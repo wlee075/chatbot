@@ -174,9 +174,10 @@ Expected components for this section:
 {human_trust_block}
 
 Rules:
-- Ask exactly 3–5 numbered questions.
-- Each question must target a specific expected component of this section.
-- Each question must aim to produce a decision that is:
+- Ask exactly 1 focused question.
+- Choose the single most important unresolved component of this section to ask
+  about first.
+- The question must aim to produce a decision that is:
   - Yes/No, or
   - a choice among clearly defined options.
 - Avoid open-ended brainstorming questions unless you immediately convert them
@@ -192,7 +193,7 @@ Rules:
 - Prioritize unresolved items that block implementation or create policy ambiguity.
 - If context needed for a question is missing from the provided materials, do not
   invent it. Use only supported context.
-- Output only the numbered questions. No preamble. No closing remarks.\
+- Output only the question. No numbering, no preamble, no closing remarks.\
 """
 
 ELICITOR_CONTEXT_BLOCK = """\
@@ -229,14 +230,14 @@ Rules for this iteration:
 
 If TRIAGE: ENTER RECOVERY MODE:
 - Do NOT ask broad or exploratory questions.
-- Ask only high-impact questions that unblock the most critical missing decisions.
-- Prioritize questions that:
-  - convert multiple gaps into a single decision
-  - define thresholds or enforcement rules
-- Limit to the minimum number of questions needed to recover the section.
+- Ask exactly 1 high-impact question that unblocks the most critical missing
+  decision.
+- Prioritize a question that:
+  - converts multiple gaps into a single decision
+  - defines thresholds or enforcement rules
 
 If TRIAGE: NORMAL ITERATION:
-- Continue refining unresolved requirement gaps normally.
+- Ask exactly 1 focused question targeting the most important unresolved gap.
 
 In all cases:
 - Convert vague areas into decisionable questions (Yes/No or explicit options).

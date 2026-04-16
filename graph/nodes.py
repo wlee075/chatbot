@@ -64,9 +64,13 @@ def _format_prd_so_far(prd_sections: dict) -> str:
 
 
 def _parse_rubric_score(text: str, rubric: str) -> float:
-    """Extract a single rubric score from reflector output. Returns -1.0 on failure."""
+    """Extract a single rubric score from reflector output. Returns -1.0 on failure.
+
+    Tolerates varied separator formats: em-dash, colon, space, markdown bold, etc.
+    Restricts to the same line as the rubric name to avoid false matches.
+    """
     m = re.search(
-        rf"{re.escape(rubric)}\s*[—\-–]+\s*(\d+\.?\d*)\s*/\s*10",
+        rf"{re.escape(rubric)}[^\d\n]*(\d+\.?\d*)\s*/\s*10",
         text,
         re.IGNORECASE,
     )
