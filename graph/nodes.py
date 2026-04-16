@@ -595,7 +595,7 @@ def reflect_node(state: PRDState) -> dict:
     if overall_score != state.get("overall_score", -1.0):
         _changes["overall_score"] = f"{state.get('overall_score', -1.0):.1f} -> {overall_score:.1f}"
     if new_iteration != prev_iteration:
-        _changes["iteration"] = f"{prev_iteration} -> {new_iteration}"
+        _changes["iteration_change"] = f"{prev_iteration} -> {new_iteration}"
     if new_recovery_count != current_recovery_count:
         _changes["recovery_mode_consecutive_count"] = f"{current_recovery_count} -> {new_recovery_count}"
     if llm_verdict != verdict:
