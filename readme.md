@@ -67,43 +67,21 @@ in the terminal.
 ├── app.py
 ├── config
 │   ├── __init__.py
-│   ├── __pycache__
-│   │   ├── __init__.cpython-313.pyc
-│   │   └── sections.cpython-313.pyc
 │   └── sections.py
 ├── dummy_context.txt
-├── flow_test.csv
 ├── graph
 │   ├── __init__.py
-│   ├── __pycache__
-│   │   ├── __init__.cpython-313.pyc
-│   │   ├── builder.cpython-313.pyc
-│   │   ├── nodes.cpython-313.pyc
-│   │   ├── routing.cpython-313.pyc
-│   │   └── state.cpython-313.pyc
 │   ├── builder.py
 │   ├── nodes.py
 │   ├── routing.py
 │   └── state.py
 ├── prompts
 │   ├── __init__.py
-│   ├── __pycache__
-│   │   ├── __init__.cpython-313.pyc
-│   │   └── templates.cpython-313.pyc
 │   └── templates.py
 ├── readme.md
-├── reflector_eval_runs.csv
-├── reflector_eval_summary.csv
 ├── requirements.txt
 ├── tests
 │   ├── __init__.py
-│   ├── __pycache__
-│   │   ├── __init__.cpython-313.pyc
-│   │   ├── ci_checks.cpython-313.pyc
-│   │   ├── eval_cases.cpython-313.pyc
-│   │   ├── fixtures.cpython-313.pyc
-│   │   ├── run_reflector_eval.cpython-313.pyc
-│   │   └── run_scoring_tests.cpython-313.pyc
 │   ├── ci_checks.py
 │   ├── eval_cases.py
 │   ├── fixtures.py
@@ -111,9 +89,6 @@ in the terminal.
 │   └── run_scoring_tests.py
 └── utils
     ├── __init__.py
-    ├── __pycache__
-    │   ├── __init__.cpython-313.pyc
-    │   └── doc_parser.cpython-313.pyc
     └── doc_parser.py
 
 11 directories, 41 files
