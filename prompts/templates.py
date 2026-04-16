@@ -265,23 +265,32 @@ Expected components for this section:
 {global_rigor_block}
 
 Instructions:
-- Write the "{section_title}" section based only on the PM's confirmed Q&A below.
-- Be clear, specific, and professional.
-- Use structured formatting (numbered lists or bullet points) where appropriate.
+
+STRICT RULE — NO INVENTION:
+- Do NOT invent any detail that was not explicitly provided in the Q&A below.
+- Do NOT invent names, roles, team names, timelines, durations, thresholds,
+  numeric values, product features, user segments, or examples.
+- If a detail sounds plausible but was not stated by the PM, it is invented.
+  Do NOT include it.
+- A thin draft with many [NEEDS CLARIFICATION] markers is correct.
+  A fluent draft with invented details is wrong.
+
+Writing rules:
+- Write only from explicitly confirmed Q&A answers.
+- For each expected component listed above:
+  - If the PM's Q&A confirms it → write it.
+  - If the PM's Q&A does not confirm it → emit exactly:
+    [NEEDS CLARIFICATION: <specific decision required>]
+  - Do NOT write prose for unconfirmed components.
 - Do NOT include the section heading in your output.
 - Do NOT contradict or duplicate content from prior sections.
-- Do NOT infer or invent product decisions, thresholds, policy rules, or
-  operational logic.
-- Only incorporate information that has been explicitly confirmed.
-- Ignore ambiguous or non-committal PM responses.
-- If critical information is missing, flag it inline as:
-  [NEEDS CLARIFICATION: <specific decision required>]
-- If you must proceed with incomplete information to preserve structure, label it:
+- Ignore ambiguous or non-committal PM responses — treat them as missing.
+- Use structured formatting (numbered lists or bullet points) where appropriate.
+- If you must note a structural gap, use:
   [ASSUMPTION: <statement>]
-- If the draft conflicts with prior sections, flag it inline as:
+- If the draft conflicts with prior sections, flag it as:
   [CONFLICT: <specific contradiction>]
-- Prefer surfacing ambiguity over smoothing it over.
-- Keep assumptions minimal and highly visible.\
+- Keep [ASSUMPTION] markers minimal and highly visible.\
 """
 
 DRAFTER_PRD_CONTEXT_BLOCK = """\
@@ -373,22 +382,27 @@ Scoring rules:
 
 {scoring_interpretation_block}
 
+Chain-of-Draft instruction:
+Before scoring each rubric, reason briefly.
+Keep EVERY reasoning step to ≤5 words.
+No lengthy explanations — concise keywords only.
+
 Output format:
 
 1. COMPLETENESS — <score>/10
-Write 1–2 sentences.
+≤5 words.
 
 2. SPECIFICITY — <score>/10
-Write 1–2 sentences.
+≤5 words.
 
 3. INTERNAL CONSISTENCY — <score>/10
-Write 1–2 sentences.
+≤5 words.
 
 4. IMPLEMENTABILITY — <score>/10
-Write 1–2 sentences.
+≤5 words.
 
 5. OVERALL SCORE — <score>/10
-Write 1 sentence explaining the overall score.
+≤5 words.
 
 6. REQUIREMENT STATUS
 List all material requirement decisions in this section and classify each as:
