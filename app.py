@@ -1,3 +1,5 @@
+import re
+import time
 import uuid
 
 import streamlit as st
@@ -29,6 +31,9 @@ if "graph_started" not in st.session_state:
 if "context_doc" not in st.session_state:
     st.session_state.context_doc = ""
 
+if "last_elapsed_ms" not in st.session_state:
+    st.session_state.last_elapsed_ms = None
+
 
 # ── Graph (cached once per process so MemorySaver persists across reruns) ─────
 @st.cache_resource
@@ -53,7 +58,7 @@ def _get_graph_state():
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("📋 PRD Builder")
-    st.caption("Claude · LangGraph · Reflection Pattern")
+    st.caption("Gemini · LangGraph · Reflection Pattern")
     st.divider()
 
     if not st.session_state.graph_started:
@@ -140,6 +145,7 @@ with st.sidebar:
             st.session_state.thread_id = str(uuid.uuid4())
             st.session_state.graph_started = False
             st.session_state.context_doc = ""
+            st.session_state.last_elapsed_ms = None
             st.rerun()
 
 
@@ -187,7 +193,7 @@ chat_history: list[dict] = sv.get("chat_history", [])
 
 
 # ── Render chat history ────────────────────────────────────────────────────────
-for msg in chat_history:
+for idx, msg in enumerate(chat_history):
     role = msg.get("role", "assistant")
     msg_type = msg.get("type", "")
     content = msg.get("content", "")
@@ -215,11 +221,87 @@ for msg in chat_history:
             if verdict == "PASS":
                 st.success("**Review: PASSED ✅**")
                 with st.expander("View review details", expanded=False):
-                    st.markdown(content)
+                    st.markdown(msg.get("content", ""))
             else:
                 st.warning("**Review: NEEDS REWORK ⚠️**")
                 with st.expander("View feedback (read before answering)", expanded=True):
-                    st.markdown(content)
+                    # ── 1. What we've captured — grouped by section ───────
+                    # Collect latest qa_pairs per section from reflect msgs up
+                    # to and including this one (later msgs override since
+                    # qa_pairs accumulates across iterations).
+                    section_qa_map: dict[str, list] = {}
+                    section_order: list[str] = []
+                    for m in chat_history[:idx + 1]:
+                        if m.get("type") == "reflect" and m.get("qa_pairs"):
+                            sec = m.get("section", "")
+                            if sec and sec not in section_order:
+                                section_order.append(sec)
+                            if sec:
+                                section_qa_map[sec] = m.get("qa_pairs", [])
+
+                    # Sections completed before this reflect message
+                    completed_sections: set[str] = set()
+                    for m in chat_history[:idx]:
+                        if m.get("type") == "advance":
+                            completed_sections.add(m.get("section", ""))
+
+                    current_section = msg.get("section", "")
+                    visible_sections = [
+                        s for s in section_order
+                        if s in completed_sections or s == current_section
+                    ]
+
+                    if visible_sections and completed_sections:
+                        # ≥1 section done: grouped view with section headers
+                        st.markdown("**📋 What we've captured so far**")
+                        for sec_title in visible_sections:
+                            is_done = sec_title in completed_sections
+                            label = f"{'✅' if is_done else '▶️'} {sec_title}"
+                            with st.expander(label, expanded=(sec_title == current_section)):
+                                qa_list = section_qa_map.get(sec_title, [])
+                                for qa in qa_list:
+                                    q = qa.get("questions", "").strip()
+                                    a = qa.get("answer", "").strip()
+                                    if q:
+                                        st.markdown(f"**Q:** {q}")
+                                    if a:
+                                        st.markdown(f"**A:** {a}")
+                                    if q or a:
+                                        st.markdown("---")
+                    elif visible_sections:
+                        # First section still in progress: flat Q&A, no headers
+                        qa_list = section_qa_map.get(current_section, [])
+                        if qa_list:
+                            st.markdown("**📋 What we've captured so far**")
+                            for qa in qa_list:
+                                q = qa.get("questions", "").strip()
+                                a = qa.get("answer", "").strip()
+                                if q:
+                                    st.markdown(f"**Q:** {q}")
+                                if a:
+                                    st.markdown(f"**A:** {a}")
+                                if q or a:
+                                    st.markdown("---")
+
+                    # ── 2. LLM summary (overall score explanation) ────────
+                    summary_match = re.search(
+                        r"OVERALL\s+SCORE[^\d]*\d+\.?\d*\s*/\s*10[.\s–—-]*(.+?)(?=\n\d+\.|\Z)",
+                        content,
+                        re.IGNORECASE | re.DOTALL,
+                    )
+                    if summary_match:
+                        summary_text = summary_match.group(1).strip().splitlines()[0].strip()
+                        if summary_text:
+                            st.caption(f"_Overall assessment: {summary_text}_")
+
+                    # ── 3. What to clarify next ───────────────────────────
+                    req_gaps = msg.get("requirement_gaps", "").strip()
+                    if req_gaps:
+                        st.markdown("**🎯 What you need to clarify next**")
+                        for line in req_gaps.splitlines():
+                            stripped = line.strip().lstrip("-•*0123456789. \t")
+                            if stripped:
+                                st.markdown(f"- {stripped}")
 
     elif msg_type == "advance":
         with st.chat_message("assistant"):
@@ -236,13 +318,29 @@ is_waiting = bool(gstate.next) and not sv.get("is_complete", False)
 
 if is_waiting:
     user_input = st.chat_input("Type your answer and press Enter…")
-    if user_input:
-        with st.spinner("Drafting and reviewing your answer… (this may take ~20s)"):
+    if user_input and user_input.strip():
+        with st.chat_message("user"):
+            st.markdown(user_input)
+        with st.spinner("Drafting and reviewing your answer…"):
             try:
+                t0 = time.monotonic()
                 graph.invoke(Command(resume=user_input), _config())
+                st.session_state.last_elapsed_ms = int((time.monotonic() - t0) * 1000)
             except Exception as exc:
+                st.session_state.last_elapsed_ms = None
                 st.error(f"Something went wrong: {exc}")
         st.rerun()
 
 elif sv.get("is_complete", False):
     st.chat_input("Session complete — download your PRD from the sidebar.", disabled=True)
+
+# ── Processing time badge ──────────────────────────────────────────────────────
+if st.session_state.last_elapsed_ms is not None:
+    elapsed = st.session_state.last_elapsed_ms
+    if elapsed >= 60_000:
+        label = f"⏱ {elapsed // 60_000}m {(elapsed % 60_000) // 1000}s"
+    elif elapsed >= 1_000:
+        label = f"⏱ {elapsed / 1000:.1f}s"
+    else:
+        label = f"⏱ {elapsed}ms"
+    st.caption(f"Last response processed in **{label}**")

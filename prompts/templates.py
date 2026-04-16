@@ -193,6 +193,10 @@ Rules:
 - Prioritize unresolved items that block implementation or create policy ambiguity.
 - If context needed for a question is missing from the provided materials, do not
   invent it. Use only supported context.
+- When referencing numeric values (thresholds, counts, percentages, time periods,
+  etc.) that the PM has NOT yet provided, use placeholder letters instead of
+  invented numbers: X, Y, Z (e.g. "within X days", "at least Y%", "fewer than Z
+  reports"). Only use a specific number if the PM stated it in a prior answer.
 - Output only the question. No numbering, no preamble, no closing remarks.\
 """
 

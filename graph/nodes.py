@@ -636,6 +636,15 @@ def reflect_node(state: PRDState) -> dict:
                 "triage": triage_decision,
                 "overall_score": overall_score,
                 "content": reflection_text,
+                "qa_pairs": list(state.get("section_qa_pairs", [])),
+                "requirement_gaps": requirement_gaps,
+                "rubric_scores": {
+                    "completeness": completeness_score,
+                    "specificity": specificity_score,
+                    "consistency": consistency_score,
+                    "implementability": implementability_score,
+                    "overall": overall_score,
+                },
             }
         ],
     }
