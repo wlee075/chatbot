@@ -73,6 +73,8 @@ with st.sidebar:
 
         if st.button("🚀 Start PRD Session", use_container_width=True, type="primary"):
             initial_state = {
+                "thread_id": st.session_state.thread_id,
+                "run_id": str(uuid.uuid4()),
                 "context_doc": st.session_state.context_doc,
                 "max_iterations": DEFAULT_MAX_SECTION_ITERATIONS,
                 "section_index": 0,

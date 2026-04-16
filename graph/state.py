@@ -8,6 +8,10 @@ def _merge_dicts(a: dict, b: dict) -> dict:
 
 
 class PRDState(TypedDict):
+    # ── Session identity (used to scope log files) ──────────────────────────
+    thread_id: str   # stable session identifier (set once per Streamlit session)
+    run_id: str      # one graph invocation — UUID generated per .invoke() call
+
     # ── Static configuration ────────────────────────────────────────────────
     context_doc: str        # raw text of the optional uploaded document
     max_iterations: int     # max reflection loops per section (default: 3)
