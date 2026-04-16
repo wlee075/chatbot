@@ -62,6 +62,7 @@ in the terminal.
 - Use Python 3.10+ for compatibility
 
 ## Project structure
+```
 .
 ├── app.py
 ├── config
@@ -116,3 +117,4 @@ in the terminal.
     └── doc_parser.py
 
 11 directories, 41 files
+```
