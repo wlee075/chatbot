@@ -12,15 +12,20 @@ OVERALL SCORE	LLM says PASS	System enforces
 < 5.0	anything	REWORK + ENTER RECOVERY MODE
 -1.0 (parse fail)	PASS	PASS (no override)
 '''
+import hashlib
+import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from difflib import SequenceMatcher
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import interrupt
 
-from config.sections import PRD_SECTIONS, get_section_by_index
+from config.sections import PRD_SECTIONS, get_section_by_index, get_section_by_id
+from graph.concept_map import get_impacted_sections as _rule_impacted_sections
 from graph.state import PRDState
 from utils.logger import log_event
 from prompts.templates import (
@@ -30,18 +35,24 @@ from prompts.templates import (
     DRAFTER_CONTEXT_DOC_BLOCK,
     DRAFTER_PRD_CONTEXT_BLOCK,
     DRAFTER_SYSTEM,
+    ECHO_INTERPRET_PROMPT,
     ELICITOR_CONTEXT_BLOCK,
+    ELICITOR_FIRST_TURN_BLOCK,
     ELICITOR_ITERATION_BLOCK,
     ELICITOR_PRD_BLOCK,
     ELICITOR_SYSTEM,
     GLOBAL_RIGOR_BLOCK,
     HUMAN_TRUST_BLOCK,
+    IMPACT_DETECTION_PROMPT,
     ITERATION_DISCIPLINE_BLOCK,
+    LANGUAGE_RULES_BLOCK,
+    NUMERIC_GROUNDING_BLOCK,
     PASS_SCORE_THRESHOLD,
     RECOVERY_MODE_SCORE_THRESHOLD,
     REFLECTOR_PRIOR_SECTIONS_BLOCK,
     REFLECTOR_SYSTEM,
     SCORING_INTERPRETATION_BLOCK,
+    SIDE_FACT_EXTRACTION_PROMPT,
 )
 
 
@@ -149,6 +160,161 @@ def load_context_node(state: PRDState) -> dict:
     }
 
 
+# ── Node: await_first_message ─────────────────────────────────────────────────
+
+def await_first_message_node(state: PRDState) -> dict:
+    """
+    D-M2 — Fires interrupt() immediately so the user's very first typed message
+    becomes the project description. No welcome is emitted here.
+    Sets context_doc so detect_framing_node can classify what was said.
+    """
+    first_message: str = interrupt({"type": "waiting_for_first_message"})
+    if isinstance(first_message, dict):
+        first_message = first_message.get("content", "")
+    text = first_message.strip()
+    return {
+        "context_doc": text,
+        "chat_history": [{"role": "user", "content": text}],
+    }
+
+
+# ── Node: detect_framing ──────────────────────────────────────────────────────
+
+_FRAMING_PROMPT = (
+    "Classify the following product description.\n\n"
+    "CLEAR — the person describes a specific product, feature, or system to build "
+    "with identifiable goals.\n"
+    "SYMPTOM — they described a pain point or problem, but no product or solution idea.\n"
+    "CONFUSED — they are vague, uncertain what to build, or said something like "
+    "'I don't know where to start'.\n\n"
+    "Product description:\n{context_doc}\n\n"
+    "Reply with exactly one word: CLEAR, SYMPTOM, or CONFUSED."
+)
+
+_FRAMING_MAP = {"CLEAR": "clear", "SYMPTOM": "symptom_only", "CONFUSED": "confused"}
+
+
+def detect_framing_node(state: PRDState) -> dict:
+    """
+    Classifies the user's first message as Path 1/2/3.
+    Sets framing_mode ('clear' | 'symptom_only' | 'confused') and
+    phase ('elicitation' for Path 1, 'discovery' for Path 2/3).
+    """
+    ctx = _log_ctx(state, "detect_framing_node")
+    t0 = time.monotonic()
+    context_doc = state.get("context_doc", "").strip()
+
+    log_event(
+        **ctx, level="INFO", event_type="node_start",
+        message="detect_framing_node started", context_len=len(context_doc),
+    )
+
+    llm = _get_llm()
+    response = llm.invoke([
+        HumanMessage(content=_FRAMING_PROMPT.format(context_doc=context_doc))
+    ])
+
+    raw = response.content.strip().upper()
+    first_word = raw.split()[0] if raw.split() else "CLEAR"
+    if first_word not in _FRAMING_MAP:
+        first_word = "CLEAR"
+
+    framing_mode = _FRAMING_MAP[first_word]
+    phase = "elicitation" if framing_mode == "clear" else "discovery"
+
+    duration_ms = int((time.monotonic() - t0) * 1000)
+    log_event(
+        **ctx, level="INFO", event_type="node_end",
+        message="detect_framing_node finished",
+        framing_mode=framing_mode, phase=phase, duration_ms=duration_ms,
+    )
+    return {"framing_mode": framing_mode, "phase": phase}
+
+
+# ── Node: discovery_questions ─────────────────────────────────────────────────
+
+_DISCOVERY_SYSTEM = (
+    "You are a friendly product management coach helping someone clarify what they want to build.\n\n"
+    "What they've said so far:\n{context_doc}\n\n"
+    "Situation: {framing_label}\n"
+    "This is clarifying question set {turn_label}.\n\n"
+    "Ask 1-2 short, natural questions to draw out:\n"
+    "- What the core goal or business need is\n"
+    "- Who will use this and why it matters\n\n"
+    "No bullet headers. No jargon. Conversational tone."
+)
+
+_FRAMING_LABELS = {
+    "symptom_only": "they described a problem but no solution or product idea yet",
+    "confused": "they're unsure what to build or where to start",
+}
+
+
+def discovery_questions_node(state: PRDState) -> dict:
+    """
+    Asks 1-2 clarifying questions for Path 2/3 users.
+    Increments discovery_turn_count. Does NOT increment iteration (D-M12).
+    """
+    ctx = _log_ctx(state, "discovery_questions_node")
+    t0 = time.monotonic()
+    framing_mode = state.get("framing_mode", "confused")
+    discovery_turn_count = state.get("discovery_turn_count", 0)
+    context_doc = state.get("context_doc", "")
+
+    log_event(
+        **ctx, level="INFO", event_type="node_start",
+        message="discovery_questions_node started",
+        framing_mode=framing_mode, discovery_turn_count=discovery_turn_count,
+    )
+
+    framing_label = _FRAMING_LABELS.get(framing_mode, "unsure what to build")
+    turn_label = f"{discovery_turn_count + 1} of 2"
+    llm = _get_llm()
+    response = llm.invoke([
+        HumanMessage(content=_DISCOVERY_SYSTEM.format(
+            context_doc=context_doc,
+            framing_label=framing_label,
+            turn_label=turn_label,
+        ))
+    ])
+    questions = response.content.strip()
+    new_count = discovery_turn_count + 1
+
+    duration_ms = int((time.monotonic() - t0) * 1000)
+    log_event(
+        **ctx, level="INFO", event_type="node_end",
+        message="discovery_questions_node finished",
+        new_discovery_turn_count=new_count, duration_ms=duration_ms,
+    )
+    return {
+        "discovery_turn_count": new_count,
+        "chat_history": [{"role": "assistant", "type": "system", "content": questions}],
+    }
+
+
+# ── Node: await_discovery_answer ──────────────────────────────────────────────
+
+def await_discovery_answer_node(state: PRDState) -> dict:
+    """
+    Interrupt — pauses for the user's discovery-phase answer.
+    Appends the answer to context_doc so the Elicitor can use the full
+    discovery context when section elicitation begins.
+    """
+    answer: str = interrupt({
+        "type": "waiting_for_discovery_answer",
+        "discovery_turn_count": state.get("discovery_turn_count", 0),
+    })
+    if isinstance(answer, dict):
+        answer = answer.get("content", "")
+    answer = answer.strip()
+    existing = state.get("context_doc", "").strip()
+    new_context = f"{existing}\n\n{answer}" if existing else answer
+    return {
+        "context_doc": new_context,
+        "chat_history": [{"role": "user", "content": answer}],
+    }
+
+
 # ── Node: generate_questions ──────────────────────────────────────────────────
 
 def generate_questions_node(state: PRDState) -> dict:
@@ -187,6 +353,16 @@ def generate_questions_node(state: PRDState) -> dict:
     else:
         iteration_block = ""
 
+    # First-turn block: only on the very first question for this section
+    qa_store = state.get("confirmed_qa_store", {})
+    section_has_answers = any(
+        v.get("section_id") == section.id for v in qa_store.values()
+    )
+    if iteration == 0 and not section_has_answers:
+        first_turn_block = ELICITOR_FIRST_TURN_BLOCK
+    else:
+        first_turn_block = ""
+
     expected_components_list = "\n".join(
         f"  \u2022 {c}" for c in section.expected_components
     )
@@ -198,10 +374,13 @@ def generate_questions_node(state: PRDState) -> dict:
         context_block=context_block,
         prd_block=prd_block,
         iteration_block=iteration_block,
+        first_turn_block=first_turn_block,
         global_rigor_block=GLOBAL_RIGOR_BLOCK,
         decision_enforcement_block=DECISION_ENFORCEMENT_BLOCK,
         iteration_discipline_block=ITERATION_DISCIPLINE_BLOCK,
         human_trust_block=HUMAN_TRUST_BLOCK,
+        language_rules_block=LANGUAGE_RULES_BLOCK,
+        numeric_grounding_block=NUMERIC_GROUNDING_BLOCK,
     )
 
     response = llm.invoke(
@@ -212,7 +391,7 @@ def generate_questions_node(state: PRDState) -> dict:
             ),
         ]
     )
-    questions = response.content.strip()
+    questions = _sanitize_user_facing_question(response.content.strip())
 
     triage = state.get("triage_decision", "")
     gaps_count = len([l for l in state.get("requirement_gaps", "").splitlines() if l.strip()])
@@ -250,17 +429,6 @@ def generate_questions_node(state: PRDState) -> dict:
         duration_ms=duration_ms, question_count=question_count,
     )
 
-    # Build display header
-    header = (
-        f"**Section {state['section_index'] + 1}/{len(PRD_SECTIONS)}: "
-        f"{section.title}**"
-    )
-    if iteration > 0:
-        header += (
-            f" _(follow-up \u00b7 iteration {iteration + 1}/"
-            f"{state.get('max_iterations', DEFAULT_MAX_SECTION_ITERATIONS)})_"
-        )
-
     return {
         "current_questions": questions,
         "chat_history": [
@@ -270,25 +438,100 @@ def generate_questions_node(state: PRDState) -> dict:
                 "section": section.title,
                 "section_index": state["section_index"],
                 "iteration": iteration,
-                "content": f"{header}\n\n{questions}",
+                "content": questions,
             }
         ],
     }
+
+
+_CONTRADICTION_PROMPT = (
+    "You are checking whether a product manager's latest answer contradicts any prior answer.\n\n"
+    "Prior Q&A (same section):\n{prior_qa}\n\n"
+    "New question and answer:\n{new_qa}\n\n"
+    "Does the new answer directly contradict any prior answer?\n"
+    "Reply with EXACTLY one of:\n"
+    "- NO\n"
+    "- YES: <one-sentence plain description of the conflict>"
+)
+
+
+def _sanitize_user_facing_question(text: str) -> str:
+    """Clean LLM output to avoid internal jargon or audit-style asks to the PM."""
+    if not text:
+        return text
+
+    out = text.strip()
+    replacements = {
+        "Headliner paragraph": "Summary section",
+        "headliner paragraph": "summary section",
+        "background_problem": "earlier business problem",
+        "stored under": "saved in your notes",
+        "concept_key": "source reference",
+        "section consistency": "alignment",
+    }
+    for bad, good in replacements.items():
+        out = out.replace(bad, good)
+    out = re.sub(r"round\s*=\s*\d+", "earlier answer", out, flags=re.IGNORECASE)
+
+    # Agent should run consistency checks itself; ask user only for decision.
+    if re.search(r"consisten|alignment\s+check|section\s+alignment", out, re.IGNORECASE):
+        return (
+            "I noticed a possible mismatch with an earlier detail. "
+            "Which version should we keep going forward?"
+        )
+
+    # Strip placeholder letters like [X], [Y], [Z] that feel robotic.
+    out = re.sub(r"\[([XYZ])\]", "___", out)
+
+    return out
+
+
+def _check_contradiction(
+    new_questions: str,
+    new_answer: str,
+    store: dict,
+    section_id: str,
+) -> str | None:
+    """
+    O-1b — lightweight contradiction check against prior answers in the same section.
+    Returns None if no contradiction found, or a plain-English description if one is.
+    """
+    prior = [v for k, v in store.items() if v.get("section_id") == section_id]
+    if not prior:
+        return None
+    prior_qa = "\n\n".join(
+        f"Q: {p['questions']}\nA: {p['answer']}" for p in prior
+    )
+    new_qa = f"Q: {new_questions}\nA: {new_answer}"
+    llm = _get_llm()
+    try:
+        resp = llm.invoke([
+            HumanMessage(content=_CONTRADICTION_PROMPT.format(
+                prior_qa=prior_qa, new_qa=new_qa
+            ))
+        ])
+        text = resp.content.strip()
+        if text.upper().startswith("YES:"):
+            return text[4:].strip()
+    except Exception:
+        pass
+    return None
 
 
 # ── Node: await_answer ────────────────────────────────────────────────────────
 
 def await_answer_node(state: PRDState) -> dict:
     """
-    Human-in-the-loop interrupt — pauses the graph until the PM submits
-    their answer via the Streamlit chat input.
-
-    The questions are already visible in chat_history (added by
-    generate_questions_node), so the interrupt value only carries metadata.
+    Human-in-the-loop interrupt — captures raw user input into raw_answer_buffer.
+    Accepts either a plain string (backward compat) or a structured dict payload
+    {event_type, content, target_message_id, target_content, ...}.
+    Does NOT write to confirmed_qa_store or section_qa_pairs.
+    Those writes happen only after echo confirmation in await_confirmation_node
+    (standard ANSWER/REPLY flow) or handle_tagged_event_node (tagged events).
     """
     section = get_section_by_index(state["section_index"])
 
-    pm_answer: str = interrupt(
+    resume_value = interrupt(
         {
             "type": "waiting_for_answer",
             "section": section.title,
@@ -296,26 +539,846 @@ def await_answer_node(state: PRDState) -> dict:
         }
     )
 
-    # Append this Q&A pair to the current section's history
-    existing_qa = list(state.get("section_qa_pairs", []))
-    new_qa = existing_qa + [
-        {
-            "questions": state.get("current_questions", ""),
-            "answer": pm_answer,
-        }
-    ]
+    # Accept structured dict payload or plain string (backward compat)
+    if isinstance(resume_value, dict):
+        user_text = resume_value.get("content", "")
+        pending_event = {k: v for k, v in resume_value.items()}
+        if "event_type" not in pending_event:
+            pending_event["event_type"] = "ANSWER"
+    else:
+        user_text = str(resume_value)
+        pending_event = {"event_type": "ANSWER", "content": user_text}
 
     return {
-        "section_qa_pairs": new_qa,
-        "chat_history": [{"role": "user", "content": pm_answer}],
+        "raw_answer_buffer": user_text.strip(),
+        "answer_confirmation_status": "PENDING",
+        "pending_interrupt_type": "question",
+        "pending_event": pending_event,
+        "chat_history": [{"role": "user", "content": user_text.strip()}],
     }
+
+
+# ── Node: handle_tagged_event ─────────────────────────────────────────────────
+
+def handle_tagged_event_node(state: PRDState) -> dict:
+    """
+    Processes structured tagged events arriving from the UI:
+      TAG_MESSAGE_AS_TRUTH — promotes the referenced message content directly to
+        confirmed_qa_store, bypassing the echo gate.
+      CORRECT_MESSAGE — creates a corrected entry in confirmed_qa_store that
+        supersedes the prior answer for the referenced concept.
+    After handling, routes to draft (same as a CONFIRMED echo gate exit).
+    """
+    event = state.get("pending_event", {})
+    event_type = event.get("event_type", "")
+    target_msg_id = event.get("target_message_id", "")
+    target_content = event.get("target_content", "")
+    new_content = event.get("content", "").strip()
+
+    section = get_section_by_index(state["section_index"])
+    chat_history = state.get("chat_history", [])
+
+    # Resolve target_content from chat_history if not passed in payload
+    if not target_content and target_msg_id:
+        try:
+            idx = int(target_msg_id.split("_")[1])
+            if 0 <= idx < len(chat_history):
+                target_content = chat_history[idx].get("content", "")
+        except (ValueError, IndexError):
+            target_content = ""
+
+    iteration = state.get("iteration", 0)
+    existing_qa = list(state.get("section_qa_pairs", []))
+    round_n = len(existing_qa) + 1
+    concept_key = f"{section.id}:iter_{iteration}:round_{round_n}:tagged"
+    current_questions = state.get("current_questions", "")
+
+    if event_type == "TAG_MESSAGE_AS_TRUTH":
+        canonical_answer = target_content or new_content
+        promotion_note = new_content if (new_content and new_content != canonical_answer) else ""
+        chat_msg = (
+            "**Ground truth set** 📌\n\n"
+            f"Using as canonical: _{canonical_answer[:160]}{'…' if len(canonical_answer) > 160 else ''}_"
+            + (f"\n\n_Note: {promotion_note}_" if promotion_note else "")
+        )
+        store_update = {
+            concept_key: {
+                "answer": canonical_answer,
+                "questions": current_questions,
+                "section": section.title,
+                "section_id": section.id,
+                "iteration": iteration,
+                "round": round_n,
+                "source_round": round_n,
+                "contradiction_flagged": False,
+                "event_type": "TAG_MESSAGE_AS_TRUTH",
+                "target_message_id": target_msg_id,
+                "promotion_note": promotion_note,
+            }
+        }
+        qa_entry = {"questions": current_questions, "answer": canonical_answer, "section": section.title}
+        event_log = [{
+            "event_type": "TAG_MESSAGE_AS_TRUTH",
+            "target_message_id": target_msg_id,
+            "content": canonical_answer[:200],
+            "section": section.title,
+            "concept_key": concept_key,
+        }]
+
+    elif event_type == "CORRECT_MESSAGE":
+        corrected_answer = new_content or target_content
+        # Find the prior concept key for provenance (best-effort match on content)
+        existing_store = state.get("confirmed_qa_store", {})
+        corrects_key = next(
+            (k for k, v in existing_store.items()
+             if target_content and v.get("answer", "")[:100] in target_content[:200]),
+            None,
+        )
+        chat_msg = (
+            "**Correction noted** ✏️\n\n"
+            f"Updated answer: _{corrected_answer[:160]}{'…' if len(corrected_answer) > 160 else ''}_"
+        )
+        store_update = {
+            concept_key: {
+                "answer": corrected_answer,
+                "questions": current_questions,
+                "section": section.title,
+                "section_id": section.id,
+                "iteration": iteration,
+                "round": round_n,
+                "source_round": round_n,
+                "contradiction_flagged": False,
+                "event_type": "CORRECT_MESSAGE",
+                "target_message_id": target_msg_id,
+                "corrects_key": corrects_key,
+            }
+        }
+        qa_entry = {"questions": current_questions, "answer": corrected_answer, "section": section.title}
+        event_log = [{
+            "event_type": "CORRECT_MESSAGE",
+            "target_message_id": target_msg_id,
+            "content": corrected_answer[:200],
+            "section": section.title,
+            "concept_key": concept_key,
+            "corrects_key": corrects_key,
+        }]
+
+    else:
+        # Unknown event type — passthrough, let normal flow handle it
+        return {"pending_event": {}}
+
+    return {
+        "answer_confirmation_status": "CONFIRMED",
+        "section_qa_pairs": existing_qa + [qa_entry],
+        "confirmed_qa_store": store_update,
+        "event_history": event_log,
+        "pending_event": {},
+        "raw_answer_buffer": "",
+        "pending_echo": "",
+        "pending_concept_updates": {},
+        "chat_history": [
+            {
+                "role": "assistant",
+                "type": "tagged_event",
+                "event_type": event_type,
+                "section": section.title,
+                "content": chat_msg,
+            }
+        ],
+    }
+
+
+# ── Side-fact extraction helper ───────────────────────────────────────────────
+
+# Maps extracted fact categories to PRD section IDs (most relevant first).
+_SIDE_FACT_SECTION_MAP: dict[str, list[str]] = {
+    "stakeholder":  ["key_stakeholders"],
+    "owner":        ["key_stakeholders"],
+    "dependency":   ["risks", "assumptions"],
+    "timeline":     ["timeline"],
+    "budget":       ["assumptions", "risks"],
+    "tool":         ["proposed_solution", "assumptions"],
+    "risk":         ["risks"],
+    "constraint":   ["assumptions", "out_of_scope"],
+    "metric":       ["success_metrics", "goals"],
+    "user":         ["elevator_pitch", "problem_statement"],
+}
+
+
+def _extract_side_facts(
+    question: str,
+    raw_answer: str,
+) -> list[dict]:
+    """
+    Runs the secondary fact extraction pass on a user reply.
+    Returns a list of dicts: [{"category": ..., "fact": ..., "section_ids": [...]}]
+    Only facts whose target section differs from the current section are returned.
+    Returns [] if the LLM finds no extra facts.
+    """
+    llm = _get_llm()
+    try:
+        response = llm.invoke([
+            HumanMessage(content=SIDE_FACT_EXTRACTION_PROMPT.format(
+                question=question,
+                raw_answer=raw_answer,
+            ))
+        ])
+        raw = response.content.strip()
+    except Exception:
+        return []
+
+    if not raw or raw.upper() == "NONE":
+        return []
+
+    results = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if ":" not in line:
+            continue
+        category, _, fact_text = line.partition(":")
+        category = category.strip().lower()
+        fact_text = fact_text.strip()
+        if not fact_text or category not in _SIDE_FACT_SECTION_MAP:
+            continue
+        results.append({
+            "category": category,
+            "fact": fact_text,
+            "section_ids": _SIDE_FACT_SECTION_MAP[category],
+        })
+    return results
+
+
+# ── Node: interpret_and_echo ──────────────────────────────────────────────────
+
+def interpret_and_echo_node(state: PRDState) -> dict:
+    """
+    Fast deterministic echo of user answer — no LLM call.
+    Simply confirms receipt and prepares answer for draft pipeline.
+    
+    Replaced expensive LLM-based interpretation with rule-based logic:
+    - Truncate long answers (max 150 chars)
+    - Capitalize first letter
+    - Generate "Got it — [echo]" template response
+    
+    This node MUST complete in <500ms to avoid blocking user feedback.
+    """
+    section = get_section_by_index(state["section_index"])
+    raw_answer = state.get("raw_answer_buffer", "").strip()
+    question = state.get("current_questions", "").strip()
+    iteration = state.get("iteration", 0)
+
+    # ── Rule-based echo (replace LLM call entirely) ──────────────────────────
+    # Keep answer max 150 chars for readability in UI
+    echo_answer = raw_answer
+    if len(echo_answer) > 150:
+        echo_answer = echo_answer[:147].rstrip() + "…"
+    
+    # Capitalize first letter if needed
+    if echo_answer and echo_answer[0].islower():
+        echo_answer = echo_answer[0].upper() + echo_answer[1:]
+    
+    # Build the "Got it" text (rule-based, not LLM)
+    echo_text = f"Got it — {echo_answer}"
+    
+    # For storage, strip the "Got it — " prefix
+    interpreted = echo_answer
+
+    ctx = _log_ctx(state, "interpret_and_echo_node")
+    log_event(
+        **ctx, level="INFO", event_type="echo_node_fast_path",
+        message="Deterministic echo (no LLM call)",
+        answer_len=len(raw_answer), echo_len=len(echo_text),
+    )
+
+    # ── Commit primary answer immediately ─────────────────────────────────
+    existing_qa = list(state.get("section_qa_pairs", []))
+    round_n = len(existing_qa) + 1
+    concept_key = f"{section.id}:iter_{iteration}:round_{round_n}"
+
+    qa_entry = {
+        "questions": question,
+        "answer": interpreted,
+        "section": section.title,
+    }
+    store_update: dict = {
+        concept_key: {
+            "answer": interpreted,
+            "questions": question,
+            "section": section.title,
+            "section_id": section.id,
+            "iteration": iteration,
+            "round": round_n,
+            "source_round": round_n,
+            "contradiction_flagged": False,  # detect_impact_node will flag if needed
+        }
+    }
+
+    return {
+        "pending_echo": "",
+        "pending_concept_updates": {},
+        "answer_confirmation_status": "CONFIRMED",
+        "section_qa_pairs": existing_qa + [qa_entry],
+        "confirmed_qa_store": store_update,
+        "contradiction_log": [],
+        "raw_answer_buffer": raw_answer,   # kept so detect_impact_node can run side-fact scan + contradiction check
+        "chat_history": [
+            {
+                "role": "assistant",
+                "type": "echo_confirmation",
+                "section": section.title,
+                "content": echo_text,
+            }
+        ],
+    }
+
+
+# ── Confirmation parser ───────────────────────────────────────────────────────
+
+_ACCEPT_RE = re.compile(
+    r"^(?:yes|y|yep|yup|correct|right|confirmed|confirm|sounds good|"
+    r"that'?s? right|that'?s? correct|ok|okay|perfect|exactly|sure|affirmative)",
+    re.IGNORECASE,
+)
+
+
+def _is_acceptance(text: str) -> bool:
+    return bool(_ACCEPT_RE.match(text.strip()))
+
+
+# ── Node: await_confirmation ──────────────────────────────────────────────────
+
+def await_confirmation_node(state: PRDState) -> dict:
+    """
+    Interrupt — waits for user to accept or correct the echo restatement.
+
+    On CONFIRMED:
+      - Promotes pending_concept_updates into confirmed_qa_store and section_qa_pairs.
+      - Runs O-1b contradiction check against prior confirmed answers.
+
+    On CORRECTED:
+      - Discards pending state, emits a re-ask message, routes back to await_answer.
+    """
+    section = get_section_by_index(state["section_index"])
+
+    user_response: str = interrupt(
+        {
+            "type": "waiting_for_confirmation",
+            "section": section.title,
+            "pending_echo": state.get("pending_echo", ""),
+        }
+    )
+    # Accept structured dict payload or plain string (backward compat)
+    if isinstance(user_response, dict):
+        user_response = user_response.get("content", "")
+    user_response = user_response.strip()
+
+    if _is_acceptance(user_response):
+        # ── Commit to canonical truth ─────────────────────────────────────
+        pending = state.get("pending_concept_updates", {})
+        interpreted_answer = pending.get("interpreted_answer", pending.get("raw_answer", ""))
+        question = pending.get("questions", state.get("current_questions", ""))
+        iteration = state.get("iteration", 0)
+        existing_qa = list(state.get("section_qa_pairs", []))
+        round_n = len(existing_qa) + 1
+        concept_key = f"{section.id}:iter_{iteration}:round_{round_n}"
+
+        # ── O-1b contradiction check (on CONFIRMED answers only) ──────────
+        contradiction_flagged = False
+        contradiction_log_entry: list[dict] = []
+        chat_extras: list[dict] = []
+        existing_store = state.get("confirmed_qa_store", {})
+        if existing_store:
+            contradiction_desc = _check_contradiction(
+                question, interpreted_answer, existing_store, section.id,
+            )
+            if contradiction_desc:
+                contradiction_flagged = True
+                contradiction_log_entry = [{
+                    "concept_key": concept_key,
+                    "prior": "see confirmed_qa_store",
+                    "new": interpreted_answer[:200],
+                    "section": section.title,
+                    "description": contradiction_desc,
+                }]
+                chat_extras = [{
+                    "role": "assistant",
+                    "type": "contradiction_flag",
+                    "content": (
+                        f"\u26a0\ufe0f **Heads up \u2014 this might conflict with something you said earlier.**\n\n"
+                        f"{contradiction_desc}\n\n"
+                        "_Using your latest answer. You can clarify if needed._"
+                    ),
+                }]
+
+        qa_entry = {
+            "questions": question,
+            "answer": interpreted_answer,
+            "section": section.title,
+        }
+        store_update = {
+            concept_key: {
+                "answer": interpreted_answer,
+                "questions": question,
+                "section": section.title,
+                "section_id": section.id,
+                "iteration": iteration,
+                "round": round_n,
+                "source_round": round_n,
+                "contradiction_flagged": contradiction_flagged,
+            }
+        }
+
+        return {
+            "answer_confirmation_status": "CONFIRMED",
+            "section_qa_pairs": existing_qa + [qa_entry],
+            "confirmed_qa_store": store_update,
+            "contradiction_log": contradiction_log_entry,
+            "pending_concept_updates": {},
+            "pending_echo": "",
+            "raw_answer_buffer": "",
+            "chat_history": (
+                [{"role": "user", "content": user_response}] + chat_extras
+            ),
+        }
+    else:
+        # ── Corrected: discard pending, re-ask ────────────────────────────
+        question = state.get("current_questions", "")
+        reask_msg = (
+            "No problem \u2014 let me re-ask:\n\n"
+            f"{question}"
+        )
+        return {
+            "answer_confirmation_status": "CORRECTED",
+            "raw_answer_buffer": "",
+            "pending_echo": "",
+            "pending_concept_updates": {},
+            "chat_history": [
+                {"role": "user", "content": user_response},
+                {
+                    "role": "assistant",
+                    "type": "reask",
+                    "section": section.title,
+                    "content": reask_msg,
+                },
+            ],
+        }
 
 
 # ── Node: draft ───────────────────────────────────────────────────────────────
 
+# ── Phase 1 hybrid constants ─────────────────────────────────────────────────
+_MAX_SIDE_WRITES = 4         # max impacted prior sections re-drafted per turn
+_MATERIAL_CHANGE_RATIO = 0.15  # 15 %+ text change = material (SequenceMatcher ratio)
+_SIDE_WRITE_MIN_IMPACT_SCORE = 0.5  # skip side-writes with confidence below this threshold
+_FIRST_DRAFT_COMPLETENESS_THRESHOLD = 0.6
+_FIRST_DRAFT_CONFIDENCE_THRESHOLD = 0.55
+_REFRESH_CONFIDENCE_DELTA = 0.15
+_LOW_CONFIDENCE_THRESHOLD = 0.35
+
+
+def _hash_text_list(items: list[str]) -> str:
+    return hashlib.sha256(json.dumps(items, sort_keys=True).encode()).hexdigest()
+
+
+def _normalize_fact_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _answer_confidence_score(answer: str) -> float:
+    text = _normalize_fact_text(answer)
+    if not text:
+        return 0.0
+    low = text.lower()
+    vague_markers = (
+        "not sure", "maybe", "depends", "tbd", "to be decided", "roughly",
+        "something like", "etc", "whatever", "not certain", "i guess",
+    )
+    if any(marker in low for marker in vague_markers):
+        return 0.2
+    if len(text) < 12:
+        return 0.25
+    if len(text) < 30:
+        return 0.5
+    return 0.8 if any(ch.isdigit() for ch in text) else 0.7
+
+
+def _collect_section_facts(qa_pairs: list[dict]) -> list[str]:
+    facts: list[str] = []
+    seen: set[str] = set()
+    for qa in qa_pairs:
+        answer = _normalize_fact_text(qa.get("answer", ""))
+        if not answer:
+            continue
+        key = answer.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        facts.append(answer)
+    return facts
+
+
+def _build_section_draft_meta(
+    section,
+    qa_pairs: list[dict],
+    existing_draft: str,
+    previous_meta: dict | None,
+) -> tuple[dict, bool, str]:
+    facts = _collect_section_facts(qa_pairs)
+    confidence_values = [_answer_confidence_score(qa.get("answer", "")) for qa in qa_pairs if qa.get("answer", "").strip()]
+    confidence_score = round(sum(confidence_values) / len(confidence_values), 3) if confidence_values else 0.0
+    completeness_score = round(min(1.0, len(facts) / max(1, len(section.expected_components))), 3)
+    has_draft = bool((existing_draft or "").strip())
+    last_draft_hash = hashlib.sha256((existing_draft or "").encode()).hexdigest() if has_draft else ""
+    facts_hash = _hash_text_list(facts)
+    prev_meta = previous_meta or {}
+    prev_facts_hash = prev_meta.get("facts_hash", "")
+    prev_confidence = float(prev_meta.get("confidence_score", 0.0) or 0.0)
+    placeholder_draft = bool(re.search(r"\b(?:tbd|placeholder|assumption)\b", existing_draft or "", re.IGNORECASE))
+
+    should_draft = False
+    reason = "no_new_value"
+
+    if not facts:
+        state_label = "not_started"
+        reason = "no_facts"
+    elif not has_draft:
+        if completeness_score >= _FIRST_DRAFT_COMPLETENESS_THRESHOLD and confidence_score >= _FIRST_DRAFT_CONFIDENCE_THRESHOLD:
+            state_label = "ready_for_first_draft"
+            should_draft = True
+            reason = "first_draft_ready"
+        elif confidence_score < _LOW_CONFIDENCE_THRESHOLD:
+            state_label = "needs_clarification"
+            reason = "low_confidence"
+        else:
+            state_label = "collecting"
+            reason = "collecting_more_facts"
+    else:
+        fact_changed = facts_hash != prev_facts_hash
+        significant_confidence_increase = (confidence_score - prev_confidence) >= _REFRESH_CONFIDENCE_DELTA
+        if confidence_score < _LOW_CONFIDENCE_THRESHOLD and fact_changed:
+            state_label = "needs_clarification"
+            reason = "low_confidence"
+        elif placeholder_draft and confidence_score >= _FIRST_DRAFT_CONFIDENCE_THRESHOLD and completeness_score >= _FIRST_DRAFT_COMPLETENESS_THRESHOLD:
+            state_label = "needs_refresh"
+            should_draft = True
+            reason = "placeholder_refresh"
+        elif fact_changed or significant_confidence_increase:
+            state_label = "needs_refresh"
+            should_draft = True
+            reason = "material_update" if fact_changed else "confidence_increase"
+        else:
+            state_label = "stable"
+            reason = "duplicate_or_non_material"
+
+    meta = {
+        "facts": facts,
+        "confidence_score": confidence_score,
+        "completeness_score": completeness_score,
+        "last_draft_hash": last_draft_hash,
+        "state": state_label,
+        "facts_hash": facts_hash,
+        "fact_count": len(facts),
+        "last_reason": reason,
+    }
+    return meta, should_draft, reason
+
+
+def _is_material_change(old: str, new: str) -> bool:
+    """Returns True if `new` differs from `old` by more than _MATERIAL_CHANGE_RATIO."""
+    if not old:
+        return True  # first draft is always material
+    ratio = SequenceMatcher(None, old, new).quick_ratio()
+    # quick_ratio is an upper bound — accurate enough for threshold guard
+    return (1.0 - ratio) >= _MATERIAL_CHANGE_RATIO
+
+
+def _draft_one_section(
+    section,
+    qa_pairs: list[dict],
+    prd_so_far: str,
+    context_doc: str,
+) -> str:
+    """Shared helper — drafts a single section. Called from primary and side paths."""
+    llm = _get_llm()
+    prd_context_block = (
+        DRAFTER_PRD_CONTEXT_BLOCK.format(prd_so_far=prd_so_far) if prd_so_far else ""
+    )
+    context_doc_block = (
+        DRAFTER_CONTEXT_DOC_BLOCK.format(context_doc=context_doc) if context_doc else ""
+    )
+    qa_parts = [
+        f"--- Round {i} ---\nQuestions:\n{qa['questions']}\n\nPM's answer:\n{qa['answer']}"
+        for i, qa in enumerate(qa_pairs, 1)
+    ]
+    expected_components_list = "\n".join(f"  \u2022 {c}" for c in section.expected_components)
+    system_prompt = DRAFTER_SYSTEM.format(
+        section_title=section.title,
+        section_description=section.description,
+        expected_components_list=expected_components_list,
+        prd_context_block=prd_context_block,
+        context_doc_block=context_doc_block,
+        global_rigor_block=GLOBAL_RIGOR_BLOCK,
+    )
+    response = llm.invoke([
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=(
+            f"Based on the Q&A below, write the '{section.title}' section:\n\n"
+            + "\n\n".join(qa_parts)
+        )),
+    ])
+    return response.content.strip()
+
+
+def _draft_sections_parallel(
+    items: list[tuple],  # [(section, qa_pairs), ...]
+    prd_so_far: str,
+    context_doc: str,
+) -> dict[str, str]:
+    """Draft multiple sections concurrently. Returns {section_id: draft_text}."""
+    results: dict[str, str] = {}
+
+    def _worker(args):
+        sec, qa = args
+        return sec.id, _draft_one_section(sec, qa, prd_so_far, context_doc)
+
+    with ThreadPoolExecutor(max_workers=len(items)) as executor:
+        futures = {executor.submit(_worker, item): item for item in items}
+        for future in as_completed(futures):
+            try:
+                sec_id, draft = future.result()
+                results[sec_id] = draft
+            except Exception:
+                pass
+    return results
+
+
+def _compute_draft_cache_key(
+    section,
+    qa_pairs: list[dict],
+    prd_sections: dict,
+    context_doc: str,
+) -> str:
+    """Dependency-scoped SHA-256 cache key for a section draft.
+
+    Only hashes Q&A pairs + the PRD sections this section explicitly depends on
+    (``section.context_depends_on``). Changes to unrelated sections do NOT
+    invalidate the cache, solving the over-invalidation problem described in the
+    senior review.
+    """
+    dep_ids: list[str] = getattr(section, "context_depends_on", None) or []
+    relevant_prd = {sid: prd_sections.get(sid, "") for sid in dep_ids}
+    key_data = {
+        "section_id": section.id,
+        "qa": [{"q": qa.get("questions", ""), "a": qa.get("answer", "")} for qa in qa_pairs],
+        "prd_deps": relevant_prd,
+        "context_doc": context_doc,
+    }
+    return hashlib.sha256(json.dumps(key_data, sort_keys=True).encode()).hexdigest()
+
+
+def _get_memoized_prd_so_far(state: PRDState) -> tuple[str, str]:
+    """Return (prd_so_far_text, fmt_hash).
+
+    Uses the state-cached formatted string when prd_sections is unchanged,
+    saving repeated markdown serialisation across consecutive node calls within
+    the same graph invocation.
+    """
+    prd_sections = state.get("prd_sections", {})
+    fmt_hash = hashlib.sha256(
+        json.dumps(prd_sections, sort_keys=True).encode()
+    ).hexdigest()
+    cached_hash = state.get("_prd_sections_fmt_hash")
+    cached_text = state.get("_formatted_prd_so_far")
+    if cached_hash == fmt_hash and cached_text is not None:
+        return cached_text, fmt_hash
+    return _format_prd_so_far(prd_sections), fmt_hash
+
+
+# ── Node: detect_impact ───────────────────────────────────────────────────────
+
+def detect_impact_node(state: PRDState) -> dict:
+    """
+    Determines which already-drafted sections are impacted by the latest answer.
+
+    Two passes (run concurrently):
+    1. Primary impact: rule-based keyword lookup + LLM fallback on the confirmed
+       answer — finds sections worth re-drafting.
+    2. Side-fact extraction: scans raw_answer_buffer for extra facts beyond the
+       direct answer (stakeholders, timelines, dependencies, etc.) and maps them
+       to PRD sections. Side facts are committed to confirmed_qa_store and their
+       target sections are added to impacted_sections for side-drafting.
+
+    Sets `impacted_sections` in state (empty list = no side-writes this turn).
+    Clears `raw_answer_buffer` after use.
+    """
+    section = get_section_by_index(state["section_index"])
+    already_drafted = set(state.get("prd_sections", {}).keys())
+    candidates = already_drafted - {section.id}
+
+    # Data for primary impact detection
+    qa_pairs = state.get("section_qa_pairs", [])
+    latest_qa = qa_pairs[-1] if qa_pairs else {}
+    question = latest_qa.get("questions", state.get("current_questions", ""))
+    answer = latest_qa.get("answer", "")
+    iteration = state.get("iteration", 0)
+
+    # raw_answer_buffer was preserved by interpret_and_echo_node for this pass
+    raw_answer = state.get("raw_answer_buffer", "").strip()
+
+    def _run_primary() -> tuple[list[str], dict[str, float]]:
+        if not candidates:
+            return [], {}
+        rule_imp = _rule_impacted_sections(
+            question=question,
+            answer=answer,
+            already_drafted=candidates,
+            current_section_id=section.id,
+            max_sections=_MAX_SIDE_WRITES,
+        )
+        if rule_imp:
+            sliced = rule_imp[:_MAX_SIDE_WRITES]
+            return sliced, {sid: 1.0 for sid in sliced}
+        llm_imp = _detect_impact_llm(question, answer, list(candidates))
+        sliced = llm_imp[:_MAX_SIDE_WRITES]
+        return sliced, {sid: 0.7 for sid in sliced}
+
+    def _run_side_facts():
+        if not raw_answer:
+            return []
+        return _extract_side_facts(question, raw_answer)
+
+    def _run_contradiction():
+        existing_store = state.get("confirmed_qa_store", {})
+        if not existing_store or not answer:
+            return None
+        return _check_contradiction(question, answer, existing_store, section.id)
+
+    with ThreadPoolExecutor(max_workers=3) as _ex:
+        _primary_f = _ex.submit(_run_primary)
+        _facts_f = _ex.submit(_run_side_facts)
+        _contra_f = _ex.submit(_run_contradiction)
+        primary_impacted, primary_scores = _primary_f.result()
+        side_facts: list[dict] = _facts_f.result()
+        contradiction_desc: str | None = _contra_f.result()
+
+    # ── Process side facts ────────────────────────────────────────────────
+    side_store_updates: dict = {}
+    side_impacted: list[str] = []
+    existing_store = state.get("confirmed_qa_store", {})
+    concept_key_base = f"{section.id}:iter_{iteration}:round_{len(qa_pairs)}"
+
+    if side_facts:
+        for sf in side_facts:
+            if not sf["section_ids"]:
+                continue
+            target_sid = next(
+                (sid for sid in sf["section_ids"] if sid != section.id), None
+            )
+            if not target_sid:
+                continue
+            sf_key = f"{target_sid}:side_fact:{concept_key_base}:{sf['category']}"
+            if sf_key not in existing_store:  # deduplicate
+                side_store_updates[sf_key] = {
+                    "answer": sf["fact"],
+                    "questions": f"[auto-captured {sf['category']}]",
+                    "section": target_sid,
+                    "section_id": target_sid,
+                    "iteration": iteration,
+                    "round": 0,
+                    "source_round": len(qa_pairs),
+                    "contradiction_flagged": False,
+                }
+            if target_sid not in primary_impacted and target_sid not in side_impacted:
+                side_impacted.append(target_sid)
+
+    # Merge: primary sections first, then side-fact sections (overall cap = _MAX_SIDE_WRITES)
+    all_impacted = primary_impacted[:]
+    for sid in side_impacted:
+        if sid not in all_impacted and len(all_impacted) < _MAX_SIDE_WRITES:
+            all_impacted.append(sid)
+
+    # Confidence scores: side-fact-only sections get 0.6 (explicit user mention, LLM-extracted);
+    # primary scores take precedence — rule-based=1.0, LLM-fallback=0.7
+    all_scores: dict[str, float] = {**{sid: 0.6 for sid in side_impacted}, **primary_scores}
+
+    result: dict = {
+        "impacted_sections": all_impacted,
+        "impacted_section_scores": all_scores,
+        "raw_answer_buffer": "",  # consumed — clear now
+    }
+    if side_store_updates:
+        result["confirmed_qa_store"] = side_store_updates
+
+    # ── O-1b contradiction flag (moved here from interpret_and_echo_node) ─
+    if contradiction_desc:
+        # Back-flag the concept key in the store
+        qa_pairs = state.get("section_qa_pairs", [])
+        iteration = state.get("iteration", 0)
+        concept_key = f"{section.id}:iter_{iteration}:round_{len(qa_pairs)}"
+        result.setdefault("confirmed_qa_store", {})[concept_key] = {
+            "contradiction_flagged": True,
+        }
+        result["contradiction_log"] = [{
+            "concept_key": concept_key,
+            "prior": "see confirmed_qa_store",
+            "new": answer[:200],
+            "section": section.title,
+            "description": contradiction_desc,
+        }]
+        result["chat_history"] = [{
+            "role": "assistant",
+            "type": "contradiction_flag",
+            "content": (
+                f"⚠️ **Heads up — this might conflict with something you said earlier.**\n\n"
+                f"{contradiction_desc}\n\n"
+                "_Using your latest answer. You can clarify if needed._"
+            ),
+        }]
+
+    return result
+
+
+def _detect_impact_llm(
+    question: str,
+    answer: str,
+    candidate_section_ids: list[str],
+) -> list[str]:
+    """
+    LLM-based fallback for impact detection.
+    Returns up to _MAX_SIDE_WRITES section IDs.
+    """
+    if not candidate_section_ids:
+        return []
+    llm = _get_llm()
+    try:
+        resp = llm.invoke([
+            HumanMessage(content=IMPACT_DETECTION_PROMPT.format(
+                question=question,
+                answer=answer,
+                candidate_sections=", ".join(candidate_section_ids),
+            ))
+        ])
+        text = resp.content.strip()
+        if text.upper() == "NONE" or not text:
+            return []
+        found = [
+            s.strip() for s in text.lower().split(",")
+            if s.strip() in candidate_section_ids
+        ]
+        return found[:_MAX_SIDE_WRITES]
+    except Exception:
+        return []
+
+
 def draft_node(state: PRDState) -> dict:
     """
-    Drafter — synthesises all Q&A pairs for the current section into a draft.
+    Drafter — synthesises Q&A pairs for the current section into a draft.
+
+    Phase 1 hybrid extension: also re-drafts up to _MAX_SIDE_WRITES prior
+    sections listed in `impacted_sections` (set by detect_impact_node).
+    Side drafts run in parallel with ThreadPoolExecutor.
+    The material_change_threshold guard (_MATERIAL_CHANGE_RATIO) suppresses
+    rewrites whose net text change is below the threshold (silent non-event).
     """
     ctx = _log_ctx(state, "draft_node")
     t0 = time.monotonic()
@@ -325,59 +1388,74 @@ def draft_node(state: PRDState) -> dict:
         message="draft_node started", qa_rounds=qa_rounds,
     )
     section = get_section_by_index(state["section_index"])
-    llm = _get_llm()
+    prd_so_far, _fmt_hash = _get_memoized_prd_so_far(state)
+    context_doc = state.get("context_doc", "")
+    section_draft_meta = state.get("section_draft_meta", {})
+    existing_primary_draft = state.get("prd_sections", {}).get(section.id, "")
 
-    prd_so_far = _format_prd_so_far(state.get("prd_sections", {}))
-
-    prd_context_block = (
-        DRAFTER_PRD_CONTEXT_BLOCK.format(prd_so_far=prd_so_far)
-        if prd_so_far
-        else ""
+    # ── Primary draft: current section ──────────────────────────────────────
+    primary_qa = state.get("section_qa_pairs", [])
+    primary_meta, should_primary_draft, skip_reason = _build_section_draft_meta(
+        section,
+        primary_qa,
+        existing_primary_draft,
+        section_draft_meta.get(section.id, {}),
     )
-    context_doc_block = (
-        DRAFTER_CONTEXT_DOC_BLOCK.format(context_doc=state["context_doc"])
-        if state.get("context_doc")
-        else ""
-    )
 
-    # Format accumulated Q&A for this section
-    qa_parts = []
-    for i, qa in enumerate(state.get("section_qa_pairs", []), 1):
-        qa_parts.append(
-            f"--- Round {i} ---\n"
-            f"Questions:\n{qa['questions']}\n\n"
-            f"PM's answer:\n{qa['answer']}"
+    if not should_primary_draft:
+        log_event(
+            **ctx, level="INFO", event_type="draft_skipped",
+            message="Skipped draft rewrite due to selective drafting policy",
+            section_id=section.id,
+            skip_reason=skip_reason,
+            draft_state=primary_meta["state"],
+            fact_count=primary_meta["fact_count"],
+            completeness_score=primary_meta["completeness_score"],
+            confidence_score=primary_meta["confidence_score"],
         )
-    qa_context = "\n\n".join(qa_parts)
+        return {
+            "current_draft": existing_primary_draft,
+            "last_section_updates": [],
+            "draft_execution_mode": "skipped",
+            "section_draft_meta": {section.id: primary_meta},
+            "_prd_sections_fmt_hash": _fmt_hash,
+            "_formatted_prd_so_far": prd_so_far,
+        }
 
-    expected_components_list = "\n".join(
-        f"  \u2022 {c}" for c in section.expected_components
+    # Check draft cache before calling the LLM
+    _draft_cache = state.get("draft_cache", {})
+    _cache_key = _compute_draft_cache_key(
+        section, primary_qa, state.get("prd_sections", {}), context_doc,
     )
+    if _cache_key in _draft_cache.get(section.id, {}):
+        primary_draft = _draft_cache[section.id][_cache_key]
+        log_event(**ctx, level="INFO", event_type="draft_cache_hit",
+                  message="Draft cache hit - skipping primary LLM call",
+                  section_id=section.id, cache_key=_cache_key[:16],
+                  cache_key_components={
+                      "section_id": section.id,
+                      "dep_ids": getattr(section, "context_depends_on", []),
+                      "qa_rounds": len(primary_qa),
+                      "context_doc_present": bool(context_doc),
+                  })
+        _primary_draft_ms = 0
+    else:
+        _t1 = time.monotonic()
+        primary_draft = _draft_one_section(section, primary_qa, prd_so_far, context_doc)
+        _primary_draft_ms = int((time.monotonic() - _t1) * 1000)
+        log_event(**ctx, level="INFO", event_type="draft_cache_miss",
+                  message="Draft cache miss - LLM call made",
+                  section_id=section.id, cache_key=_cache_key[:16],
+                  primary_draft_latency_ms=_primary_draft_ms,
+                  cache_key_components={
+                      "section_id": section.id,
+                      "dep_ids": getattr(section, "context_depends_on", []),
+                      "qa_rounds": len(primary_qa),
+                      "context_doc_present": bool(context_doc),
+                  })
 
-    system_prompt = DRAFTER_SYSTEM.format(
-        section_title=section.title,
-        section_description=section.description,
-        expected_components_list=expected_components_list,
-        prd_context_block=prd_context_block,
-        context_doc_block=context_doc_block,
-        global_rigor_block=GLOBAL_RIGOR_BLOCK,
-    )
-
-    response = llm.invoke(
-        [
-            SystemMessage(content=system_prompt),
-            HumanMessage(
-                content=(
-                    f"Based on the Q&A below, write the '{section.title}' section:\n\n"
-                    f"{qa_context}"
-                )
-            ),
-        ]
-    )
-    draft = response.content.strip()
-
-    assumption_count = draft.upper().count("[ASSUMPTION]")
-    if not draft:
+    assumption_count = primary_draft.upper().count("[ASSUMPTION]")
+    if not primary_draft:
         log_event(**ctx, level="WARNING", event_type="drafter_empty_output",
                   message="draft_node produced an empty draft")
     if assumption_count > 3:
@@ -387,29 +1465,135 @@ def draft_node(state: PRDState) -> dict:
     log_event(
         **ctx, level="INFO", event_type="drafter_output",
         message="Draft produced",
-        qa_rounds=qa_rounds, draft_len=len(draft), assumption_count=assumption_count,
+        qa_rounds=qa_rounds, draft_len=len(primary_draft), assumption_count=assumption_count,
     )
-    log_event(**ctx, level="DEBUG", event_type="drafter_prompt",
-              message="Drafter system prompt", system_prompt=system_prompt)
-    log_event(**ctx, level="DEBUG", event_type="drafter_raw_output",
-              message="Drafter raw LLM response", raw_output=draft)
+
+    # ── Side drafts: impacted prior sections ─────────────────────────────────
+    _impact_scores = state.get("impacted_section_scores", {})
+    _all_impacted_raw = [s for s in state.get("impacted_sections", []) if s != section.id]
+    _side_skipped: list[dict] = []
+    impacted_ids: list[str] = []
+    for _sid in _all_impacted_raw:
+        _score = _impact_scores.get(_sid, 1.0)
+        if _score >= _SIDE_WRITE_MIN_IMPACT_SCORE:
+            impacted_ids.append(_sid)
+        else:
+            _side_skipped.append({"section_id": _sid, "score": _score, "reason": "below_min_impact_score"})
+    impacted_ids = impacted_ids[:_MAX_SIDE_WRITES]
+    if _side_skipped:
+        log_event(**ctx, level="INFO", event_type="side_write_skipped",
+                  message=f"{len(_side_skipped)} side-write(s) skipped due to low impact score",
+                  skipped=_side_skipped, threshold=_SIDE_WRITE_MIN_IMPACT_SCORE)
+
+    store = state.get("confirmed_qa_store", {})
+    existing_prd = state.get("prd_sections", {})
+
+    side_items: list[tuple] = []
+    for sec_id in impacted_ids:
+        try:
+            prior_section = get_section_by_id(sec_id)
+        except StopIteration:
+            continue
+        prior_qa = [
+            {"questions": v["questions"], "answer": v["answer"]}
+            for v in sorted(
+                store.values(),
+                key=lambda x: (x.get("iteration", 0), x.get("round", 0)),
+            )
+            if v.get("section_id") == sec_id
+        ]
+        if prior_qa:
+            side_items.append((prior_section, prior_qa))
+
+    material_updates: list[str] = []
+    silent_updates: list[str] = []
+    all_prd_updates: dict[str, str] = {section.id: primary_draft}
+    new_section_draft_meta: dict[str, dict] = {
+        section.id: {
+            **primary_meta,
+            "last_draft_hash": hashlib.sha256(primary_draft.encode()).hexdigest(),
+            "state": "stable",
+        }
+    }
+
+    if side_items:
+        raw_side = _draft_sections_parallel(side_items, prd_so_far, context_doc)
+        for sec_id, new_draft in raw_side.items():
+            old_draft = existing_prd.get(sec_id, "")
+            prior_section = get_section_by_id(sec_id)
+            prior_qa = [
+                {"questions": v["questions"], "answer": v["answer"]}
+                for v in sorted(
+                    store.values(),
+                    key=lambda x: (x.get("iteration", 0), x.get("round", 0)),
+                )
+                if v.get("section_id") == sec_id
+            ]
+            side_meta, _, _ = _build_section_draft_meta(
+                prior_section,
+                prior_qa,
+                new_draft,
+                section_draft_meta.get(sec_id, {}),
+            )
+            side_meta["last_draft_hash"] = hashlib.sha256(new_draft.encode()).hexdigest()
+            side_meta["state"] = "stable"
+            new_section_draft_meta[sec_id] = side_meta
+            if _is_material_change(old_draft, new_draft):
+                all_prd_updates[sec_id] = new_draft
+                material_updates.append(sec_id)
+            else:
+                silent_updates.append(sec_id)
+
+    last_section_updates = list(all_prd_updates.keys())
+
     duration_ms = int((time.monotonic() - t0) * 1000)
     log_event(
         **ctx, level="INFO", event_type="node_end",
         message="draft_node finished",
-        duration_ms=duration_ms, draft_len=len(draft), assumption_count=assumption_count,
+        duration_ms=duration_ms, draft_len=len(primary_draft),
+        assumption_count=assumption_count,
+        primary_draft_latency_ms=_primary_draft_ms,
+        primary_cache_hit=(_primary_draft_ms == 0),
+        side_write_count=len(side_items),
+        side_write_skip_count=len(_side_skipped),
+        side_material=material_updates, side_silent=silent_updates,
+        sections_total=len(all_prd_updates),
     )
 
+    # ── Build chat history entries ────────────────────────────────────────────
+    chat_entries: list[dict] = [
+        {
+            "role": "assistant",
+            "type": "draft",
+            "section": section.title,
+            "content": primary_draft,
+        }
+    ]
+
+    if material_updates:
+        section_titles = {s.id: s.title for s in PRD_SECTIONS}
+        updated_labels = ", ".join(
+            f"**{section_titles.get(sid, sid)}**" for sid in material_updates
+        )
+        chat_entries.append({
+            "role": "assistant",
+            "type": "section_update_feed",
+            "section": section.title,
+            "content": f"Also updated: {updated_labels}",
+            "updated_section_ids": material_updates,
+            "section_drafts": {sid: all_prd_updates[sid] for sid in material_updates},
+        })
+
     return {
-        "current_draft": draft,
-        "chat_history": [
-            {
-                "role": "assistant",
-                "type": "draft",
-                "section": section.title,
-                "content": draft,
-            }
-        ],
+        "current_draft": primary_draft,
+        "prd_sections": all_prd_updates,
+        "last_section_updates": last_section_updates,
+        "chat_history": chat_entries,
+        "draft_execution_mode": "drafted",
+        "draft_cache": {section.id: {_cache_key: primary_draft}},  # one key per section (bounded)
+        "section_draft_meta": new_section_draft_meta,
+        "_prd_sections_fmt_hash": _fmt_hash,
+        "_formatted_prd_so_far": prd_so_far,
     }
 
 
@@ -430,7 +1614,7 @@ def reflect_node(state: PRDState) -> dict:
     section = get_section_by_index(state["section_index"])
     llm = _get_llm()
 
-    prd_so_far = _format_prd_so_far(state.get("prd_sections", {}))
+    prd_so_far, _ = _get_memoized_prd_so_far(state)
     prior_sections_block = (
         REFLECTOR_PRIOR_SECTIONS_BLOCK.format(prd_so_far=prd_so_far)
         if prd_so_far
@@ -619,14 +1803,60 @@ def reflect_node(state: PRDState) -> dict:
         new_iteration=new_iteration, new_recovery_count=new_recovery_count,
     )
 
+    # ── D-M8: parse JSON summary block emitted by Reflector ────────────────────
+    confidence = -1.0
+    technical_gaps = requirement_gaps  # fallback
+    user_gaps = requirement_gaps       # fallback
+
+    json_block_match = re.search(r"```json\s*(\{.*?\})\s*```", reflection_text, re.DOTALL)
+    if json_block_match:
+        try:
+            parsed = json.loads(json_block_match.group(1))
+            raw_tech = parsed.get("technical_gaps")
+            raw_user = parsed.get("user_gaps")
+            confidence = float(parsed.get("confidence", -1.0))
+            if isinstance(raw_tech, list) and raw_tech:
+                technical_gaps = "\n".join(str(g) for g in raw_tech)
+            if isinstance(raw_user, list) and raw_user:
+                user_gaps = "\n".join(str(g) for g in raw_user)
+            json_verdict = str(parsed.get("verdict", "")).upper()
+            if json_verdict and json_verdict != verdict:
+                log_event(
+                    **ctx, level="WARNING", event_type="reflect_json_verdict_mismatch",
+                    message="JSON verdict disagrees with text verdict",
+                    json_verdict=json_verdict, text_verdict=verdict,
+                )
+        except (ValueError, TypeError) as exc:
+            log_event(
+                **ctx, level="WARNING", event_type="reflect_json_parse_error",
+                message=f"Failed to parse reflector JSON block: {exc}",
+            )
+    else:
+        log_event(
+            **ctx, level="WARNING", event_type="reflect_json_missing",
+            message="Reflector output contained no JSON block — using regex fallback",
+        )
+
     return {
         "reflection": reflection_text,
         "verdict": verdict,
         "triage_decision": triage_decision,
-        "requirement_gaps": requirement_gaps,
+        "requirement_gaps": requirement_gaps,   # deprecated compat
+        "technical_gaps": technical_gaps,
+        "user_gaps": user_gaps,
         "overall_score": overall_score,
         "iteration": new_iteration,
         "recovery_mode_consecutive_count": new_recovery_count,
+        "confidence": confidence,
+        # ── Phase 1: record per-section completeness/confidence score ─────
+        "section_scores": {
+            section.id: {
+                "completeness": overall_score / 10.0 if overall_score >= 0 else -1.0,
+                "confidence": confidence,
+                "verdict": verdict,
+                "iteration": new_iteration,
+            }
+        },
         "chat_history": [
             {
                 "role": "assistant",
@@ -635,9 +1865,11 @@ def reflect_node(state: PRDState) -> dict:
                 "verdict": verdict,
                 "triage": triage_decision,
                 "overall_score": overall_score,
+                "confidence": confidence,
                 "content": reflection_text,
                 "qa_pairs": list(state.get("section_qa_pairs", [])),
-                "requirement_gaps": requirement_gaps,
+                "requirement_gaps": requirement_gaps,   # deprecated compat
+                "user_gaps": user_gaps,
                 "rubric_scores": {
                     "completeness": completeness_score,
                     "specificity": specificity_score,
@@ -721,13 +1953,26 @@ def advance_section_node(state: PRDState) -> dict:
         "iteration": 0,
         "verdict": "",
         "reflection": "",
+        "technical_gaps": "",
+        "user_gaps": "",
         "current_draft": "",
         "current_questions": "",
-        "section_qa_pairs": [],
-        "requirement_gaps": "",
+        "section_qa_pairs": [],       # deprecated compat field
+        "requirement_gaps": "",       # deprecated compat field
         "triage_decision": "",
         "recovery_mode_consecutive_count": 0,
         "overall_score": -1.0,
+        "confidence": -1.0,
+        "raw_answer_buffer": "",
+        "pending_echo": "",
+        "pending_concept_updates": {},
+        "answer_confirmation_status": "",
+        "draft_execution_mode": "",
+        "pending_interrupt_type": "question",
+        "interrupt_queue": [],
+        # Phase 1 hybrid — reset per-turn impact state
+        "impacted_sections": [],
+        "last_section_updates": [],
         "chat_history": [
             {
                 "role": "assistant",

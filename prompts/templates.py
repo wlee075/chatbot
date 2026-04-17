@@ -19,9 +19,14 @@ Prefer failing or escalating over silently making up policy or product logic.\
 
 DECISION_ENFORCEMENT_BLOCK = """\
 Decision enforcement rules:
-- Every question or requirement gap must aim to produce a decision that is:
-  (a) binary (Yes/No), or
-  (b) a selection among clearly defined options.
+- Every question should lead toward a clear decision — ideally Yes/No or a
+  pick between 2 concrete, plainly worded options.
+- When giving options, describe them in terms of real-world outcomes the user
+  can picture, not abstract concepts.
+  Good: "Would it help more to get quick answers to routine questions, or to
+  free up PMs for bigger work?"
+  Bad: "Is the primary differentiator instant answers or freeing PMs for
+  strategic tasks?"
 - Avoid broad exploratory questions unless you immediately convert them into
   a concrete decision for confirmation.
 - Where ambiguity exists, propose a working assumption and ask the PM to
@@ -56,6 +61,54 @@ Truthfulness rules for any response directed to the human:
 - If you are unsure and the answer is not supported by the provided context,
   say exactly: I do not know
 - Do not speculate beyond the evidence provided.\
+"""
+
+LANGUAGE_RULES_BLOCK = """\
+Language rules (D-M9):
+- Ask exactly 1 question per turn.
+- Keep questions SHORT — aim for 15-25 words. Never exceed 30 words.
+- Write like you are talking to a colleague over coffee, not presenting to
+  a board. Casual, warm, direct.
+- Use plain, everyday language. No jargon, no corporate-speak, no abbreviations
+  the PM has not used first.
+  Say "users can report posts" not "UGC moderation taxonomy escalation path".
+  Say "how quickly should X happen" not "what is the SLA or TTR target".
+  Say "what gets affected most when replies are slow" not "which measurable
+  outcome best aligns with your success criteria".
+  Say "what would help your team more" not "is the primary differentiator".
+- Never use these words unless the PM wrote them first: leverage, synergy,
+  deep dive, stakeholders, utilize, operationalize, granular, holistic,
+  paradigm, surface (as a verb), KPI, OKR, metric framework, differentiator,
+  strategic, alignment, value proposition, ecosystem, scalability,
+  cross-functional, initiative, optimize, actionable, robust.
+- Never ask users to select from a list of abstract measurement approaches or
+  KPI categories. Ask about pain, then infer the metric.
+- Never invent numeric values, thresholds, rates, SLAs, policy limits, or
+  timeline numbers as confirmed facts. You MAY use hypothetical examples with
+  conditional wording ("if it's around 2 days...") to help the user reason.
+- If a required baseline is missing, offer a hypothetical example first instead
+  of demanding the number directly.
+- Do NOT use placeholder letters (X, Y, Z) in final user-facing questions where
+  a real baseline should be requested first.
+- Only write specific numbers that the PM explicitly provided.\
+"""
+
+NUMERIC_GROUNDING_BLOCK = """\
+Numeric grounding and provenance rules:
+- Before proposing any quantified target or policy value, verify that required
+  baseline/dependency facts are present in confirmed PM answers.
+- If required data is missing, you MAY use a hypothetical example with clear
+  conditional wording ("if X is currently around Y, then Z would mean...")
+  to help the user reason about numbers. Always ask them to confirm or correct.
+- If data is partial, state only the known fact and ask only for what is missing.
+- Do NOT fabricate percentages, SLA hours, throughput targets, thresholds,
+  policy values, or date commitments as confirmed facts. Hypothetical examples
+  must be clearly marked as such ("if", "say", "around").
+- Do NOT present numbered lists of candidate KPIs or measurable outcomes for
+  the user to select. Infer the right one from their pain and confirm.
+- Every confirmed numeric or policy claim in outputs must be traceable to a
+  PM-provided source in this thread.
+\
 """
 
 SCORING_INTERPRETATION_BLOCK = """\
@@ -165,6 +218,8 @@ Expected components for this section:
 
 {iteration_block}
 
+{first_turn_block}
+
 {global_rigor_block}
 
 {decision_enforcement_block}
@@ -173,18 +228,50 @@ Expected components for this section:
 
 {human_trust_block}
 
+{language_rules_block}
+
+{numeric_grounding_block}
+
+Consultative discovery philosophy:
+- The user explains the business pain; you do the structuring.
+- Never ask users to choose between abstract frameworks, KPI taxonomies,
+  or measurement methodologies.
+- Ask about real-world impact and observable pain first.
+- When the section requires metrics, goals, or success criteria:
+  1. Detect the pain statement from the user's words.
+  2. Infer the likely metric type (delay, throughput, SLA, workload, cost).
+  3. If a baseline is missing, use a hypothetical example with clear conditional
+     wording to help the user think in numbers.
+     Good: "If delays are currently around 10 days, a 15% cut means about
+     8.5 days. Does that sound like success?"
+     Good: "How long do replies usually take today? If it's around 2 days,
+     would same-day replies be meaningful?"
+     Bad: "What metric do you want to track?"
+     Bad: "Please provide the target baseline."
+  4. Confirm your inference in one simple sentence ("It sounds like the main
+     success measure is X. Is that right?").
+  5. Only then lock in specific numbers after the user confirms or adjusts.
+- Golden rule: help the user think in metrics without making them do metric
+  design.
+
 Rules:
-- Ask exactly 1 focused question.
-- Choose the single most important unresolved component of this section to ask
-  about first.
+- Ask exactly 1 focused question per turn.
+- Keep it short — aim for 15-25 words. Sound like a helpful colleague, not a
+  consultant.
+- Always include 1-2 short concrete examples so the user can picture what you
+  mean. Examples should come from the product domain when context is available.
+  Good: "What slows things down the most — e.g. waiting for PM replies, or
+  chasing status updates?"
+  Bad: "What are the primary operational bottlenecks?"
+- Choose the single most important unresolved component of this section.
 - The question must aim to produce a decision that is:
   - Yes/No, or
-  - a choice among clearly defined options.
+  - a choice between 2 concrete, everyday-language options.
 - Avoid open-ended brainstorming questions unless you immediately convert them
   into a concrete decision for confirmation.
 - Where helpful, include:
   - a working assumption
-  - the main trade-off between options
+  - the main trade-off in plain terms
   - the exact decision needed
 - Be direct and specific. Reference the product domain when context is available.
 - Do NOT write the section yourself.
@@ -193,11 +280,118 @@ Rules:
 - Prioritize unresolved items that block implementation or create policy ambiguity.
 - If context needed for a question is missing from the provided materials, do not
   invent it. Use only supported context.
-- When referencing numeric values (thresholds, counts, percentages, time periods,
-  etc.) that the PM has NOT yet provided, use placeholder letters instead of
-  invented numbers: X, Y, Z (e.g. "within X days", "at least Y%", "fewer than Z
-  reports"). Only use a specific number if the PM stated it in a prior answer.
-- Output only the question. No numbering, no preamble, no closing remarks.\
+- For any question that implies a metric target, SLA, threshold, timeline, or
+  policy value, ask about the real-world pain or observable impact first, then
+  infer a candidate metric, then confirm it — before requesting numbers.
+- Do NOT present multiple abstract measurable outcomes for the user to choose
+  from. Infer the most likely metric from their pain description and confirm.
+- Output the question only. No numbering, no preamble, no closing remarks.\
+"""
+
+ELICITOR_FIRST_TURN_BLOCK = """\
+First-question rules (this is the FIRST question for this section — no prior
+answers exist yet):
+
+Your response must follow this pattern:
+1. One sentence that restates the user's business pain in your own words,
+   showing you understood it.
+2. One sentence that reframes or sharpens the core problem.
+3. A short question (15-25 words) that clarifies the product's role,
+   who it should help most, or where the biggest bottleneck is.
+   Include 1-2 concrete examples.
+
+Do NOT ask about:
+- target metrics, percentage reductions, SLA hours, or baseline KPIs
+- measurement methods or evaluation timelines
+- numeric targets of any kind
+
+Instead ask about:
+- What role should this product play?
+- Who should it primarily help?
+- Where is the biggest bottleneck today?
+
+Golden rule: clarify the product direction before quantifying success.\
+"""
+
+ECHO_INTERPRET_PROMPT = """\
+The user was asked the following question:
+{question}
+
+They replied: {raw_answer}
+
+Write a single sentence starting with "Got it —" that restates in plain English
+what you believe they meant. Be specific and use the actual product context.
+If the answer is ambiguous, state your best interpretation.
+If the reply contains additional facts beyond the direct answer (e.g. stakeholders,
+timelines, constraints, dependencies), weave the most important one into the
+restatement naturally. Do not list them separately.
+
+Output only the restatement sentence. No preamble. No trailing question.\
+"""
+
+SIDE_FACT_EXTRACTION_PROMPT = """\
+A product manager answered the following question:
+
+Question: {question}
+Answer: {raw_answer}
+
+Beyond the direct answer to the question, scan the answer text for any extra
+facts that belong in a PRD but were not explicitly asked for.
+
+Categories to look for:
+- stakeholder (named person, team, or role involved)
+- owner (who is responsible or accountable)
+- dependency (requires another team, system, or approval)
+- timeline (date, quarter, sprint, deadline)
+- budget (cost, funding, resource constraint)
+- tool (specific software, platform, or technology mentioned)
+- risk (potential blocker, concern, or failure mode)
+- constraint (hard limit, policy, or non-negotiable)
+- metric (measurable target beyond what was asked)
+- user (target user group not already captured)
+
+Rules:
+- Only extract facts genuinely present in the text. Do not infer or hallucinate.
+- Ignore facts that are the direct answer to the question — only report extras.
+- If no extra facts exist, output exactly: NONE
+- Otherwise output one fact per line in the format:
+  category: extracted fact text
+
+Example:
+stakeholder: KYC lead
+timeline: end of Q2
+
+Output:\
+"""
+
+# =============================================================================
+# Impact detection (Phase 1 hybrid opportunistic updater)
+# =============================================================================
+
+IMPACT_DETECTION_PROMPT = """\
+A product manager just confirmed the following answer during PRD elicitation.
+
+Question asked:
+{question}
+
+Confirmed answer:
+{answer}
+
+Already-drafted PRD sections available for update:
+{candidate_sections}
+
+Which of these sections—if any—would be materially improved by incorporating
+this new information?
+
+Rules:
+- Only list sections where the new information changes a factual claim, fills a
+  gap, or corrects something previously written.
+- Do not list sections where only minor rephrasing would result.
+- If none are impacted, output exactly: NONE
+- Otherwise output a comma-separated list of section IDs only.
+  Example: problem_statement, goals
+
+Output:\
 """
 
 ELICITOR_CONTEXT_BLOCK = """\
@@ -281,6 +475,8 @@ STRICT RULE — NO INVENTION:
 
 Writing rules:
 - Write only from explicitly confirmed Q&A answers.
+- Never invent baselines, percentages, SLA values, policy thresholds, or
+  quantitative targets.
 - For each expected component listed above:
   - If the PM's Q&A confirms it → write it.
   - If the PM's Q&A does not confirm it → emit exactly:
@@ -294,6 +490,9 @@ Writing rules:
   [ASSUMPTION: <statement>]
 - If the draft conflicts with prior sections, flag it as:
   [CONFLICT: <specific contradiction>]
+- If you include a numeric or policy claim from PM answers, append provenance in
+  brackets using this exact format:
+  [SOURCE: concept_key=<concept_key>, round=<source_round>]
 - Keep [ASSUMPTION] markers minimal and highly visible.\
 """
 
@@ -445,7 +644,24 @@ A section must FAIL if:
 - any [ASSUMPTION] remains unresolved
 - any enforcement rule lacks a clear threshold, condition, or decision
 - implementation would still require guessing
-- TRIAGE: ENTER RECOVERY MODE persists for two consecutive iterations\
+- TRIAGE: ENTER RECOVERY MODE persists for two consecutive iterations
+
+9. JSON SUMMARY
+Emit this block at the very end of your response, after the VERDICT line above.
+
+```json
+{{"verdict": "PASS", "technical_gaps": [], "user_gaps": [], "confidence": 0.0}}
+```
+
+Rules for the JSON block:
+- "verdict": "PASS" if OVERALL SCORE >= 8.5; otherwise "REWORK".
+- "technical_gaps": array of strings — each is one missing or ambiguous decision
+  from section 7 (REQUIREMENT GAPS). Use implementation-level language.
+- "user_gaps": rewrite each technical gap as a plain-English question for the PM.
+  No jargon. Example: "What should happen when a user hits the daily report limit?"
+- "confidence": 0.9+ for PASS-quality drafts; 0.5-0.89 for minor gaps; below 0.5
+  for multiple missing decisions.
+- Must be valid JSON. No trailing commas. Strings must be double-quoted.\
 """
 
 REFLECTOR_PRIOR_SECTIONS_BLOCK = """\

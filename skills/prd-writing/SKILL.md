@@ -125,7 +125,7 @@ Defined in `config/sections.py` as `PRD_SECTIONS: List[PRDSection]`.
 
 | Index | `id` | Title | `allow_high_level` |
 |---|---|---|---|
-| 0 | `tldr` | tl;dr | True |
+| 0 | `headliner` | Headliner | True |
 | 1 | `elevator_pitch` | Elevator Pitch | True |
 | 2 | `key_stakeholders` | Key Stakeholders | False |
 | 3 | `background` | Background | False |

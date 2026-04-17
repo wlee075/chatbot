@@ -139,7 +139,7 @@ SYNTHETIC_DRAFTS: list[dict] = [
 
 def _get_llm() -> ChatGoogleGenerativeAI:
     model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-    return ChatGoogleGenerativeAI(model=model, temperature=0)
+    return ChatGoogleGenerativeAI(model=model, temperature=0, thinking_budget=0 )
 
 
 def _parse_rubric_score(text: str, rubric: str) -> float:

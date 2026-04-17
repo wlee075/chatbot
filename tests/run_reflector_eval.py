@@ -13,7 +13,7 @@ Usage
   .venv/bin/python -m tests.run_reflector_eval --runs 3
 
   # Filter to specific case IDs
-  .venv/bin/python -m tests.run_reflector_eval --cases tldr_strong_01 goals_very_poor_01
+  .venv/bin/python -m tests.run_reflector_eval --cases headliner_strong_01 goals_very_poor_01
 
   # Override default output paths
   .venv/bin/python -m tests.run_reflector_eval \\

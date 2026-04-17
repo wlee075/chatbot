@@ -16,8 +16,8 @@ Schema per case
 
 Mapping from legacy fixtures
 ─────────────────────────────
-  F01 → tldr_strong_01
-  F02 → tldr_poor_01
+  F01 → headliner_strong_01
+  F02 → headliner_poor_01
   F03 → goals_strong_01
   F04 → goals_very_poor_01
   F05 → metrics_strong_01
@@ -30,11 +30,11 @@ Mapping from legacy fixtures
 
 CASES = [
     # ─────────────────────────────────────────────────────────────────────────
-    # tl;dr — strong
+    # Headliner — strong
     # ─────────────────────────────────────────────────────────────────────────
     {
-        "case_id": "tldr_strong_01",
-        "section_id": "tldr",
+        "case_id": "headliner_strong_01",
+        "section_id": "headliner",
         "label": "strong",
         "prior_sections": "",
         "draft_text": (
@@ -58,11 +58,11 @@ CASES = [
         ),
     },
     # ─────────────────────────────────────────────────────────────────────────
-    # tl;dr — poor
+    # Headliner — poor
     # ─────────────────────────────────────────────────────────────────────────
     {
-        "case_id": "tldr_poor_01",
-        "section_id": "tldr",
+        "case_id": "headliner_poor_01",
+        "section_id": "headliner",
         "label": "poor",
         "prior_sections": "",
         "draft_text": (
