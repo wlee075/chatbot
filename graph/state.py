@@ -11,6 +11,18 @@ class QuestionObject(TypedDict):
 RepairInstruction = Literal["", "DUPLICATE_SUPPRESSED", "REPHRASE_REQUIRED", "CLARIFY_TARGET"]
 
 
+def _merge_recent_questions(old: list[str], new: list[str] | str) -> list[str]:
+    res = list(old) if old else []
+    if not isinstance(new, list):
+        new = [new]
+    for q in new:
+        if q and q not in res:
+            res.append(q)
+    while len(res) > 3:
+        res.pop(0)
+    return res
+
+
 def _merge_dicts(a: dict, b: dict) -> dict:
     """Reducer: merges dict updates rather than replacing the entire dict."""
     return {**a, **b}
@@ -20,6 +32,12 @@ class PRDState(TypedDict):
     # ── Session identity ─────────────────────────────────────────────────────
     thread_id: str   # stable session identifier (set once per Streamlit session)
     run_id: str      # one graph invocation — UUID generated per .invoke() call
+
+    validation_flag: str
+    validation_reason: str
+    pending_numeric_clarification: bool
+    parent_question_id: str
+    repair_question_id: str
 
     # ── Static configuration ─────────────────────────────────────────────────
     context_doc: str        # raw text of the optional uploaded document (kept for compat)
@@ -44,6 +62,13 @@ class PRDState(TypedDict):
     recovery_mode_consecutive_count: int  # consecutive ENTER RECOVERY MODE verdicts
     overall_score: float    # parsed OVERALL SCORE from reflector (-1.0 = not parsed)
 
+    # ── UX Deterministic Routing (Decision Transparency) ──────────────────────
+    next_action: str             # "START_DRAFT" | "ASK_ONE_MORE" | "ASK_MULTIPLE" | "UPDATE_DRAFT" | "ADVANCE_SECTION" | "WAITING_CONFIRMATION"
+    next_action_reason: str      # concise 1-line rationale for user AI helper text
+    missing_required_fields_count: int # 0 means drafting block cleared
+    blocking_fields: list        # names of drafting blockers
+    draft_readiness_band: str    # internal band name (e.g., "Ready", "Near Ready", "Blocked")
+
     # ── Reflector outputs (v2: JSON schema) ───────────────────────────────────
     # technical_gaps: internal only — fed to Elicitor for follow-up questions
     # user_gaps:      plain English — shown to user in feedback panel
@@ -56,9 +81,18 @@ class PRDState(TypedDict):
     # ── Confirmed answers store (D-M5) ────────────────────────────────────────
     # Source of truth for all confirmed user answers.
     # Keys are canonical concept keys (e.g. "team_size", "problem_statement").
-    # Each value: {"answer": str, "section": str, "contradiction_flagged": bool}
+    # Each value: {
+    #   "fact_id": str (UUID),
+    #   "answer": str,
+    #   "section": str,
+    #   "section_id": str,
+    #   "contradiction_flagged": bool,
+    #   "version": int (turn-level version of the store when this was written)
+    # }
     # Uses merge reducer so individual concepts can be updated without full replace.
     confirmed_qa_store: Annotated[dict, _merge_dicts]
+    store_version: int      # incremented on every turn with a canonical write
+    rebuild_count: int      # total number of state reconciliation events
 
     # ── section_qa_pairs (DEPRECATED as source of truth) ─────────────────────
     # Kept as a derived view written simultaneously with confirmed_qa_store.
@@ -118,10 +152,25 @@ class PRDState(TypedDict):
     raw_answer_buffer: str       # latest unconfirmed raw user response
     current_question_object: QuestionObject  # structured question from Elicitor
     remaining_subparts: list[str]            # unfilled parts
+    
+    # ── Explicit clarification loop tracking ───────────────────────────────────
+    active_question_id: str
+    active_question_type: str
+    active_question_options: list[str]
+    resolved_option_id: str
+    question_status: str             # "OPEN" | "ANSWERED" | "SUPERSEDED"
+    answered_at: str
+    recent_questions: Annotated[list[str], _merge_recent_questions]
+    
+    # ── Phase 2 UX Tone Tracking ───────────────────────────────────────────────
+    user_facing_gap_reason: str
+    single_next_question: str
+
     repair_instruction: RepairInstruction    # Guidance passed to Elicitor if a repair hit
     pending_echo: str            # system restatement awaiting user confirmation
     pending_concept_updates: dict  # candidate Q&A not yet promoted to canonical truth
     answer_confirmation_status: str  # "" | "PENDING" | "CONFIRMED" | "CORRECTED"
+    reply_intent: str            # intent of the user's latest incoming answer
 
     # ── Structured event payload (message tagging, D-M14) ─────────────────
     # Set by await_answer_node when user submits a structured tagged event.
@@ -133,6 +182,7 @@ class PRDState(TypedDict):
     # Append-only log of processed TAG_MESSAGE_AS_TRUTH and CORRECT_MESSAGE events.
     # Each item: {event_type, target_message_id, content, section, concept_key}
     event_history: Annotated[list, operator.add]
+    correction_stats: Annotated[dict, _merge_dicts]
 
     # ── Hybrid opportunistic updater (Phase 1) ────────────────────────────
     # section_scores: per-section completeness/confidence written by reflect_node.

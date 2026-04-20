@@ -149,6 +149,7 @@ def _build_initial_state(image_context: list[str]) -> dict:
         "impacted_sections": [],
         "last_section_updates": [],
         "confirmed_qa_store": {},
+        "store_version": 0,
         "section_qa_pairs": [],
         "pending_interrupt_type": "question",
         "interrupt_queue": [],
@@ -160,6 +161,7 @@ def _build_initial_state(image_context: list[str]) -> dict:
         "chat_history": [],
         "prd_markdown": "",
         "is_complete": False,
+        "rebuild_count": 0,
     }
 
 
@@ -356,7 +358,12 @@ def _present_content(content: str, source_lookup: dict[str, str] | None = None, 
             # Render with hover tooltip showing the answer
             tooltip_html = f"<div class='cite-tooltip'>{answer_text_escaped}</div>" if answer_text else ""
             return f"<span class='cite-chip' onclick=\"if(window._citationHandler)window._citationHandler('{target}');\">{tooltip_html}your earlier answer ↗</span>"
-        return f"<span class='cite-fallback'>(round {round_n})</span>"
+        # Ship-now UI Fallback (instead of generic (round N))
+        if answer_text:
+            snippet_text = (answer_text[:119] + "…") if len(answer_text) > 120 else answer_text
+            snippet_text = snippet_text.replace("\n", " ").strip()
+            return f"<span class='cite-fallback'>(from: \"{html.escape(snippet_text)}\")</span>"
+        return ""
 
     text = _SOURCE_TAG_RE.sub(_source_repl, text)
     
@@ -632,7 +639,12 @@ def _stream_graph_resume(payload: dict | str) -> None:
         stream_slot.empty()
         st.session_state.last_elapsed_ms = None
         st.session_state.last_node_timings_ms = {}
-        st.error(f"Something went wrong: {exc}")
+        import uuid
+        import traceback
+        req_id = str(uuid.uuid4())[:8]
+        # Write traceback to console/logs, never to UI
+        print(f"UI CRASH [{req_id}]:\n{traceback.format_exc()}")
+        st.error(f"We hit an unexpected snag parsing your request. Please try again. (Ref: {req_id})")
         return
 
     if last_node:
@@ -789,83 +801,89 @@ if st.session_state.graph_started:
         confirmed_qa_store,
     )
 
+    # Chunk chat_history into turns based on user boundaries
+    turns = []
+    current_turn = {"user": None, "assistant": []}
+    
     for idx, msg in enumerate(chat_history):
-        role = msg.get("role", "assistant")
-        msg_type = msg.get("type", "")
-        content = msg.get("content", "")
-        msg_id = f"msg_{idx}"
-        st.markdown(f'<div id="{msg_id}"></div>', unsafe_allow_html=True)
+        msg["_idx"] = idx  # Keep track of original index for msg_id
+        if msg.get("role") == "user":
+            if current_turn["user"] or current_turn["assistant"]:
+                turns.append(current_turn)
+            current_turn = {"user": msg, "assistant": []}
+        else:
+            current_turn["assistant"].append(msg)
+            
+    if current_turn["user"] or current_turn["assistant"]:
+        turns.append(current_turn)
 
-        if role == "user":
+    for turn in turns:
+        # 1. Render User Message if any
+        if turn["user"]:
+            user_msg = turn["user"]
+            content = user_msg.get("content", "")
+            msg_id = f"msg_{user_msg['_idx']}"
+            st.markdown(f'<div id="{msg_id}"></div>', unsafe_allow_html=True)
             with st.chat_message("user"):
                 st.markdown(content)
-                _render_message_actions(msg_id, content, "user", msg_type)
+                _render_message_actions(msg_id, content, "user", user_msg.get("type", ""))
 
-        elif msg_type in ("system", "elicit"):
-            with st.chat_message("Agent", avatar="assistant"):
-                st.markdown(_present_content(content, source_lookup, confirmed_qa_store), unsafe_allow_html=True)
-                _render_message_actions(msg_id, content, "assistant", msg_type)
+        # 2. Render Single Terminal Intents for Assistant
+        assistant_msgs = turn["assistant"]
+        if not assistant_msgs:
+            continue
+            
+        # Classify the terminal block for this cycle
+        has_advance = any(m.get("type") in ("advance", "complete") for m in assistant_msgs)
+        
+        # Single Bubble Context
+        with st.chat_message("Agent", avatar="assistant"):
+            for msg in assistant_msgs:
+                msg_type = msg.get("type", "")
+                content = msg.get("content", "")
+                msg_id = f"msg_{msg['_idx']}"
+                st.markdown(f'<div id="{msg_id}"></div>', unsafe_allow_html=True)
+                
+                # --- Filter Logic ---
+                if msg_type in ("reflect", "elicit") and has_advance:
+                    # Forbidden: ADVANCE_SECTION + clarification request
+                    continue
+                    
+                if msg_type == "elicit" and "I have all the details I need for this section. Let's move on." in content and len(content) > 65:
+                    content = content.replace("I have all the details I need for this section. Let's move on.", "").strip()
 
-        elif msg_type == "draft":
-            with st.chat_message("Agent", avatar="assistant"):
-                with st.expander("📝 View draft", expanded=False):
+                # --- Render Logic ---
+                if msg_type in ("system", "elicit"):
                     st.markdown(_present_content(content, source_lookup, confirmed_qa_store), unsafe_allow_html=True)
-
-        elif msg_type == "contradiction_flag":
-            with st.chat_message("Agent", avatar="assistant"):
-                st.markdown(content)
-                evidence = msg.get("contradiction_evidence")
-                if evidence:
-                    with st.expander("🔍 View earlier reply"):
-                        st.markdown(f"**Earlier you said:**\n\n> {evidence.get('evidence_snippet', '')}")
-
-        elif msg_type == "reflect":
-            verdict = msg.get("verdict", "REWORK")
-            review_summary = _build_review_summary(msg)
-            with st.chat_message("Agent", avatar="assistant"):
-                if verdict == "PASS":
-                    st.success("**Approved ✅**")
-                else:
-                    st.warning("**Needs one more update ⚠️**")
-
-                st.markdown(
-                    _present_content(review_summary["explanation"], source_lookup, confirmed_qa_store),
-                    unsafe_allow_html=True,
-                )
-
-                st.markdown("**Next step**")
-                st.markdown(
-                    _present_content(str(review_summary["next_step"]), source_lookup, confirmed_qa_store),
-                    unsafe_allow_html=True,
-                )
-
-                with st.expander("Advanced review details", expanded=False):
-                    confidence = review_summary["confidence"]
-                    if isinstance(confidence, (int, float)) and confidence >= 0:
-                        st.caption(f"Confidence: {confidence:.0%}")
-
-                    strengths = review_summary["strengths"]
-                    if strengths:
-                        st.markdown("**What is working well**")
-                        for item in strengths:
-                            st.markdown(
-                                f"- {_present_content(str(item), source_lookup, confirmed_qa_store)}",
-                                unsafe_allow_html=True,
-                            )
-
-                    if verdict != "PASS" and review_summary["improvement"]:
-                        st.markdown("**Top improvement**")
-                        st.markdown(
-                            _present_content(str(review_summary["improvement"]), source_lookup, confirmed_qa_store),
-                            unsafe_allow_html=True,
-                        )
-
-                    quality_checks = review_summary["quality_checks"]
-                    if quality_checks:
-                        st.markdown("**Quality checks passed**")
-                        for item in quality_checks:
-                            st.markdown(f"- {item}")
-
+                    _render_message_actions(msg_id, content, "assistant", msg_type)
+                    
+                elif msg_type == "draft":
+                    with st.expander("📝 View draft", expanded=False):
+                        st.markdown(_present_content(content, source_lookup, confirmed_qa_store), unsafe_allow_html=True)
+                        
+                elif msg_type == "contradiction_flag":
+                    st.markdown(content)
+                    evidence = msg.get("contradiction_evidence")
+                    if evidence:
+                        with st.expander("🔍 View earlier reply"):
+                            st.markdown(f"**Earlier you said:**\n\n> {evidence.get('evidence_snippet', '')}")
+                            
+                elif msg_type == "reflect":
+                    verdict = msg.get("verdict", "REWORK")
+                    review_summary = _build_review_summary(msg)
+                    
+                    if verdict == "PASS":
+                        st.success("**Approved ✅**")
+                    else:
+                        st.warning("**Needs one more update ⚠️**")
+                        
+                    st.markdown(
+                        _present_content(review_summary["explanation"], source_lookup, confirmed_qa_store),
+                        unsafe_allow_html=True,
+                    )
+                    
+                    # The next_action_reason is only for backend telemetry and no longer displayed in the UI.
+                    
                     minor_notes = review_summary["minor_wording_notes"]
                     if minor_notes:
                         st.markdown("**Minor wording notes**")
@@ -879,52 +897,39 @@ if st.session_state.graph_started:
                     with st.expander("Internal review debug", expanded=False):
                         st.markdown(_present_content(content, source_lookup, confirmed_qa_store), unsafe_allow_html=True)
 
-        elif msg_type == "echo_confirmation":
-            with st.chat_message("Agent", avatar="assistant"):
-                st.markdown(_present_content(content, source_lookup, confirmed_qa_store), unsafe_allow_html=True)
+                elif msg_type == "echo_confirmation":
+                    st.markdown(_present_content(content, source_lookup, confirmed_qa_store), unsafe_allow_html=True)
 
-        elif msg_type == "reask":
-            with st.chat_message("Agent", avatar="assistant"):
-                st.info(_present_content(content, source_lookup, confirmed_qa_store))
+                elif msg_type == "reask":
+                    st.info(_present_content(content, source_lookup, confirmed_qa_store))
 
-        elif msg_type == "contradiction_flag":
-            with st.chat_message("Agent", avatar="assistant"):
-                st.warning(_present_content(content, source_lookup, confirmed_qa_store))
+                elif msg_type == "tagged_event":
+                    st.success(_present_content(content, source_lookup, confirmed_qa_store))
 
-        elif msg_type == "tagged_event":
-            with st.chat_message("Agent", avatar="assistant"):
-                st.success(_present_content(content, source_lookup, confirmed_qa_store))
+                elif msg_type == "section_update_feed":
+                    st.markdown(f"📊 {_present_content(content, source_lookup, confirmed_qa_store)}")
+                    updated_ids = msg.get("updated_section_ids", [])
+                    drafts = msg.get("section_drafts", {})
+                    for sec_id in updated_ids:
+                        sec_title = _display_section_title(next(
+                            (s.title for s in PRD_SECTIONS if s.id == sec_id), sec_id
+                        ))
+                        latest_draft = sv.get("prd_sections", {}).get(
+                            sec_id, drafts.get(sec_id, "")
+                        )
+                        if latest_draft:
+                            with st.expander(
+                                f"🔄 {sec_title} — view updated draft",
+                                expanded=False,
+                            ):
+                                st.markdown(_present_content(latest_draft, source_lookup, confirmed_qa_store), unsafe_allow_html=True)
 
-        elif msg_type == "section_update_feed":
-            with st.chat_message("Agent", avatar="assistant"):
-                st.markdown(f"📊 {_present_content(content, source_lookup, confirmed_qa_store)}")
-                updated_ids = msg.get("updated_section_ids", [])
-                drafts = msg.get("section_drafts", {})
-                for sec_id in updated_ids:
-                    sec_title = _display_section_title(next(
-                        (s.title for s in PRD_SECTIONS if s.id == sec_id), sec_id
-                    ))
-                    # Always show the latest draft from graph state, not the
-                    # snapshot stored in chat_history (may be stale after
-                    # subsequent rewrites in the same session).
-                    latest_draft = sv.get("prd_sections", {}).get(
-                        sec_id, drafts.get(sec_id, "")
-                    )
-                    if latest_draft:
-                        with st.expander(
-                            f"🔄 {sec_title} — view updated draft",
-                            expanded=False,
-                        ):
-                            st.markdown(_present_content(latest_draft, source_lookup, confirmed_qa_store), unsafe_allow_html=True)
+                elif msg_type == "advance":
+                    st.success(_present_content(content, source_lookup, confirmed_qa_store))
 
-        elif msg_type == "advance":
-            with st.chat_message("Agent", avatar="assistant"):
-                st.success(_present_content(content, source_lookup, confirmed_qa_store))
-
-        elif msg_type == "complete":
-            with st.chat_message("Agent", avatar="assistant"):
-                st.balloons()
-                st.success(_present_content(content, source_lookup, confirmed_qa_store))
+                elif msg_type == "complete":
+                    st.balloons()
+                    st.success(_present_content(content, source_lookup, confirmed_qa_store))
 
 # ── Pending input: render user bubble + stream ABOVE the composer row ────────
 # Stored by the composer when user submits; processed here so the messages
@@ -1000,6 +1005,26 @@ with _inp_col:
         is_waiting = bool(gstate and gstate.next) and not sv.get("is_complete", False)
         if is_waiting:
             active_ref = st.session_state.get("active_reference")
+            
+            # --- Dynamic UX Transparency Text ---
+            next_action = sv.get("next_action")
+            if next_action == "START_DRAFT":
+                helper_copy = "After you reply, I’ll likely begin drafting."
+            elif next_action == "ASK_ONE_MORE":
+                helper_copy = "I need one final detail before drafting."
+            elif next_action == "ASK_MULTIPLE":
+                helper_copy = "I still need a few key details before drafting."
+            elif next_action == "UPDATE_DRAFT":
+                helper_copy = "Your next reply will update the current draft."
+            elif next_action == "WAITING_CONFIRMATION":
+                helper_copy = "Please confirm the last point so I can continue."
+            else:
+                helper_copy = "After you reply, I’ll either start drafting if I have enough detail, or ask one focused follow-up question."
+            
+            # Only render if we aren't directly replying to an interrupt which provides its own context
+            if not active_ref:
+                st.caption(f"_{helper_copy}_")
+            
             placeholder = (
                 "Reply, correct, or clarify…"
                 if active_ref else "Type your answer and press Enter…"

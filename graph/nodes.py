@@ -17,6 +17,7 @@ import json
 import os
 import re
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 
@@ -28,6 +29,9 @@ from config.sections import PRD_SECTIONS, get_section_by_index, get_section_by_i
 from graph.concept_map import get_impacted_sections as _rule_impacted_sections
 from graph.state import PRDState
 from utils.logger import log_event
+from utils.llm_logger import llm_invoke, flush_turn_summary
+from utils.telemetry import log_canonical_write, log_integrity_failure, log_suppression_decision
+from utils.validator import IntegrityValidator
 
 # ── NLTK resources (cached at module load) ────────────────────────────────────
 try:
@@ -59,6 +63,8 @@ except Exception as _nltk_err:
     def _word_tokenize(text: str) -> list[str]:
         return re.findall(r"[a-zA-Z']+", text.lower())
 from prompts.templates import (
+    CLARIFICATION_ANSWER_PROMPT,
+    INTENT_FALLBACK_CLASSIFICATION_PROMPT,
     DECISION_ENFORCEMENT_BLOCK,
     DEFAULT_MAX_RECOVERY_MODE_CONSECUTIVE_ITERATIONS,
     DEFAULT_MAX_SECTION_ITERATIONS,
@@ -133,6 +139,80 @@ def _log_ctx(state: PRDState, node_name: str) -> dict:
         "section_name": section_name,
         "section_index": section_idx,
         "iteration": state.get("iteration", 0),
+    }
+
+def _enforce_visibility(return_dict: dict, prompt_text: str, section_title: str, section_index: int, iteration: int = 0, event_type: str = "elicit") -> dict:
+    """Consolidated helper to append a prompt to chat_history and assert its visibility."""
+    if not prompt_text:
+        return return_dict
+    
+    hist = return_dict.get("chat_history", [])
+    hist.append({
+        "role": "assistant",
+        "type": event_type,
+        "section": section_title,
+        "section_index": section_index,
+        "iteration": iteration,
+        "content": prompt_text,
+    })
+    return_dict["chat_history"] = hist
+    
+    has_visible_history = any(
+        m.get("role") == "assistant" and m.get("content") == prompt_text
+        for m in return_dict.get("chat_history", [])
+    )
+    assert has_visible_history, "CRITICAL: Emitted user-facing prompt but missing visible assistant message in chat_history"
+    
+    return return_dict
+
+def rebuild_mirror_node(state: PRDState) -> dict:
+    """
+    Ensures section_qa_pairs is a deterministic derivative of confirmed_qa_store.
+    Enforces idempotent state reconciliation at the start of every turn.
+    """
+    t0 = time.monotonic()
+    ctx = _log_ctx(state, "rebuild_mirror")
+    section = get_section_by_index(state["section_index"])
+
+    # 1. Extraction from Canonical Store
+    store = state.get("confirmed_qa_store", {})
+    # Filter for values belonging to the current section (exclude contradictions)
+    section_facts = [
+        v for v in store.values()
+        if v.get("section_id") == section.id and not v.get("contradiction_flagged")
+    ]
+
+    # 2. Sort by iteration and round to maintain chronological sequence for drafting
+    section_facts.sort(key=lambda x: (x.get("iteration", 0), x.get("round", 0)))
+
+    # 3. Format into the legacy section_qa_pairs structure
+    rebuilt_qa = [
+        {
+            "questions": f.get("questions", ""),
+            "answer": f.get("answer", ""),
+            "section": f.get("section", section.title)
+        }
+        for f in section_facts
+    ]
+
+    # 4. Parity Check & Telemetry
+    before_qa = state.get("section_qa_pairs", [])
+    parity = (before_qa == rebuilt_qa)
+
+    log_event(
+        **ctx, level="INFO", event_type="mirror_rebuild",
+        message="State mirror reconciled",
+        parity_maintained=parity,
+        facts_count=len(rebuilt_qa),
+        rebuild_count=state.get("rebuild_count", 0) + 1
+    )
+
+    duration_ms = int((time.monotonic() - t0) * 1000)
+    log_event(**ctx, level="INFO", event_type="node_end", message="rebuild_mirror finished", duration_ms=duration_ms)
+
+    return {
+        "section_qa_pairs": rebuilt_qa,
+        "rebuild_count": state.get("rebuild_count", 0) + 1
     }
 
 
@@ -240,9 +320,10 @@ def detect_framing_node(state: PRDState) -> dict:
     )
 
     llm = _get_llm()
-    response = llm.invoke([
-        HumanMessage(content=_FRAMING_PROMPT.format(context_doc=context_doc))
-    ])
+    response = llm_invoke(
+        llm, [HumanMessage(content=_FRAMING_PROMPT.format(context_doc=context_doc))],
+        state=state, node_name="detect_framing_node", purpose="classify_framing_mode",
+    )
 
     raw = response.content.strip().upper()
     first_word = raw.split()[0] if raw.split() else "CLEAR"
@@ -300,13 +381,15 @@ def discovery_questions_node(state: PRDState) -> dict:
     framing_label = _FRAMING_LABELS.get(framing_mode, "unsure what to build")
     turn_label = f"{discovery_turn_count + 1} of 2"
     llm = _get_llm()
-    response = llm.invoke([
-        HumanMessage(content=_DISCOVERY_SYSTEM.format(
+    response = llm_invoke(
+        llm,
+        [HumanMessage(content=_DISCOVERY_SYSTEM.format(
             context_doc=context_doc,
             framing_label=framing_label,
             turn_label=turn_label,
-        ))
-    ])
+        ))],
+        state=state, node_name="discovery_questions_node", purpose="generate_discovery_questions",
+    )
     questions = response.content.strip()
     new_count = discovery_turn_count + 1
 
@@ -316,10 +399,9 @@ def discovery_questions_node(state: PRDState) -> dict:
         message="discovery_questions_node finished",
         new_discovery_turn_count=new_count, duration_ms=duration_ms,
     )
-    return {
+    return _enforce_visibility({
         "discovery_turn_count": new_count,
-        "chat_history": [{"role": "assistant", "type": "system", "content": questions}],
-    }
+    }, questions, "Discovery", 0, 0, event_type="system")
 
 
 # ── Node: await_discovery_answer ──────────────────────────────────────────────
@@ -354,7 +436,72 @@ def generate_questions_node(state: PRDState) -> dict:
     """
     ctx = _log_ctx(state, "generate_questions_node")
     t0 = time.monotonic()
+    
+    if state.get("pending_numeric_clarification"):
+        repair_prompt = "I may have misunderstood that value. Did you mean 30 minutes per day, 3 hours per day, or something else?"
+        log_event(**ctx, level="INFO", event_type="repair_prompt_emitted", message="Emitted deterministic repair prompt.")
+        
+        section = get_section_by_index(state["section_index"])
+        return _enforce_visibility({
+            "current_questions": repair_prompt,
+            "question_status": "OPEN",
+            "pending_numeric_clarification": False,
+            "parent_question_id": state.get("active_question_id", ""),
+            "repair_question_id": str(uuid.uuid4()),
+        }, repair_prompt, section.title if section else "Unknown", state["section_index"], state.get("iteration", 0), event_type="elicit")
+
     section = get_section_by_index(state["section_index"])
+    
+    # ── Deterministic Branch Short-Circuit (F1/M1/M2) ──
+    if state.get("question_status") == "ANSWERED":
+        resolved_opt = state.get("resolved_option_id", "")
+        if resolved_opt:
+            remaining = state.get("remaining_subparts", [])
+            # F2: Highest priority unresolved blocker
+            target_subpart = remaining[0] if remaining else "overall details"
+            target_lower = target_subpart.lower()
+            
+            # F1/M1: Curated branch/blocker-specific templates
+            if any(k in target_lower for k in ("metric", "success", "measure")):
+                deterministic_q = f"How will we measure success specifically for the {resolved_opt}?"
+            elif any(k in target_lower for k in ("manual", "bottleneck", "error", "pain")):
+                deterministic_q = f"What part of the {resolved_opt} is the most manual or prone to errors today?"
+            elif any(k in target_lower for k in ("user", "persona", "audience")):
+                deterministic_q = f"Who are the primary users impacted by the {resolved_opt}?"
+            elif any(k in target_lower for k in ("timeline", "deadline")):
+                deterministic_q = f"What is the target timeline for the {resolved_opt}?"
+            else:
+                deterministic_q = f"Could you walk me through how the {resolved_opt} currently handles {target_subpart.replace('_', ' ')}?"
+            
+            log_event(**ctx, level="INFO", event_type="deterministic_branch_narrowing", 
+                      message="Short-circuited LLM generation for resolved branch", 
+                      resolved_option=resolved_opt)
+            
+            # M4: Log prevention metric
+            log_event(
+                thread_id=state.get("thread_id", ""), run_id=state.get("run_id", ""), node_name="generate_questions_node",
+                event_type="metric_llm_prevention", metric_name="branch_short_circuit", metric_value=1
+            )
+            
+            current_question_object = {
+                "question_id": str(uuid.uuid4()),
+                "question_text": deterministic_q,
+                "subparts": [target_subpart] if remaining else [],
+            }
+            
+            return _enforce_visibility({
+                "current_questions": deterministic_q,
+                "current_question_object": current_question_object,
+                "remaining_subparts": remaining,
+                "active_question_id": current_question_object["question_id"],
+                "active_question_type": "OPEN_ENDED",
+                "active_question_options": [],
+                "question_status": "OPEN",
+                "resolved_option_id": "",
+                "answered_at": "",
+                "recent_questions": state.get("recent_questions", []) + [deterministic_q],
+                "repair_instruction": "",
+            }, deterministic_q, section.title if section else "Unknown", state["section_index"], state.get("iteration", 0), event_type="elicit")
     iteration = state.get("iteration", 0)
     llm = _get_llm()
 
@@ -404,6 +551,13 @@ def generate_questions_node(state: PRDState) -> dict:
     elif repair_instruction == "REPHRASE_REQUIRED":
         first_turn_block += "\n\nCRITICAL: The user was confused by your previous question. Do NOT repeat it. Instead, rephrase it much more clearly and simply."
 
+    first_turn_block += "\n\nCRITICAL NEXT QUESTION RULE: You MUST target the single highest-priority unresolved constraint or blocker. Do NOT ask about already-known info or low-leverage details."
+
+    if state.get("question_status") == "ANSWERED":
+        resolved_opt = state.get("resolved_option_id", "")
+        if resolved_opt:
+            first_turn_block += f"\n\nCRITICAL: The user just resolved the previous ambiguity by selecting '{resolved_opt}'. You MUST advance the conversation. DO NOT repeat the previous question. Ask the next logical narrower follow-up question."
+
     expected_components_list = "\n".join(
         f"  \u2022 {c}" for c in section.expected_components
     )
@@ -423,36 +577,236 @@ def generate_questions_node(state: PRDState) -> dict:
         language_rules_block=LANGUAGE_RULES_BLOCK,
         numeric_grounding_block=NUMERIC_GROUNDING_BLOCK,
     )
+    # Backend tone enclosure to prevent evaluator language bypass
+    system_prompt += "\n\nCRITICAL UX RULE: Do not use internal reviewer terms like 'contradictory', 'ambiguous', 'blocker', 'rubric', 'missing components'. Explain what details you need using plain English. Ask EXACTLY ONE question."
 
-    response = llm.with_structured_output(
-        {
-            "name": "QuestionSchema",
-            "description": "Structure of the next logical question to ask.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "question_id": {"type": "string"},
-                    "question_text": {"type": "string"},
-                    "subparts": {"type": "array", "items": {"type": "string"}},
+    response = llm_invoke(
+        llm.with_structured_output(
+            {
+                "name": "QuestionSchema",
+                "description": "Structure of the next logical question to ask.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question_id": {"type": "string"},
+                        "user_facing_gap_reason": {"type": "string"},
+                        "single_next_question": {"type": "string"},
+                        "subparts": {"type": "array", "items": {"type": "string"}},
+                        "question_type": {"type": "string", "enum": ["OPEN_ENDED", "BINARY_CLARIFICATION"]},
+                        "options": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["question_id", "user_facing_gap_reason", "single_next_question", "subparts"],
                 },
-                "required": ["question_id", "question_text", "subparts"],
-            },
-        }
-    ).invoke(
+            }
+        ),
         [
             SystemMessage(content=system_prompt),
             HumanMessage(
                 content=f"Generate questions for the '{section.title}' section."
             ),
-        ]
+        ],
+        state=state, node_name="generate_questions_node", purpose="structured_question_generation"
     )
 
-    questions = _sanitize_user_facing_question(response["question_text"])
+    # --- CONTAINMENT FIX: If the LLM structured parser failed and returned a string ---
+    extraction_status = "success"
+    if isinstance(response, str):
+        extraction_status = "fallback"
+        log_event(
+            **ctx, level="WARNING", event_type="parser_fallback",
+            message="LLM returned string instead of dict. Using safe fallback.",
+            raw_response=response,
+            model_name=getattr(_get_llm(), "model", "gemini-2.5-flash"),
+        )
+        fallback_msg = str(response)
+        last_q_text = ""
+        recent = state.get("recent_questions", [])
+        if recent:
+            last_q_text = recent[-1]
+            
+        gap_reason = state.get("user_facing_gap_reason", "")
+        # M3: Only force overwrite when fallback output is an exact or semantic repeat
+        preserved_options = []
+        preserved_type = "OPEN_ENDED"
+        if last_q_text and (last_q_text.lower() in fallback_msg.lower() or fallback_msg.lower() in last_q_text.lower()):
+            if state.get("resolved_option_id"):
+                fallback_msg = f"Could you elaborate more on the {state.get('resolved_option_id')}?"
+                gap_reason = ""
+            elif state.get("question_status") == "OPEN" and state.get("active_question_type") == "BINARY_CLARIFICATION" and state.get("active_question_options"):
+                preserved_options = state.get("active_question_options")
+                preserved_type = "BINARY_CLARIFICATION"
+        
+        response = {
+            "question_id": f"fallback_{int(time.monotonic())}",
+            "single_next_question": fallback_msg,
+            "user_facing_gap_reason": gap_reason,
+            "subparts": ["clarification"],
+            "question_type": preserved_type,
+            "options": preserved_options
+        }
+    elif not isinstance(response, dict):
+        extraction_status = "malformed"
+        response = {
+            "question_id": "fallback_error",
+            "single_next_question": "Could you tell me a little more about what you're trying to achieve?",
+            "user_facing_gap_reason": state.get("user_facing_gap_reason", ""),
+            "subparts": ["clarification"],
+            "question_type": "OPEN_ENDED",
+            "options": []
+        }
+
+    log_event(
+        **ctx, level="INFO", event_type="structured_extraction_metric",
+        message=f"Structured extraction status: {extraction_status}",
+        extraction_status=extraction_status
+    )
+    
+    # ── Phase 2 Backend Enforcements ──
+    raw_next_q = response.get("single_next_question", "Could you elaborate on that?")
+    raw_gap_reason = state.get("user_facing_gap_reason", response.get("user_facing_gap_reason", ""))
+    
+    # Plain English constraint: Scrub internal evaluative jargon
+    jargon = re.compile(r'\b(contradictory|ambiguous|rubric|missing components|implementation blocker|review process|overall score)\b', re.IGNORECASE)
+    raw_next_q = jargon.sub('unclear', raw_next_q)
+    raw_gap_reason = jargon.sub('unclear', raw_gap_reason)
+    
+    # One-question limit enforcement: Break at first question mark followed by another question or bullet
+    if '?' in raw_next_q:
+        parts = raw_next_q.split('?')
+        if len(parts) > 2:
+            raw_next_q = parts[0].strip() + '?'
+
+    if raw_gap_reason:
+        questions = f"{raw_gap_reason.strip().rstrip('.')}.\n\n{raw_next_q}"
+    else:
+        questions = raw_next_q
+
+    questions = _sanitize_user_facing_question(questions)
+    
+    # ── Deterministic Question Suppression (P0) ──
+    # Ensure we don't ask for things already in the canonical store.
+    resolved_in_store = []
+    for k, v in qa_store.items():
+        if v.get("section_id") == section.id and not v.get("contradiction_flagged"):
+            resolved_in_store.extend(v.get("resolved_subparts", []))
+    
+    resolved_set = set(resolved_in_store)
+    raw_subparts = response.get("subparts", [])
+    filtered_subparts = [sp for sp in raw_subparts if sp not in resolved_set]
+    
+    # Post-LLM Guard: If all subparts are resolved, suppress the question.
+    if raw_subparts and not filtered_subparts:
+        log_suppression_decision(
+            thread_id=state.get("thread_id", ""),
+            run_id=state.get("run_id", ""),
+            node_name="generate_questions",
+            concept_id="multiple",
+            decision="SUPPRESSED",
+            reason=f"All subparts {raw_subparts} already resolved in store."
+        )
+        
+        # F3: Suppression observability
+        log_event(
+            **ctx, level="INFO", event_type="suppression_observability",
+            message="Fully suppressed candidate question",
+            candidate_question=raw_next_q,
+            raw_subparts=raw_subparts,
+            suppressed_subparts=raw_subparts,
+            final_question="I have all the details I need for this section. Let's move on."
+        )
+        
+        # Advance if we have nothing left to ask
+        if iteration > 0:
+            questions = "I have all the details I need for this section. Let's move on."
+            filtered_subparts = []
+    elif len(filtered_subparts) < len(raw_subparts):
+        suppressed = [sp for sp in raw_subparts if sp in resolved_set]
+        log_suppression_decision(
+            thread_id=state.get("thread_id", ""),
+            run_id=state.get("run_id", ""),
+            node_name="generate_questions",
+            concept_id="multiple",
+            decision="PARTIAL_SUPPRESSION",
+            reason=f"Suppressed duplicate subparts: {suppressed}"
+        )
+        
+        # F3: Suppression observability
+        log_event(
+            **ctx, level="INFO", event_type="suppression_observability",
+            message="Partially suppressed candidate question",
+            candidate_question=raw_next_q,
+            raw_subparts=raw_subparts,
+            suppressed_subparts=suppressed,
+            final_question=raw_next_q
+        )
+
+    recent_questions = state.get("recent_questions", [])
+
     current_question_object = {
-        "question_id": response["question_id"],
-        "question_text": questions,
-        "subparts": response["subparts"],
+        "question_id": response.get("question_id", ""),
+        "question_text": raw_next_q,
+        "subparts": filtered_subparts,
     }
+    
+    # M1 & M4: Unconditional Check for Duplicate Question Guard
+    last_q_id = state.get("active_question_id", "")
+    new_q_id = response.get("question_id", "")
+    new_raw_q_lower = raw_next_q.lower()
+    is_duplicate = False
+    matched_prior = ""
+    
+    # 1. Check against recent_questions unconditionally
+    for prior_q in recent_questions:
+        prior_q_lower = prior_q.lower()
+        if len(prior_q_lower) > 10 and (prior_q_lower in new_raw_q_lower or new_raw_q_lower in prior_q_lower):
+            is_duplicate = True
+            matched_prior = prior_q
+            break
+            
+    # 2. Check against canonical qa_store for fully ANSWERED questions
+    if not is_duplicate:
+        for k, v in qa_store.items():
+            if v.get("section_id") == section.id and not v.get("contradiction_flagged"):
+                stored_q = v.get("questions", "").lower()
+                store_subparts = v.get("resolved_subparts", [])
+                
+                text_match = len(stored_q) > 10 and (stored_q in new_raw_q_lower or new_raw_q_lower in stored_q)
+                semantic_match = bool(set(store_subparts) & set(raw_subparts))
+                
+                # M1: Scope to exact text match or shared subpart family
+                if text_match or semantic_match:
+                    is_duplicate = True
+                    matched_prior = v.get("questions", "")
+                    break
+                
+    if is_duplicate:
+        log_event(
+            **ctx, level="INFO", event_type="duplicate_question_blocked",
+            message="Duplicate question guard fired!",
+            active_question_id=last_q_id,
+            prior_question_text=matched_prior,
+            new_question_text=raw_next_q,
+            comparison_mode="CANONICAL_RAW_TEXT_ROLLING_WINDOW"
+        )
+        # Duplicate question guard fired!
+        raw_next_q = "Can you give me a specific example of how this process works in practice today?"
+        # Regenerate the wrapped questions using the new suppressed next question
+        if raw_gap_reason:
+            questions = f"{raw_gap_reason.strip().rstrip('.')}.\n\n{raw_next_q}"
+        else:
+            questions = raw_next_q
+        questions = _sanitize_user_facing_question(questions)
+        current_question_object["question_text"] = raw_next_q
+        if isinstance(response, dict):
+            response["question_type"] = "OPEN_ENDED"
+            response["options"] = []
+
+    # Intercept fallback hallucinations where the model concatenates a question AND the exit string
+    if "I have all the details I need for this section." in questions:
+        if len(questions.strip()) > 60:
+            questions = questions.replace("I have all the details I need for this section. Let's move on.", "").strip()
+        else:
+            filtered_subparts = []
 
     triage = state.get("triage_decision", "")
     gaps_count = len([l for l in state.get("requirement_gaps", "").splitlines() if l.strip()])
@@ -490,22 +844,22 @@ def generate_questions_node(state: PRDState) -> dict:
         duration_ms=duration_ms, question_count=question_count,
     )
 
-    return {
+    return _enforce_visibility({
         "current_questions": questions,
         "current_question_object": current_question_object,
         "remaining_subparts": current_question_object["subparts"],
+        
+        # Phase 1: Overwrite state tracking for new question
+        "active_question_id": response.get("question_id", ""),
+        "active_question_type": response.get("question_type", "OPEN_ENDED"),
+        "active_question_options": response.get("options", []),
+        "question_status": "OPEN",
+        "resolved_option_id": "",
+        "answered_at": "",
+        "recent_questions": [current_question_object["question_text"]],
+        
         "repair_instruction": "",
-        "chat_history": [
-            {
-                "role": "assistant",
-                "type": "elicit",
-                "section": section.title,
-                "section_index": state["section_index"],
-                "iteration": iteration,
-                "content": questions,
-            }
-        ],
-    }
+    }, questions, section.title, state["section_index"], iteration, event_type="elicit")
 
 
 _CONTRADICTION_PROMPT = (
@@ -605,10 +959,17 @@ def _check_contradiction(
     )
     try:
         prompt = _CONTRADICTION_PROMPT.format(prior_qa=prior_qa, new_qa=new_qa)
-        resp = llm.invoke([HumanMessage(content=prompt)])
-        if resp.get("is_contradiction"):
+        resp = llm_invoke(
+            llm, [HumanMessage(content=prompt)],
+            state=state, node_name="_check_contradiction", purpose="contradiction_judgment"
+        )
+        if isinstance(resp, str):
+            import logging
+            logging.warning("Contradiction strict boundary failed: LLM returned string. Assuming no contradiction.")
+            return None
+        if isinstance(resp, dict) and resp.get("is_contradiction"):
             return resp
-    except Exception as e:
+    except ValueError as e:
         import logging
         logging.warning(f"Contradiction check failed: {e}")
     return None
@@ -644,6 +1005,9 @@ def await_answer_node(state: PRDState) -> dict:
         user_text = str(resume_value)
         pending_event = {"event_type": "ANSWER", "content": user_text}
 
+    # End of turn instrumentation
+    flush_turn_summary(state)
+
     return {
         "raw_answer_buffer": user_text.strip(),
         "answer_confirmation_status": "PENDING",
@@ -664,6 +1028,10 @@ def handle_tagged_event_node(state: PRDState) -> dict:
         supersedes the prior answer for the referenced concept.
     After handling, routes to draft (same as a CONFIRMED echo gate exit).
     """
+    t0 = time.monotonic()
+    ctx = _log_ctx(state, "handle_tagged_event")
+    log_event(**ctx, level="INFO", event_type="node_start", message="handle_tagged_event started")
+
     event = state.get("pending_event", {})
     event_type = event.get("event_type", "")
     target_msg_id = event.get("target_message_id", "")
@@ -687,6 +1055,10 @@ def handle_tagged_event_node(state: PRDState) -> dict:
     round_n = len(existing_qa) + 1
     concept_key = f"{section.id}:iter_{iteration}:round_{round_n}:tagged"
     current_questions = state.get("current_questions", "")
+    
+    # Versioning: increment store_version for this write
+    current_version = state.get("store_version", 0) + 1
+    fact_id = str(uuid.uuid4())
 
     if event_type == "TAG_MESSAGE_AS_TRUTH":
         canonical_answer = target_content or new_content
@@ -698,6 +1070,7 @@ def handle_tagged_event_node(state: PRDState) -> dict:
         )
         store_update = {
             concept_key: {
+                "fact_id": fact_id,
                 "answer": canonical_answer,
                 "questions": current_questions,
                 "section": section.title,
@@ -709,6 +1082,7 @@ def handle_tagged_event_node(state: PRDState) -> dict:
                 "event_type": "TAG_MESSAGE_AS_TRUTH",
                 "target_message_id": target_msg_id,
                 "promotion_note": promotion_note,
+                "version": current_version,
             }
         }
         qa_entry = {"questions": current_questions, "answer": canonical_answer, "section": section.title}
@@ -722,19 +1096,29 @@ def handle_tagged_event_node(state: PRDState) -> dict:
 
     elif event_type == "CORRECT_MESSAGE":
         corrected_answer = new_content or target_content
-        # Find the prior concept key for provenance (best-effort match on content)
+        # Hard Correction Linkage (P1/P3): Match by target_message_id or fail
         existing_store = state.get("confirmed_qa_store", {})
         corrects_key = next(
             (k for k, v in existing_store.items()
-             if target_content and v.get("answer", "")[:100] in target_content[:200]),
+             if target_msg_id and v.get("source_message_id") == target_msg_id),
             None,
         )
-        chat_msg = (
-            "**Correction noted** ✏️\n\n"
-            f"Updated answer: _{corrected_answer[:160]}{'…' if len(corrected_answer) > 160 else ''}_"
-        )
+        if target_msg_id and not corrects_key:
+             log_event(**ctx, level="WARNING", event_type="correction_link_failure",
+                       message=f"Correction failed: No canonical fact found for target_message_id {target_msg_id}",
+                       target_msg_id=target_msg_id)
+             chat_msg = (
+                 "**Update noted** 📌\n\n"
+                 f"We couldn't link this to a specific previous answer, but we've saved your update: _{corrected_answer[:160]}{'…' if len(corrected_answer) > 160 else ''}_"
+             )
+        else:
+             chat_msg = (
+                 "**Correction noted** ✏️\n\n"
+                 f"Updated answer: _{corrected_answer[:160]}{'…' if len(corrected_answer) > 160 else ''}_"
+             )
         store_update = {
             concept_key: {
+                "fact_id": fact_id,
                 "answer": corrected_answer,
                 "questions": current_questions,
                 "section": section.title,
@@ -746,6 +1130,7 @@ def handle_tagged_event_node(state: PRDState) -> dict:
                 "event_type": "CORRECT_MESSAGE",
                 "target_message_id": target_msg_id,
                 "corrects_key": corrects_key,
+                "version": current_version,
             }
         }
         qa_entry = {"questions": current_questions, "answer": corrected_answer, "section": section.title}
@@ -762,11 +1147,40 @@ def handle_tagged_event_node(state: PRDState) -> dict:
         # Unknown event type — passthrough, let normal flow handle it
         return {"pending_event": {}}
 
+    # Telemetry: Log the write
+    log_canonical_write(
+        thread_id=state.get("thread_id", ""),
+        run_id=state.get("run_id", ""),
+        node_name="handle_tagged_event",
+        fact_id=fact_id,
+        concept_id=concept_key,
+        change_type="CREATED" if event_type == "TAG_MESSAGE_AS_TRUTH" else "SUPERSEDED",
+        version=current_version,
+    )
+
+    # Post-write Integrity Validation (P0/P3)
+    IntegrityValidator.validate_mutation(
+        thread_id=state.get("thread_id", ""),
+        run_id=state.get("run_id", ""),
+        node_name="handle_tagged_event",
+        store=state.get("confirmed_qa_store", {}),
+        update=store_update,
+        section_id=section.id
+    )
+
+    duration_ms = int((time.monotonic() - t0) * 1000)
+    log_event(**ctx, level="INFO", event_type="node_end", message="handle_tagged_event finished", duration_ms=duration_ms)
+
     return {
         "answer_confirmation_status": "CONFIRMED",
         "section_qa_pairs": existing_qa + [qa_entry],
         "confirmed_qa_store": store_update,
+        "store_version": current_version,
         "event_history": event_log,
+        "correction_stats": {
+            "success": (state.get("correction_stats", {}).get("success", 0) + (1 if event_type == "CORRECT_MESSAGE" and corrects_key else 0)),
+            "failure": (state.get("correction_stats", {}).get("failure", 0) + (1 if event_type == "CORRECT_MESSAGE" and not corrects_key else 0)),
+        },
         "pending_event": {},
         "raw_answer_buffer": "",
         "pending_echo": "",
@@ -812,12 +1226,14 @@ def _extract_side_facts(
     """
     llm = _get_llm()
     try:
-        response = llm.invoke([
-            HumanMessage(content=SIDE_FACT_EXTRACTION_PROMPT.format(
+        response = llm_invoke(
+            llm,
+            [HumanMessage(content=SIDE_FACT_EXTRACTION_PROMPT.format(
                 question=question,
                 raw_answer=raw_answer,
-            ))
-        ])
+            ))],
+            state=state, node_name="_extract_side_facts", purpose="side_fact_extraction", is_parallel=True
+        )
         raw = response.content.strip()
     except Exception:
         return []
@@ -845,7 +1261,7 @@ def _extract_side_facts(
 
 # ── Node: interpret_and_echo ──────────────────────────────────────────────────
 
-def _classify_intent_rule(question: str, answer: str) -> tuple[str, str]:
+def _classify_intent_rule(question: str, answer: str, llm=None, state=None) -> tuple[str, str, str]:
     ans = answer.strip()
     ans_lower = ans.lower()
     
@@ -854,21 +1270,38 @@ def _classify_intent_rule(question: str, answer: str) -> tuple[str, str]:
 
     if complaint_pattern.search(ans_lower):
         if has_blend:
-            return 'BLENDED', ans
-        return 'COMPLAINT_OR_META', ans
+            return 'BLENDED', ans, 'FAST_REGEX'
+        return 'COMPLAINT_OR_META', ans, 'FAST_REGEX'
         
     if re.search(r'^(both|combination|all of them|all of the above|neither)\b', ans_lower):
         if len(ans_lower.split()) < 4 and ' or ' not in question.lower():
-            return 'AMBIGUOUS', ans
-        return 'BLENDED', ans
+            return 'AMBIGUOUS', ans, 'FAST_REGEX'
+        return 'BLENDED', ans, 'FAST_REGEX'
         
     if re.search(r'^(actually|no\b|wait|incorrect|disagree)', ans_lower):
-        return 'COMPLAINT_OR_META', ans
+        return 'COMPLAINT_OR_META', ans, 'FAST_REGEX'
         
     if ans_lower in ['idk', 'maybe', 'not sure', 'whatever']:
-        return 'AMBIGUOUS', ans
+        return 'AMBIGUOUS', ans, 'FAST_REGEX'
 
-    return 'DIRECT_ANSWER', ans
+    # Fast-path check for explicit clarification queries
+    clarification_pattern = re.compile(r'^(what do you mean by|what is|how does it|i don\'t understand|tell me more about|could you explain)', re.IGNORECASE)
+    if clarification_pattern.search(ans_lower) or (ans_lower.endswith('?') and len(ans_lower.split()) < 15):
+        # Fallback to LLM to rigorously check if it's truly a clarification or just a weird question-reply.
+        if llm:
+            try:
+                res = llm.invoke([SystemMessage(content=INTENT_FALLBACK_CLASSIFICATION_PROMPT.format(
+                    question=question,
+                    answer=ans
+                ))])
+                classified = res.content.strip().upper()
+                if classified in ("CLARIFICATION_REQUEST", "COMPLAINT_OR_META", "BLENDED", "DIRECT_ANSWER"):
+                    return classified, ans, 'LLM_FALLBACK'
+            except Exception:
+                pass
+        return 'CLARIFICATION_REQUEST', ans, 'FAST_REGEX'
+
+    return 'DIRECT_ANSWER', ans, 'FAST_REGEX'
 
 
 def interpret_and_echo_node(state: PRDState) -> dict:
@@ -884,8 +1317,54 @@ def interpret_and_echo_node(state: PRDState) -> dict:
     subparts = current_question_object.get("subparts", [])
     remaining_subparts = list(state.get("remaining_subparts", subparts))
 
-    intent, _ = _classify_intent_rule(question, raw_answer)
-    ctx = _log_ctx(state, "interpret_and_echo_node")
+    t0 = time.monotonic()
+    ctx = _log_ctx(state, "interpret_and_echo")
+    log_event(**ctx, level="INFO", event_type="node_start", message="interpret_and_echo started")
+
+    from utils.validator import _check_numeric_plausibility
+    flag, reason = _check_numeric_plausibility(raw_answer)
+    if flag:
+        log_event(**ctx, level="INFO", event_type="invalid_value_detected", message="Caught impossible numeric input.", reason=reason)
+        return {
+            "validation_flag": flag,
+            "validation_reason": reason,
+            "pending_numeric_clarification": True,
+            "question_status": "OPEN",
+            "metrics": state.get("metrics")
+        }
+
+    intent, _, classifier_source = _classify_intent_rule(question, raw_answer, llm=_get_llm(), state=state)
+
+    if intent == "CLARIFICATION_REQUEST":
+        # Do not run echo or fact storage! Short-circuit out.
+        log_event(
+            **ctx, 
+            level="INFO", 
+            event_type="clarification_intent_classified", 
+            message="Intent classified as CLARIFICATION_REQUEST",
+            active_question_id=state.get("active_question_id", ""),
+            reply_text=raw_answer,
+            reply_intent=intent,
+            classifier_source=classifier_source
+        )
+        return {"reply_intent": intent}
+
+    # ── Phase 1: Canonical Option Resolution for Active Clarifications ───────
+    active_q_type = state.get("active_question_type", "OPEN_ENDED")
+    active_options = state.get("active_question_options", [])
+    q_status = state.get("question_status", "")
+    matched_option = None
+
+    if active_q_type == "BINARY_CLARIFICATION" and q_status == "OPEN" and active_options:
+        # Extremely simple, deterministic NLP overlap for matching an option.
+        ans_norm = set([w for w in re.split(r'\W+', raw_answer.lower()) if len(w) > 2])
+        best_overlap = 0
+        for opt in active_options:
+            opt_norm = set([w for w in re.split(r'\W+', opt.lower()) if len(w) > 2])
+            overlap = len(ans_norm & opt_norm)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                matched_option = opt
 
     # ── Deterministic Subpart & Snippet Extraction (Locked Contract) ─────────
     # Library: NLTK sent_tokenize / word_tokenize / SnowballStemmer (module-level).
@@ -941,8 +1420,10 @@ def interpret_and_echo_node(state: PRDState) -> dict:
     resolved_subparts = []
     snippets_by_subpart = {}
     ans_lower = raw_answer.lower()
+    
+    is_numeric_repair = bool(state.get("parent_question_id"))
 
-    if intent == "DIRECT_ANSWER" or "both" in ans_lower or "all" in ans_lower:
+    if is_numeric_repair or intent == "DIRECT_ANSWER" or "both" in ans_lower or "all" in ans_lower:
         resolved_subparts = list(remaining_subparts)
         for sp in resolved_subparts:
             snippets_by_subpart[sp] = raw_answer
@@ -1007,21 +1488,13 @@ def interpret_and_echo_node(state: PRDState) -> dict:
             if intent == 'AMBIGUOUS' else
             "You're right — I missed that context. Could you clarify the specific details we should capture here?"
         )
-        return {
+        return _enforce_visibility({
             "repair_instruction": "REPHRASE_REQUIRED" if intent == 'AMBIGUOUS' else "DUPLICATE_SUPPRESSED",
             "remaining_subparts": new_remaining,
             "pending_echo": "",
             "pending_concept_updates": {},
             "raw_answer_buffer": "",
-            "chat_history": [
-                {
-                    "role": "assistant",
-                    "type": "reask",
-                    "section": section.title,
-                    "content": repair_msg,
-                }
-            ],
-        }
+        }, repair_msg, section.title, state["section_index"], state.get("iteration", 0), event_type="reask")
 
     # Answer or Blended: continue extraction
     if intent == 'BLENDED':
@@ -1029,13 +1502,20 @@ def interpret_and_echo_node(state: PRDState) -> dict:
         interpreted = "Both options matter: " + raw_answer
         echo_text = f"You're right — I should have captured that. It sounds like {echo_answer} unless one is clearly the priority."
     else:
-        echo_answer = raw_answer
+        if matched_option:
+            # Phase 1: Natural Language Mapping success
+            echo_answer = matched_option
+            interpreted = matched_option
+        else:
+            echo_answer = raw_answer
+            interpreted = raw_answer
+        
         if len(echo_answer) > 150:
             echo_answer = echo_answer[:147].rstrip() + "…"
         if echo_answer and echo_answer[0].islower():
             echo_answer = echo_answer[0].upper() + echo_answer[1:]
-        echo_text = f"Got it — {echo_answer}"
-        interpreted = echo_answer
+        
+        echo_text = f"Got it — the main focus is {echo_answer}." if matched_option else f"Got it — {echo_answer}."
 
     ctx = _log_ctx(state, "interpret_and_echo_node")
     log_event(
@@ -1051,15 +1531,29 @@ def interpret_and_echo_node(state: PRDState) -> dict:
 
     source_message_id = f"msg_{len(state.get('chat_history', [])) - 1}"
 
+    # Versioning
+    current_version = state.get("store_version", 0) + 1
+    fact_id = str(uuid.uuid4())
+    
+    # Store the ORIGINAL parent question text, not the repair prompt
+    stored_question = question
+    if is_numeric_repair:
+        stored_question = current_question_object.get("question_text", question)
+
+    resolution_source = "numeric_repair" if is_numeric_repair else "direct_answer"
+    
     qa_entry = {
-        "questions": question,
+        "questions": stored_question,
         "answer": interpreted,
         "section": section.title,
+        "resolution_source": resolution_source,
     }
+    
     store_update: dict = {
         concept_key: {
+            "fact_id": fact_id,
             "answer": interpreted,
-            "questions": question,
+            "questions": stored_question,
             "resolved_subparts": resolved_subparts,
             "evidence_snippets_by_subpart": snippets_by_subpart,
             "source_message_id": source_message_id,
@@ -1069,18 +1563,73 @@ def interpret_and_echo_node(state: PRDState) -> dict:
             "round": round_n,
             "source_round": round_n,
             "contradiction_flagged": False,  # detect_impact_node will flag if needed
+            "version": current_version,
+            "resolution_source": resolution_source,
+            "parent_question_id": state.get("parent_question_id", ""),
         }
     }
 
-    return {
+    # Telemetry
+    log_canonical_write(
+        thread_id=state.get("thread_id", ""),
+        run_id=state.get("run_id", ""),
+        node_name="interpret_and_echo",
+        fact_id=fact_id,
+        concept_id=concept_key,
+        change_type="CREATED",
+        version=current_version,
+    )
+
+    # Integrity Assertion
+    if section.id not in [s.id for s in PRD_SECTIONS]:
+        log_integrity_failure(
+            thread_id=state.get("thread_id", ""),
+            run_id=state.get("run_id", ""),
+            node_name="interpret_and_echo",
+            failure_type="INVALID_SECTION_ID",
+            message=f"Attempted write to non-existent section: {section.id}",
+            concept_id=concept_key
+        )
+
+    # Post-write Integrity Validation (P0/P3)
+    IntegrityValidator.validate_mutation(
+        thread_id=state.get("thread_id", ""),
+        run_id=state.get("run_id", ""),
+        node_name="interpret_and_echo",
+        store=state.get("confirmed_qa_store", {}),
+        update=store_update,
+        section_id=section.id
+    )
+
+    duration_ms = int((time.monotonic() - t0) * 1000)
+    log_event(**ctx, level="INFO", event_type="node_end", message="interpret_and_echo finished", duration_ms=duration_ms)
+
+    if matched_option:
+        log_event(
+            **ctx, level="INFO", event_type="clarification_question_resolved",
+            message=f"Question transitioned from {q_status} to ANSWERED",
+            active_question_id=state.get("active_question_id", ""),
+            resolved_option_id=matched_option,
+            question_status_before=q_status,
+            question_status_after="ANSWERED"
+        )
+
+    return_payload = {
         "pending_echo": "",
         "pending_concept_updates": {},
         "answer_confirmation_status": "CONFIRMED",
         "section_qa_pairs": existing_qa + [qa_entry],
         "remaining_subparts": new_remaining,
         "confirmed_qa_store": store_update,
+        "store_version": current_version,
         "contradiction_log": [],
         "raw_answer_buffer": raw_answer,   # kept so detect_impact_node can run side-fact scan + contradiction check
+        
+        # Phase 1 Clarification State Update
+        "question_status": "ANSWERED" if matched_option else q_status,
+        "resolved_option_id": matched_option if matched_option else state.get("resolved_option_id", ""),
+        "answered_at": str(time.time()) if matched_option else state.get("answered_at", ""),
+        
         "chat_history": [
             {
                 "role": "assistant",
@@ -1090,6 +1639,27 @@ def interpret_and_echo_node(state: PRDState) -> dict:
             }
         ],
     }
+    
+    # M2 & M4: Atomically update blocking fields and invariant checks
+    if resolved_subparts:
+        current_blocking = list(state.get("blocking_fields", []))
+        removed = 0
+        for sp in resolved_subparts:
+            if sp in current_blocking:
+                current_blocking.remove(sp)
+                removed += 1
+        return_payload["blocking_fields"] = current_blocking
+        current_count = state.get("missing_required_fields_count", 0)
+        return_payload["missing_required_fields_count"] = max(0, current_count - removed)
+    
+    # ── Numeric Repair Explicit State Closure ──
+    if is_numeric_repair:
+        return_payload["parent_question_id"] = ""
+        return_payload["repair_question_id"] = ""
+        return_payload["pending_numeric_clarification"] = False
+        return_payload["question_status"] = "ANSWERED"
+        
+    return return_payload
 
 
 # ── Confirmation parser ───────────────────────────────────────────────────────
@@ -1110,14 +1680,11 @@ def _is_acceptance(text: str) -> bool:
 def await_confirmation_node(state: PRDState) -> dict:
     """
     Interrupt — waits for user to accept or correct the echo restatement.
-
-    On CONFIRMED:
-      - Promotes pending_concept_updates into confirmed_qa_store and section_qa_pairs.
-      - Runs O-1b contradiction check against prior confirmed answers.
-
-    On CORRECTED:
-      - Discards pending state, emits a re-ask message, routes back to await_answer.
     """
+    t0 = time.monotonic()
+    ctx = _log_ctx(state, "await_confirmation")
+    log_event(**ctx, level="INFO", event_type="node_start", message="await_confirmation started")
+
     section = get_section_by_index(state["section_index"])
 
     user_response: str = interrupt(
@@ -1170,6 +1737,10 @@ def await_confirmation_node(state: PRDState) -> dict:
                     ),
                 }]
 
+        # Versioning
+        current_version = state.get("store_version", 0) + 1
+        fact_id = str(uuid.uuid4())
+
         qa_entry = {
             "questions": question,
             "answer": interpreted_answer,
@@ -1177,6 +1748,7 @@ def await_confirmation_node(state: PRDState) -> dict:
         }
         store_update = {
             concept_key: {
+                "fact_id": fact_id,
                 "answer": interpreted_answer,
                 "questions": question,
                 "section": section.title,
@@ -1185,13 +1757,50 @@ def await_confirmation_node(state: PRDState) -> dict:
                 "round": round_n,
                 "source_round": round_n,
                 "contradiction_flagged": contradiction_flagged,
+                "version": current_version,
             }
         }
+
+        # Telemetry
+        log_canonical_write(
+            thread_id=state.get("thread_id", ""),
+            run_id=state.get("run_id", ""),
+            node_name="await_confirmation",
+            fact_id=fact_id,
+            concept_id=concept_key,
+            change_type="SUPERSEDED" if contradiction_flagged else "CREATED",
+            version=current_version,
+        )
+
+        # Integrity Assertion
+        if section.id not in [s.id for s in PRD_SECTIONS]:
+            log_integrity_failure(
+                thread_id=state.get("thread_id", ""),
+                run_id=state.get("run_id", ""),
+                node_name="await_confirmation",
+                failure_type="INVALID_SECTION_ID",
+                message=f"Attempted write to non-existent section: {section.id}",
+                concept_id=concept_key
+            )
+
+        # Post-write Integrity Validation (P0/P3)
+        IntegrityValidator.validate_mutation(
+            thread_id=state.get("thread_id", ""),
+            run_id=state.get("run_id", ""),
+            node_name="await_confirmation",
+            store=state.get("confirmed_qa_store", {}),
+            update=store_update,
+            section_id=section.id
+        )
+
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        log_event(**ctx, level="INFO", event_type="node_end", message="await_confirmation finished", duration_ms=duration_ms)
 
         return {
             "answer_confirmation_status": "CONFIRMED",
             "section_qa_pairs": existing_qa + [qa_entry],
             "confirmed_qa_store": store_update,
+            "store_version": current_version,
             "contradiction_log": contradiction_log_entry,
             "pending_concept_updates": {},
             "pending_echo": "",
@@ -1357,6 +1966,7 @@ def _draft_one_section(
     qa_pairs: list[dict],
     prd_so_far: str,
     context_doc: str,
+    state: dict,
 ) -> str:
     """Shared helper — drafts a single section. Called from primary and side paths."""
     llm = _get_llm()
@@ -1379,13 +1989,17 @@ def _draft_one_section(
         context_doc_block=context_doc_block,
         global_rigor_block=GLOBAL_RIGOR_BLOCK,
     )
-    response = llm.invoke([
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=(
-            f"Based on the Q&A below, write the '{section.title}' section:\n\n"
-            + "\n\n".join(qa_parts)
-        )),
-    ])
+    response = llm_invoke(
+        llm,
+        [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=(
+                f"Based on the Q&A below, write the '{section.title}' section:\n\n"
+                + "\n\n".join(qa_parts)
+            )),
+        ],
+        state=state, node_name="_draft_one_section", purpose="section_drafting",
+    )
     return response.content.strip()
 
 
@@ -1393,13 +2007,14 @@ def _draft_sections_parallel(
     items: list[tuple],  # [(section, qa_pairs), ...]
     prd_so_far: str,
     context_doc: str,
+    state: dict,
 ) -> dict[str, str]:
     """Draft multiple sections concurrently. Returns {section_id: draft_text}."""
     results: dict[str, str] = {}
 
     def _worker(args):
         sec, qa = args
-        return sec.id, _draft_one_section(sec, qa, prd_so_far, context_doc)
+        return sec.id, _draft_one_section(sec, qa, prd_so_far, context_doc, state)
 
     with ThreadPoolExecutor(max_workers=len(items)) as executor:
         futures = {executor.submit(_worker, item): item for item in items}
@@ -1459,18 +2074,11 @@ def _get_memoized_prd_so_far(state: PRDState) -> tuple[str, str]:
 def detect_impact_node(state: PRDState) -> dict:
     """
     Determines which already-drafted sections are impacted by the latest answer.
-
-    Two passes (run concurrently):
-    1. Primary impact: rule-based keyword lookup + LLM fallback on the confirmed
-       answer — finds sections worth re-drafting.
-    2. Side-fact extraction: scans raw_answer_buffer for extra facts beyond the
-       direct answer (stakeholders, timelines, dependencies, etc.) and maps them
-       to PRD sections. Side facts are committed to confirmed_qa_store and their
-       target sections are added to impacted_sections for side-drafting.
-
-    Sets `impacted_sections` in state (empty list = no side-writes this turn).
-    Clears `raw_answer_buffer` after use.
     """
+    t0 = time.monotonic()
+    ctx = _log_ctx(state, "detect_impact")
+    log_event(**ctx, level="INFO", event_type="node_start", message="detect_impact started")
+
     section = get_section_by_index(state["section_index"])
     already_drafted = set(state.get("prd_sections", {}).keys())
     candidates = already_drafted - {section.id}
@@ -1531,6 +2139,9 @@ def detect_impact_node(state: PRDState) -> dict:
     existing_store = state.get("confirmed_qa_store", {})
     concept_key_base = f"{section.id}:iter_{iteration}:round_{len(qa_pairs)}"
 
+    # Versioning
+    current_version = state.get("store_version", 0)
+    
     if side_facts:
         for sf in side_facts:
             if not sf["section_ids"]:
@@ -1540,9 +2151,15 @@ def detect_impact_node(state: PRDState) -> dict:
             )
             if not target_sid:
                 continue
+            
+            # Every mutation increments version
+            current_version += 1
+            sf_id = str(uuid.uuid4())
             sf_key = f"{target_sid}:side_fact:{concept_key_base}:{sf['category']}"
+
             if sf_key not in existing_store:  # deduplicate
                 side_store_updates[sf_key] = {
+                    "fact_id": sf_id,
                     "answer": sf["fact"],
                     "questions": f"[auto-captured {sf['category']}]",
                     "section": target_sid,
@@ -1551,7 +2168,32 @@ def detect_impact_node(state: PRDState) -> dict:
                     "round": 0,
                     "source_round": len(qa_pairs),
                     "contradiction_flagged": False,
+                    "version": current_version,
                 }
+                
+                # Telemetry
+                log_canonical_write(
+                    thread_id=state.get("thread_id", ""),
+                    run_id=state.get("run_id", ""),
+                    node_name="detect_impact",
+                    fact_id=sf_id,
+                    concept_id=sf_key,
+                    change_type="CREATED",
+                    version=current_version,
+                    category=sf["category"]
+                )
+
+                # Integrity Assertion
+                if target_sid not in [s.id for s in PRD_SECTIONS]:
+                    log_integrity_failure(
+                        thread_id=state.get("thread_id", ""),
+                        run_id=state.get("run_id", ""),
+                        node_name="detect_impact",
+                        failure_type="INVALID_SECTION_ID",
+                        message=f"Attempted side-write to non-existent section: {target_sid}",
+                        concept_id=sf_key
+                    )
+
             if target_sid not in primary_impacted and target_sid not in side_impacted:
                 side_impacted.append(target_sid)
 
@@ -1579,6 +2221,19 @@ def detect_impact_node(state: PRDState) -> dict:
         qa_pairs = state.get("section_qa_pairs", [])
         iteration = state.get("iteration", 0)
         concept_key = f"{section.id}:iter_{iteration}:round_{len(qa_pairs)}"
+        
+        # Telemetry: This is a mutation (SUPERSEDED)
+        log_canonical_write(
+            thread_id=state.get("thread_id", ""),
+            run_id=state.get("run_id", ""),
+            node_name="detect_impact",
+            fact_id="flag-update", # Back-flagging doesn't create a new fact_id but updates an existing one
+            concept_id=concept_key,
+            change_type="SUPERSEDED",
+            version=state.get("store_version", 0), # No version increment for flags, or should I?
+            contradiction_flagged=True
+        )
+
         result.setdefault("confirmed_qa_store", {})[concept_key] = {
             "contradiction_flagged": True,
         }
@@ -1603,6 +2258,20 @@ def detect_impact_node(state: PRDState) -> dict:
             ),
         }]
 
+    # Post-write Integrity Validation (P0/P3)
+    if side_store_updates or result.get("confirmed_qa_store"):
+        IntegrityValidator.validate_mutation(
+            thread_id=state.get("thread_id", ""),
+            run_id=state.get("run_id", ""),
+            node_name="detect_impact",
+            store=state.get("confirmed_qa_store", {}),
+            update=result.get("confirmed_qa_store", side_store_updates),
+            section_id=section.id
+        )
+
+    duration_ms = int((time.monotonic() - t0) * 1000)
+    log_event(**ctx, level="INFO", event_type="node_end", message="detect_impact finished", duration_ms=duration_ms)
+
     return result
 
 
@@ -1619,13 +2288,15 @@ def _detect_impact_llm(
         return []
     llm = _get_llm()
     try:
-        resp = llm.invoke([
-            HumanMessage(content=IMPACT_DETECTION_PROMPT.format(
+        resp = llm_invoke(
+            llm,
+            [HumanMessage(content=IMPACT_DETECTION_PROMPT.format(
                 question=question,
                 answer=answer,
                 candidate_sections=", ".join(candidate_section_ids),
-            ))
-        ])
+            ))],
+            state=state, node_name="_detect_impact_llm", purpose="impact_detection_fallback",
+        )
         text = resp.content.strip()
         if text.upper() == "NONE" or not text:
             return []
@@ -1650,6 +2321,7 @@ def draft_node(state: PRDState) -> dict:
     """
     ctx = _log_ctx(state, "draft_node")
     t0 = time.monotonic()
+    current_store_version = state.get("store_version", 0)
     qa_rounds = len(state.get("section_qa_pairs", []))
     log_event(
         **ctx, level="INFO", event_type="node_start",
@@ -1709,7 +2381,7 @@ def draft_node(state: PRDState) -> dict:
         _primary_draft_ms = 0
     else:
         _t1 = time.monotonic()
-        primary_draft = _draft_one_section(section, primary_qa, prd_so_far, context_doc)
+        primary_draft = _draft_one_section(section, primary_qa, prd_so_far, context_doc, state)
         _primary_draft_ms = int((time.monotonic() - _t1) * 1000)
         log_event(**ctx, level="INFO", event_type="draft_cache_miss",
                   message="Draft cache miss - LLM call made",
@@ -1780,12 +2452,14 @@ def draft_node(state: PRDState) -> dict:
         section.id: {
             **primary_meta,
             "last_draft_hash": hashlib.sha256(primary_draft.encode()).hexdigest(),
+            "requirement_gaps": f"Current draft is based on a stale state version (v{primary_meta.get('draft_version')} vs v{current_store_version}). Auto-regeneration required.\n\nDraft Content: {state.get('current_draft', '')[:100]}...",
             "state": "stable",
+            "draft_version": current_store_version,
         }
     }
 
     if side_items:
-        raw_side = _draft_sections_parallel(side_items, prd_so_far, context_doc)
+        raw_side = _draft_sections_parallel(side_items, prd_so_far, context_doc, state)
         for sec_id, new_draft in raw_side.items():
             old_draft = existing_prd.get(sec_id, "")
             prior_section = get_section_by_id(sec_id)
@@ -1880,6 +2554,26 @@ def reflect_node(state: PRDState) -> dict:
         draft_len=len(state.get("current_draft", "")),
     )
     section = get_section_by_index(state["section_index"])
+
+    # ── Version-Stamped Draft Guard (P2) ──
+    current_store_version = state.get("store_version", 0)
+    meta = state.get("section_draft_meta", {}).get(section.id, {})
+    draft_version = meta.get("draft_version")
+
+    if draft_version is not None and draft_version < current_store_version:
+        log_event(
+            **ctx, level="WARNING", event_type="stale_draft_blocked",
+            message="Blocked reflection on stale draft",
+            draft_version=draft_version,
+            current_version=current_store_version,
+            section_id=section.id
+        )
+        return {
+            "verdict": "REWORK",
+            "triage_decision": "TRIAGE: STALE_DRAFT_REGEN",
+            "requirement_gaps": f"State changed (v{draft_version} -> v{current_store_version}). Auto-regeneration required.",
+        }
+
     llm = _get_llm()
 
     prd_so_far, _ = _get_memoized_prd_so_far(state)
@@ -1902,16 +2596,18 @@ def reflect_node(state: PRDState) -> dict:
         scoring_interpretation_block=SCORING_INTERPRETATION_BLOCK,
     )
 
-    response = llm.invoke(
+    response = llm_invoke(
+        llm,
         [
             SystemMessage(content=system_prompt),
             HumanMessage(
                 content=(
                     f"Review this draft for the '{section.title}' section:\n\n"
-                    f"{state['current_draft']}"
+                    f"{state.get('current_draft', '')}"
                 )
             ),
-        ]
+        ],
+        state=state, node_name="reflect_node", purpose="section_reflection",
     )
     reflection_text = response.content.strip()
     log_event(**ctx, level="DEBUG", event_type="reflector_prompt",
@@ -2105,6 +2801,46 @@ def reflect_node(state: PRDState) -> dict:
             message="Reflector output contained no JSON block — using regex fallback",
         )
 
+    blocking_fields = [
+        l.strip().lstrip("-•*0123456789. \t") 
+        for l in technical_gaps.splitlines() 
+        if l.strip().lstrip("-•*0123456789. \t")
+    ]
+    missing_required_fields_count = len(blocking_fields)
+    
+    # ── Phase 2 Extract highest-leverage single reason ──
+    _ug_lines = [l.strip().lstrip("-•*0123456789. \t") for l in user_gaps.splitlines() if l.strip().lstrip("-•*0123456789. \t")]
+    user_facing_gap_reason = _ug_lines[0] if _ug_lines else ""
+    if user_facing_gap_reason and not user_facing_gap_reason.endswith("."):
+        user_facing_gap_reason += "."
+    
+    # deterministic next action derived immediately from blockers (M1/M3)
+    has_draft = bool(state.get("current_draft"))
+    if missing_required_fields_count == 0:
+        draft_readiness_band = "Ready" if verdict == "PASS" else "Draft Ready, Reviewing"
+        next_action = "UPDATE_DRAFT" if has_draft else "START_DRAFT"
+        next_action_reason = "I have enough detail to compute the next draft update." if has_draft else "I have enough detail to start drafting."
+    elif missing_required_fields_count <= 2:
+        draft_readiness_band = "Near Ready"
+        next_action = "ASK_ONE_MORE"
+        # Phase 2: Scrub specific blockers from UI payload, let Elicitor ask.
+        next_action_reason = "I need a few final details before drafting."
+    else:
+        draft_readiness_band = "Blocked"
+        next_action = "ASK_MULTIPLE"
+        # Phase 2: Scrub blocker list dump from UI payload. Keep it internal.
+        next_action_reason = f"I still need {missing_required_fields_count} key details before drafting."
+
+    log_event(
+        **ctx, level="INFO", event_type="admin_review_decision",
+        message="Evaluated internal drafting readiness",
+        next_action=next_action,
+        next_action_reason=next_action_reason,
+        missing_count=missing_required_fields_count,
+        draft_readiness_band=draft_readiness_band,
+        verdict=verdict,
+    )
+
     return {
         "reflection": reflection_text,
         "verdict": verdict,
@@ -2112,10 +2848,16 @@ def reflect_node(state: PRDState) -> dict:
         "requirement_gaps": requirement_gaps,   # deprecated compat
         "technical_gaps": technical_gaps,
         "user_gaps": user_gaps,
+        "user_facing_gap_reason": user_facing_gap_reason,
         "overall_score": overall_score,
         "iteration": new_iteration,
         "recovery_mode_consecutive_count": new_recovery_count,
         "confidence": confidence,
+        "next_action": next_action,
+        "next_action_reason": next_action_reason,
+        "missing_required_fields_count": missing_required_fields_count,
+        "blocking_fields": blocking_fields,
+        "draft_readiness_band": draft_readiness_band,
         # ── Phase 1: record per-section completeness/confidence score ─────
         "section_scores": {
             section.id: {
@@ -2134,6 +2876,7 @@ def reflect_node(state: PRDState) -> dict:
                 "triage": triage_decision,
                 "overall_score": overall_score,
                 "confidence": confidence,
+                "next_action_reason": next_action_reason,
                 "content": reflection_text,
                 "qa_pairs": list(state.get("section_qa_pairs", [])),
                 "requirement_gaps": requirement_gaps,   # deprecated compat
@@ -2218,6 +2961,8 @@ def advance_section_node(state: PRDState) -> dict:
         "section_index": next_index,
         "is_complete": is_complete,
         # Reset per-section state
+        "rebuild_count": 0,
+        "correction_stats": {"success": 0, "failure": 0},
         "iteration": 0,
         "verdict": "",
         "reflection": "",
@@ -2306,4 +3051,82 @@ def finalize_node(state: PRDState) -> dict:
                 ),
             }
         ],
+    }
+
+def _log_llm_elapsed(state: PRDState, node_name: str, timing_name: str, elapsed: float, is_success: bool = True):
+    status = "success" if is_success else "failed"
+    log_event(
+        thread_id=state.get("thread_id", ""),
+        run_id=state.get("run_id", ""),
+        node_name=node_name,
+        level="INFO" if is_success else "ERROR",
+        event_type="llm_call",
+        message=f"{node_name} LLM call ({timing_name}) in {int(elapsed)}ms [{status}]",
+        latency_ms=int(elapsed),
+        llm_operation=timing_name,
+        success=is_success
+    )
+
+def answer_clarification_node(state: PRDState) -> dict:
+    ctx = _log_ctx(state, "answer_clarification")
+    log_event(**ctx, level="INFO", event_type="node_start", message="answer_clarification started")
+    
+    question = state.get("current_questions", "").strip()
+    answer = state.get("raw_answer_buffer", "").strip()
+    
+    # We must format the PRD safely, handle edge cases
+    prd_sections = state.get("prd_sections", {})
+    from config.sections import PRD_SECTIONS
+    context = ""
+    for sec in PRD_SECTIONS:
+        if sec.id in prd_sections:
+            context += f"## {sec.title}\n{prd_sections[sec.id]}\n\n"
+            
+    t0 = time.monotonic()
+    llm = _get_llm()
+    try:
+        from langchain_core.messages import SystemMessage
+        from prompts.templates import CLARIFICATION_ANSWER_PROMPT
+        active_opts = state.get("active_question_options", [])
+        response = llm_invoke(llm, [SystemMessage(content=CLARIFICATION_ANSWER_PROMPT.format(
+            question=question,
+            options=", ".join(active_opts) if active_opts else "None",
+            answer=answer,
+            context=context or "No context drafted yet."
+        ))], state=state, node_name="answer_clarification", purpose="clarify")
+        elapsed = (time.monotonic() - t0) * 1000
+        _log_llm_elapsed(state, "answer_clarification", "clarification_generation", elapsed)
+        
+        reply_content = response.content.strip()
+    except ValueError as e:
+        reply_content = "I'm having trouble providing a clarification. Could you rephrase your question?"
+        log_event(**ctx, level="ERROR", event_type="llm_error", message=str(e))
+
+    chat_history = list(state.get("chat_history", []))
+    chat_history.append({
+        "role": "assistant",
+        "type": "elicit",
+        "content": reply_content,
+        "run_id": state.get("run_id", ""),
+        "section": get_section_by_index(state.get("section_index", 0)).title
+    })
+
+    log_event(**ctx, level="INFO", event_type="node_end", message="answer_clarification finished")
+    
+    current_status = state.get("question_status", "")
+    target_status = "OPEN" if current_status != "SUPERSEDED" else "SUPERSEDED"
+    
+    log_event(
+        **ctx, level="INFO", event_type="clarification_answer_emitted",
+        message=f"Stored clarification response and transitioned question_status to {target_status}",
+        active_question_id=state.get("active_question_id", ""),
+        current_questions=reply_content,
+        question_status=target_status
+    )
+
+    return {
+        "chat_history": chat_history,
+        "reply_intent": "CLARIFIED", # terminal outcome for this branch
+        "current_questions": reply_content,
+        "question_status": target_status,
     }

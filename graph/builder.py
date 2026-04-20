@@ -3,6 +3,7 @@ from langgraph.graph import END, START, StateGraph
 
 from graph.nodes import (
     advance_section_node,
+    answer_clarification_node,
     await_answer_node,
     await_discovery_answer_node,
     await_first_message_node,
@@ -14,6 +15,7 @@ from graph.nodes import (
     generate_questions_node,
     handle_tagged_event_node,
     interpret_and_echo_node,
+    rebuild_mirror_node,
     reflect_node,
 )
 from graph.routing import (
@@ -21,6 +23,7 @@ from graph.routing import (
     route_after_advance,
     route_after_answer,
     route_after_discovery,
+    route_after_echo,
     route_after_framing,
     route_after_reflect,
 )
@@ -60,10 +63,12 @@ def build_graph(checkpointer: MemorySaver | None = None):
     builder.add_node("await_discovery_answer", await_discovery_answer_node)
 
     # ── Elicitation path (all paths eventually) ───────────────────────────────
+    builder.add_node("rebuild_mirror", rebuild_mirror_node)
     builder.add_node("generate_questions", generate_questions_node)
     builder.add_node("await_answer", await_answer_node)
     builder.add_node("handle_tagged_event", handle_tagged_event_node)
     builder.add_node("interpret_and_echo", interpret_and_echo_node)
+    builder.add_node("answer_clarification", answer_clarification_node)
     builder.add_node("detect_impact", detect_impact_node)
     builder.add_node("draft", draft_node)
     builder.add_node("reflect", reflect_node)
@@ -78,7 +83,7 @@ def build_graph(checkpointer: MemorySaver | None = None):
         "detect_framing",
         route_after_framing,
         {
-            "generate_questions": "generate_questions",
+            "generate_questions": "rebuild_mirror",
             "discovery_questions": "discovery_questions",
         },
     )
@@ -88,10 +93,13 @@ def build_graph(checkpointer: MemorySaver | None = None):
         "await_discovery_answer",
         route_after_discovery,
         {
-            "generate_questions": "generate_questions",
+            "generate_questions": "rebuild_mirror",
             "discovery_questions": "discovery_questions",
         },
     )
+
+    # Rebuild entry point
+    builder.add_edge("rebuild_mirror", "generate_questions")
 
     # Confirmation gate: await_answer → (route) → interpret_and_echo | handle_tagged_event
     builder.add_edge("generate_questions", "await_answer")
@@ -104,7 +112,19 @@ def build_graph(checkpointer: MemorySaver | None = None):
         },
     )
     builder.add_edge("handle_tagged_event", "detect_impact")
-    builder.add_edge("interpret_and_echo", "detect_impact")
+    
+    # New intercept logic for clarification requests
+    builder.add_conditional_edges(
+        "interpret_and_echo",
+        route_after_echo,
+        {
+            "detect_impact": "detect_impact",
+            "answer_clarification": "answer_clarification"
+        }
+    )
+    
+    # Clarification completed → return straight to waiting for answer to the NEW elicited question
+    builder.add_edge("answer_clarification", "await_answer")
     builder.add_edge("detect_impact", "draft")
 
     builder.add_conditional_edges(
@@ -112,7 +132,7 @@ def build_graph(checkpointer: MemorySaver | None = None):
         route_after_draft,
         {
             "reflect": "reflect",
-            "generate_questions": "generate_questions",
+            "generate_questions": "rebuild_mirror",
         },
     )
 
@@ -121,7 +141,8 @@ def build_graph(checkpointer: MemorySaver | None = None):
         route_after_reflect,
         {
             "advance_section": "advance_section",
-            "generate_questions": "generate_questions",
+            "generate_questions": "rebuild_mirror",
+            "draft": "draft",
         },
     )
 
@@ -129,7 +150,7 @@ def build_graph(checkpointer: MemorySaver | None = None):
         "advance_section",
         route_after_advance,
         {
-            "generate_questions": "generate_questions",
+            "generate_questions": "rebuild_mirror",
             "finalize": "finalize",
         },
     )

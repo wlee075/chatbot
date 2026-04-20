@@ -27,10 +27,8 @@ def route_after_reflect(state: PRDState) -> str:
 
     if verdict == "PASS":
         route, reason = "advance_section", "PASS"
-    elif recovery_count >= DEFAULT_MAX_RECOVERY_MODE_CONSECUTIVE_ITERATIONS:
-        route, reason = "advance_section", "RECOVERY_CAP"
-    elif iteration >= state.get("max_iterations", DEFAULT_MAX_SECTION_ITERATIONS):
-        route, reason = "advance_section", "ITER_CAP"
+    elif "TRIAGE: STALE_DRAFT_REGEN" in triage:
+        route, reason = "draft", "STALE_REGEN"
     else:
         route, reason = "generate_questions", "LOOP"
 
@@ -129,3 +127,28 @@ def route_after_answer(state: PRDState) -> str:
     if event_type in ("TAG_MESSAGE_AS_TRUTH", "CORRECT_MESSAGE"):
         return "handle_tagged_event"
     return "interpret_and_echo"
+
+
+def route_after_echo(state: PRDState) -> str:
+    """
+    Route based on intent extracted during the interpretation phase.
+    If the user asked to clarify a term, answer directly without impacting facts.
+    """
+    reply_intent = state.get("reply_intent")
+    if reply_intent == "CLARIFICATION_REQUEST":
+        route = "answer_clarification"
+    else:
+        route = "detect_impact"
+        
+    log_event(
+        thread_id=state.get("thread_id", ""),
+        run_id=state.get("run_id", ""),
+        node_name="route_after_echo",
+        level="INFO",
+        event_type="clarification_route_taken",
+        message=f"Routing after echo: {reply_intent} → {route}",
+        from_node="interpret_and_echo",
+        to_node=route,
+        reason=reply_intent
+    )
+    return route

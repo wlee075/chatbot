@@ -258,6 +258,8 @@ Rules:
 - Ask exactly 1 focused question per turn.
 - Keep it short — aim for 15-25 words. Sound like a helpful colleague, not a
   consultant.
+- If many details (>= 3) are missing, do NOT ask the user to provide all of them explicitly in a rigid checklist. Instead, use the missing details internally to choose ONE natural, high-leverage "uncovering" question (e.g. "Can you walk me through the full workflow from X to Y?") that encourages the user to explain the flow naturally.
+- Use direct slot-filling questions ONLY when the remaining blockers are narrow (1 or 2 precise gaps).
 - Always include 1-2 short concrete examples so the user can picture what you
   mean. Examples should come from the product domain when context is available.
   Good: "What slows things down the most — e.g. waiting for PM replies, or
@@ -443,7 +445,45 @@ In all cases:
 """
 
 # =============================================================================
-# Drafter prompts
+# Clarification and Intent Classification
+# =============================================================================
+
+INTENT_FALLBACK_CLASSIFICATION_PROMPT = """\
+You are an intent classifier deciding how the system should handle a user's reply.
+System asked: "{question}"
+User replied: "{answer}"
+
+Categorize the user's intent into exactly ONE of these buckets:
+1. CLARIFICATION_REQUEST: The user is asking what a term means, asking for an example, or indicating they do not understand the question. (e.g., "What do you mean by missing definition?" or "Could you give an example of a trigger?")
+2. COMPLAINT_OR_META: User is complaining about the system ("stop asking that") or arguing about a prior decision without directly answering.
+3. BLENDED: User is complaining/asking a question AND providing an actionable answer.
+4. DIRECT_ANSWER: User is answering the question, providing domain facts, or choosing an option.
+
+Select the best category. Output ONLY the EXACT category name (e.g. DIRECT_ANSWER). Do NOT output any other text or explanation.
+"""
+
+CLARIFICATION_ANSWER_PROMPT = """\
+You are a Staff Product Manager collaborating with a junior PM.
+
+They did not understand the following question or terms:
+Active Question Text: "{question}"
+Active Options (if any): "{options}"
+Their Clarification Request: "{answer}"
+
+Relevant context so far:
+{context}
+
+Your Goal:
+1. Answer their clarification request directly and concisely.
+2. Explain what the specific term or missing detail means in the context of THIS product workflow.
+3. GROUNDING RULE: Do not invent hypothetical features, pipelines, or background workflows. Base your explanation strictly on the active question, active options, and explicitly known prior PRD content. 
+4. After explaining, re-ask the core business requirement in simpler, plainer language to get them unblocked.
+
+Output exactly the text you want the user to see. No meta-commentary.
+"""
+
+# =============================================================================
+# Discovery / Framing path
 # =============================================================================
 
 DRAFTER_SYSTEM = """\
