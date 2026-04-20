@@ -28,6 +28,36 @@ from config.sections import PRD_SECTIONS, get_section_by_index, get_section_by_i
 from graph.concept_map import get_impacted_sections as _rule_impacted_sections
 from graph.state import PRDState
 from utils.logger import log_event
+
+# ── NLTK resources (cached at module load) ────────────────────────────────────
+try:
+    import nltk
+    from nltk.tokenize import sent_tokenize as _sent_tokenize, word_tokenize as _word_tokenize
+    from nltk.corpus import stopwords as _nltk_sw
+    from nltk.stem import SnowballStemmer as _SnowballStemmer
+
+    # Bootstrap required corpora once; safe to call repeatedly.
+    for _corpus in ("punkt_tab", "stopwords"):
+        try:
+            nltk.data.find(f"tokenizers/{_corpus}" if "punkt" in _corpus else f"corpora/{_corpus}")
+        except LookupError:
+            nltk.download(_corpus, quiet=True)
+
+    _STEMMER = _SnowballStemmer("english")
+    _STOPWORDS_EN: frozenset[str] = frozenset(_nltk_sw.words("english"))
+    _NLTK_AVAILABLE = True
+except Exception as _nltk_err:
+    import logging as _logging
+    _logging.warning(f"NLTK unavailable ({_nltk_err}); clause extraction will use fallback tokenizer.")
+    _STEMMER = None
+    _STOPWORDS_EN = frozenset({"a", "an", "the", "is", "are", "was", "were", "it", "they"})
+    _NLTK_AVAILABLE = False
+
+    def _sent_tokenize(text: str) -> list[str]:
+        return [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+
+    def _word_tokenize(text: str) -> list[str]:
+        return re.findall(r"[a-zA-Z']+", text.lower())
 from prompts.templates import (
     DECISION_ENFORCEMENT_BLOCK,
     DEFAULT_MAX_RECOVERY_MODE_CONSECUTIVE_ITERATIONS,
@@ -363,6 +393,17 @@ def generate_questions_node(state: PRDState) -> dict:
     else:
         first_turn_block = ""
 
+    repair_instruction = state.get("repair_instruction", "")
+    remaining_subparts = state.get("remaining_subparts", [])
+
+    if remaining_subparts:
+        first_turn_block += f"\n\nFOLLOW-UP BOUNDARY: Do NOT generate original broad question. Ask ONLY about these exact missing constraints: {remaining_subparts}."
+
+    if repair_instruction == "DUPLICATE_SUPPRESSED":
+        first_turn_block += "\n\nCRITICAL: User indicated frustration over repetition. Explicitly acknowledge context, and ensure this query is syntactically distinct and narrower."
+    elif repair_instruction == "REPHRASE_REQUIRED":
+        first_turn_block += "\n\nCRITICAL: The user was confused by your previous question. Do NOT repeat it. Instead, rephrase it much more clearly and simply."
+
     expected_components_list = "\n".join(
         f"  \u2022 {c}" for c in section.expected_components
     )
@@ -383,7 +424,21 @@ def generate_questions_node(state: PRDState) -> dict:
         numeric_grounding_block=NUMERIC_GROUNDING_BLOCK,
     )
 
-    response = llm.invoke(
+    response = llm.with_structured_output(
+        {
+            "name": "QuestionSchema",
+            "description": "Structure of the next logical question to ask.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question_id": {"type": "string"},
+                    "question_text": {"type": "string"},
+                    "subparts": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["question_id", "question_text", "subparts"],
+            },
+        }
+    ).invoke(
         [
             SystemMessage(content=system_prompt),
             HumanMessage(
@@ -391,7 +446,13 @@ def generate_questions_node(state: PRDState) -> dict:
             ),
         ]
     )
-    questions = _sanitize_user_facing_question(response.content.strip())
+
+    questions = _sanitize_user_facing_question(response["question_text"])
+    current_question_object = {
+        "question_id": response["question_id"],
+        "question_text": questions,
+        "subparts": response["subparts"],
+    }
 
     triage = state.get("triage_decision", "")
     gaps_count = len([l for l in state.get("requirement_gaps", "").splitlines() if l.strip()])
@@ -431,6 +492,9 @@ def generate_questions_node(state: PRDState) -> dict:
 
     return {
         "current_questions": questions,
+        "current_question_object": current_question_object,
+        "remaining_subparts": current_question_object["subparts"],
+        "repair_instruction": "",
         "chat_history": [
             {
                 "role": "assistant",
@@ -487,36 +551,67 @@ def _sanitize_user_facing_question(text: str) -> str:
 
 
 def _check_contradiction(
-    new_questions: str,
-    new_answer: str,
+    new_entry: dict,
+    new_key: str,
     store: dict,
     section_id: str,
-) -> str | None:
+) -> dict | None:
     """
     O-1b — lightweight contradiction check against prior answers in the same section.
-    Returns None if no contradiction found, or a plain-English description if one is.
+    1. Deterministic filter: Intersects resolved_subparts between new answer and prior answers.
+    2. Fallback LLM: Passes only matched candidates for JSON contradiction scoring.
     """
-    prior = [v for k, v in store.items() if v.get("section_id") == section_id]
-    if not prior:
+    new_subparts = set(new_entry.get("resolved_subparts", []))
+    candidates = []
+    
+    for k, v in store.items():
+        if v.get("section_id") == section_id and k != new_key:
+            prior_subparts = set(v.get("resolved_subparts", []))
+            if new_subparts.intersection(prior_subparts):
+                candidates.append((k, v))
+                
+    if not candidates:
         return None
-    prior_qa = "\n\n".join(
-        f"Q: {p['questions']}\nA: {p['answer']}" for p in prior
-    )
-    new_qa = f"Q: {new_questions}\nA: {new_answer}"
-    llm = _get_llm()
-    try:
-        resp = llm.invoke([
-            HumanMessage(content=_CONTRADICTION_PROMPT.format(
-                prior_qa=prior_qa, new_qa=new_qa
-            ))
-        ])
-        text = resp.content.strip()
-        if text.upper().startswith("YES:"):
-            return text[4:].strip()
-    except Exception:
-        pass
-    return None
 
+    # Construct strict minimal candidate text
+    prior_qa = "\\n\\n".join(
+        f"Candidate [{v.get('source_message_id', k)}]:\\n"
+        f"- Snippets: {v.get('evidence_snippets_by_subpart', v.get('answer', ''))}\\n"
+        f"- Resolved Subparts: {v.get('resolved_subparts', [])}"
+        for k, v in candidates
+    )
+    
+    new_qa = (
+        f"New Statement:\\n"
+        f"- Snippets: {new_entry.get('evidence_snippets_by_subpart', new_entry.get('answer', ''))}\\n"
+        f"- Resolved Subparts: {list(new_subparts)}"
+    )
+
+    llm = _get_llm().with_structured_output(
+        {
+            "name": "ContradictionSchema",
+            "description": "Assess if the New Statement contradicts any candidate.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "is_contradiction": {"type": "boolean"},
+                    "conflicting_message_id": {"type": "string"},
+                    "evidence_snippet": {"type": "string"},
+                    "description": {"type": "string"}
+                },
+                "required": ["is_contradiction", "conflicting_message_id", "evidence_snippet", "description"]
+            }
+        }
+    )
+    try:
+        prompt = _CONTRADICTION_PROMPT.format(prior_qa=prior_qa, new_qa=new_qa)
+        resp = llm.invoke([HumanMessage(content=prompt)])
+        if resp.get("is_contradiction"):
+            return resp
+    except Exception as e:
+        import logging
+        logging.warning(f"Contradiction check failed: {e}")
+    return None
 
 # ── Node: await_answer ────────────────────────────────────────────────────────
 
@@ -750,38 +845,197 @@ def _extract_side_facts(
 
 # ── Node: interpret_and_echo ──────────────────────────────────────────────────
 
+def _classify_intent_rule(question: str, answer: str) -> tuple[str, str]:
+    ans = answer.strip()
+    ans_lower = ans.lower()
+    
+    complaint_pattern = re.compile(r'\b(why|stop|again|already|literally).*\b(asking|said|told|answered|repeating)\b', re.IGNORECASE)
+    has_blend = 'both' in ans_lower or 'combination' in ans_lower or 'all' in ans_lower
+
+    if complaint_pattern.search(ans_lower):
+        if has_blend:
+            return 'BLENDED', ans
+        return 'COMPLAINT_OR_META', ans
+        
+    if re.search(r'^(both|combination|all of them|all of the above|neither)\b', ans_lower):
+        if len(ans_lower.split()) < 4 and ' or ' not in question.lower():
+            return 'AMBIGUOUS', ans
+        return 'BLENDED', ans
+        
+    if re.search(r'^(actually|no\b|wait|incorrect|disagree)', ans_lower):
+        return 'COMPLAINT_OR_META', ans
+        
+    if ans_lower in ['idk', 'maybe', 'not sure', 'whatever']:
+        return 'AMBIGUOUS', ans
+
+    return 'DIRECT_ANSWER', ans
+
+
 def interpret_and_echo_node(state: PRDState) -> dict:
     """
-    Fast deterministic echo of user answer — no LLM call.
-    Simply confirms receipt and prepares answer for draft pipeline.
-    
-    Replaced expensive LLM-based interpretation with rule-based logic:
-    - Truncate long answers (max 150 chars)
-    - Capitalize first letter
-    - Generate "Got it — [echo]" template response
-    
-    This node MUST complete in <500ms to avoid blocking user feedback.
+    Fast deterministic echo of user answer with rule-first intent classification.
     """
     section = get_section_by_index(state["section_index"])
     raw_answer = state.get("raw_answer_buffer", "").strip()
     question = state.get("current_questions", "").strip()
     iteration = state.get("iteration", 0)
 
-    # ── Rule-based echo (replace LLM call entirely) ──────────────────────────
-    # Keep answer max 150 chars for readability in UI
-    echo_answer = raw_answer
-    if len(echo_answer) > 150:
-        echo_answer = echo_answer[:147].rstrip() + "…"
-    
-    # Capitalize first letter if needed
-    if echo_answer and echo_answer[0].islower():
-        echo_answer = echo_answer[0].upper() + echo_answer[1:]
-    
-    # Build the "Got it" text (rule-based, not LLM)
-    echo_text = f"Got it — {echo_answer}"
-    
-    # For storage, strip the "Got it — " prefix
-    interpreted = echo_answer
+    current_question_object = state.get("current_question_object", {})
+    subparts = current_question_object.get("subparts", [])
+    remaining_subparts = list(state.get("remaining_subparts", subparts))
+
+    intent, _ = _classify_intent_rule(question, raw_answer)
+    ctx = _log_ctx(state, "interpret_and_echo_node")
+
+    # ── Deterministic Subpart & Snippet Extraction (Locked Contract) ─────────
+    # Library: NLTK sent_tokenize / word_tokenize / SnowballStemmer (module-level).
+    # Custom: clause splitting, dependent merge, polarity window, tie-break, fallback.
+    _NEG_POLARITY = frozenset({"not", "no", "never", "without"})
+    _POS_POLARITY = frozenset({"fine", "correct", "fixed", "resolved"})
+    _POLARITY_MARKERS = _NEG_POLARITY | _POS_POLARITY
+    _REVERSAL_MARKERS = ("used to", "not anymore", "no longer", "changed to")
+
+    def _tokenize_norm(text: str) -> set[str]:
+        def _pre(t: str) -> str:
+            # Strip trailing lowercase 's' from acronym plurals before stemming.
+            # Matches both all-caps (PDFS) and common mixed-case (PDFs).
+            # Condition: last char is 's', and all preceding chars are uppercase letters.
+            if len(t) > 2 and t[-1] == "s" and t[:-1] == t[:-1].upper() and t[:-1].isalpha():
+                t = t[:-1]
+            return t.lower()
+        toks = _word_tokenize(text)
+        if _STEMMER is not None:
+            return {_STEMMER.stem(_pre(t)) for t in toks if t.replace("'", "").isalpha() and _pre(t) not in _STOPWORDS_EN and len(t) > 1}
+        return {_pre(t) for t in toks if t.replace("'", "").isalpha() and _pre(t) not in _STOPWORDS_EN and len(t) > 1}
+
+    def _polarity_near(clause: str, matched: set[str]) -> bool:
+        words = _word_tokenize(clause.lower())
+        stemmed = [(_STEMMER.stem(w) if _STEMMER else w) for w in words]
+        for i, s in enumerate(stemmed):
+            if s in matched:
+                window = words[max(0, i - 3):i + 4]
+                if any(p in window for p in _POLARITY_MARKERS):
+                    return True
+        return False
+
+    def _has_reversal(text: str) -> bool:
+        tl = text.lower()
+        return any(r in tl for r in _REVERSAL_MARKERS)
+
+    # Phase 1: NLTK sentence split; comma/semicolon clause split; merge only which/because/since
+    sentences = _sent_tokenize(raw_answer)
+    candidates: list[tuple[str, int, str]] = []  # (clause, idx, parent_sentence)
+    g_idx = 0
+    for sent in sentences:
+        raw_clauses = [c.strip() for c in re.split(r'(?<=[,;])\s+', sent) if c.strip()]
+        merged: list[str] = []
+        for cl in raw_clauses:
+            if cl.lower().startswith(("which ", "because ", "since ")) and merged:
+                merged[-1] += ", " + cl
+            else:
+                merged.append(cl)
+        for cl in merged:
+            candidates.append((cl, g_idx, sent))
+            g_idx += 1
+
+    resolved_subparts = []
+    snippets_by_subpart = {}
+    ans_lower = raw_answer.lower()
+
+    if intent == "DIRECT_ANSWER" or "both" in ans_lower or "all" in ans_lower:
+        resolved_subparts = list(remaining_subparts)
+        for sp in resolved_subparts:
+            snippets_by_subpart[sp] = raw_answer
+    else:
+        for sp in remaining_subparts:
+            sp_norm = _tokenize_norm(sp)
+            best_cl, best_sent = None, None
+            best_s, best_p, best_d, best_i = 0, False, 0.0, 9999
+
+            for (cl, idx, parent_sent) in candidates:
+                cl_norm = _tokenize_norm(cl)
+                b = len(sp_norm & cl_norm)
+                if b == 0:
+                    continue
+                p = 1 if _polarity_near(cl, sp_norm) else 0
+                score = b + p
+                density = b / max(len(cl_norm), 1)
+                pf = p > 0
+                # Phase 3 tie-break: total score → polarity → density → chronology
+                better = (
+                    score > best_s or
+                    (score == best_s and pf and not best_p) or
+                    (score == best_s and pf == best_p and density > best_d) or
+                    (score == best_s and pf == best_p and density == best_d and idx < best_i)
+                )
+                if better:
+                    best_s, best_cl, best_sent = score, cl, parent_sent
+                    best_p, best_d, best_i = pf, density, idx
+
+            if best_s == 0:
+                # Phase 4 zero-match: sentence-level fallback → null if none
+                fb_sent, fb_score = None, 0
+                for sent in sentences:
+                    sb = len(sp_norm & _tokenize_norm(sent))
+                    if sb > fb_score:
+                        fb_score, fb_sent = sb, sent
+                snippets_by_subpart[sp] = fb_sent  # None if still zero
+                if fb_sent:
+                    resolved_subparts.append(sp)
+            else:
+                resolved_subparts.append(sp)
+                base_b = best_s - (1 if best_p else 0)
+                overlap_ratio = base_b / max(len(sp_norm), 1)
+                if overlap_ratio < 0.5:
+                    snippets_by_subpart[sp] = best_sent   # weak → sentence span
+                elif best_cl and _has_reversal(best_cl):
+                    snippets_by_subpart[sp] = best_sent   # reversal embed → sentence span
+                else:
+                    snippets_by_subpart[sp] = best_cl     # clean clause win
+
+    new_remaining = [s for s in remaining_subparts if s not in resolved_subparts]
+
+    if intent == 'COMPLAINT_OR_META' or intent == 'AMBIGUOUS':
+        # Repair Mode: do not log to confirmed_qa_store
+        log_event(
+            **ctx, level="INFO", event_type="echo_node_repair",
+            message="Repair mode triggered (no LLM call)",
+            intent=intent, answer_len=len(raw_answer)
+        )
+        repair_msg = (
+            "I hear you — let me rephrase to be clearer. Could you clarify your needs for this?"
+            if intent == 'AMBIGUOUS' else
+            "You're right — I missed that context. Could you clarify the specific details we should capture here?"
+        )
+        return {
+            "repair_instruction": "REPHRASE_REQUIRED" if intent == 'AMBIGUOUS' else "DUPLICATE_SUPPRESSED",
+            "remaining_subparts": new_remaining,
+            "pending_echo": "",
+            "pending_concept_updates": {},
+            "raw_answer_buffer": "",
+            "chat_history": [
+                {
+                    "role": "assistant",
+                    "type": "reask",
+                    "section": section.title,
+                    "content": repair_msg,
+                }
+            ],
+        }
+
+    # Answer or Blended: continue extraction
+    if intent == 'BLENDED':
+        echo_answer = "both matter. I'll proceed on that basis"
+        interpreted = "Both options matter: " + raw_answer
+        echo_text = f"You're right — I should have captured that. It sounds like {echo_answer} unless one is clearly the priority."
+    else:
+        echo_answer = raw_answer
+        if len(echo_answer) > 150:
+            echo_answer = echo_answer[:147].rstrip() + "…"
+        if echo_answer and echo_answer[0].islower():
+            echo_answer = echo_answer[0].upper() + echo_answer[1:]
+        echo_text = f"Got it — {echo_answer}"
+        interpreted = echo_answer
 
     ctx = _log_ctx(state, "interpret_and_echo_node")
     log_event(
@@ -795,6 +1049,8 @@ def interpret_and_echo_node(state: PRDState) -> dict:
     round_n = len(existing_qa) + 1
     concept_key = f"{section.id}:iter_{iteration}:round_{round_n}"
 
+    source_message_id = f"msg_{len(state.get('chat_history', [])) - 1}"
+
     qa_entry = {
         "questions": question,
         "answer": interpreted,
@@ -804,6 +1060,9 @@ def interpret_and_echo_node(state: PRDState) -> dict:
         concept_key: {
             "answer": interpreted,
             "questions": question,
+            "resolved_subparts": resolved_subparts,
+            "evidence_snippets_by_subpart": snippets_by_subpart,
+            "source_message_id": source_message_id,
             "section": section.title,
             "section_id": section.id,
             "iteration": iteration,
@@ -818,6 +1077,7 @@ def interpret_and_echo_node(state: PRDState) -> dict:
         "pending_concept_updates": {},
         "answer_confirmation_status": "CONFIRMED",
         "section_qa_pairs": existing_qa + [qa_entry],
+        "remaining_subparts": new_remaining,
         "confirmed_qa_store": store_update,
         "contradiction_log": [],
         "raw_answer_buffer": raw_answer,   # kept so detect_impact_node can run side-fact scan + contradiction check
@@ -1251,7 +1511,11 @@ def detect_impact_node(state: PRDState) -> dict:
         existing_store = state.get("confirmed_qa_store", {})
         if not existing_store or not answer:
             return None
-        return _check_contradiction(question, answer, existing_store, section.id)
+        concept_key = f"{section.id}:iter_{iteration}:round_{len(qa_pairs)}"
+        new_entry = existing_store.get(concept_key)
+        if not new_entry:
+            return None
+        return _check_contradiction(new_entry, concept_key, existing_store, section.id)
 
     with ThreadPoolExecutor(max_workers=3) as _ex:
         _primary_f = _ex.submit(_run_primary)
@@ -1310,7 +1574,7 @@ def detect_impact_node(state: PRDState) -> dict:
         result["confirmed_qa_store"] = side_store_updates
 
     # ── O-1b contradiction flag (moved here from interpret_and_echo_node) ─
-    if contradiction_desc:
+    if contradiction_desc: # This is now a dictionary!
         # Back-flag the concept key in the store
         qa_pairs = state.get("section_qa_pairs", [])
         iteration = state.get("iteration", 0)
@@ -1323,14 +1587,18 @@ def detect_impact_node(state: PRDState) -> dict:
             "prior": "see confirmed_qa_store",
             "new": answer[:200],
             "section": section.title,
-            "description": contradiction_desc,
+            "description": contradiction_desc["description"],
         }]
         result["chat_history"] = [{
             "role": "assistant",
             "type": "contradiction_flag",
+            "contradiction_evidence": {
+                "conflicting_message_id": contradiction_desc["conflicting_message_id"],
+                "evidence_snippet": contradiction_desc["evidence_snippet"]
+            },
             "content": (
                 f"⚠️ **Heads up — this might conflict with something you said earlier.**\n\n"
-                f"{contradiction_desc}\n\n"
+                f"{contradiction_desc['description']}\n\n"
                 "_Using your latest answer. You can clarify if needed._"
             ),
         }]

@@ -811,6 +811,14 @@ if st.session_state.graph_started:
                 with st.expander("📝 View draft", expanded=False):
                     st.markdown(_present_content(content, source_lookup, confirmed_qa_store), unsafe_allow_html=True)
 
+        elif msg_type == "contradiction_flag":
+            with st.chat_message("Agent", avatar="assistant"):
+                st.markdown(content)
+                evidence = msg.get("contradiction_evidence")
+                if evidence:
+                    with st.expander("🔍 View earlier reply"):
+                        st.markdown(f"**Earlier you said:**\n\n> {evidence.get('evidence_snippet', '')}")
+
         elif msg_type == "reflect":
             verdict = msg.get("verdict", "REWORK")
             review_summary = _build_review_summary(msg)

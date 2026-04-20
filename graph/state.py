@@ -1,5 +1,14 @@
 import operator
-from typing import Annotated, TypedDict
+from typing import Annotated, Literal, TypedDict
+
+
+class QuestionObject(TypedDict):
+    question_id: str
+    question_text: str
+    subparts: list[str]
+
+
+RepairInstruction = Literal["", "DUPLICATE_SUPPRESSED", "REPHRASE_REQUIRED", "CLARIFY_TARGET"]
 
 
 def _merge_dicts(a: dict, b: dict) -> dict:
@@ -107,6 +116,9 @@ class PRDState(TypedDict):
     # Answers are provisional until explicitly confirmed by the user.
     # confirmed_qa_store must only receive CONFIRMED values.
     raw_answer_buffer: str       # latest unconfirmed raw user response
+    current_question_object: QuestionObject  # structured question from Elicitor
+    remaining_subparts: list[str]            # unfilled parts
+    repair_instruction: RepairInstruction    # Guidance passed to Elicitor if a repair hit
     pending_echo: str            # system restatement awaiting user confirmation
     pending_concept_updates: dict  # candidate Q&A not yet promoted to canonical truth
     answer_confirmation_status: str  # "" | "PENDING" | "CONFIRMED" | "CORRECTED"
