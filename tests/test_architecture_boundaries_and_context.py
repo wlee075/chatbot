@@ -24,6 +24,7 @@ def test_truth_commit_node_receives_only_eligibility_payload_not_raw_user_text()
         "raw_answer_buffer": "yes i want to deploy literally today and you suck",
         "interpreted_answer": "client wants to deploy today",
         "has_conflicts": False,
+        "is_eligible": True,
         "section_index": 0,
         "chat_history": []
     }
@@ -77,10 +78,8 @@ def test_repetition_and_rephrase_routes_do_not_overlap_question_ownership():
     res_rephrase = intent_classifier_node(state_rephrase)
     
     assert res_repeat["reply_intent"] == "REPETITION_COMPLAINT"
-    assert res_repeat.get("repair_instruction") == "REPETITION_COMPLAINT"
     
     assert res_rephrase["reply_intent"] == "REPHRASE_REQUEST"
-    assert res_rephrase.get("repair_instruction") == "REPHRASE_REQUEST"
 
 def test_reply_to_older_message_attaches_bounded_context_without_forcing_route():
     """

@@ -9,11 +9,11 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from graph.state import ConceptStatus
 from graph.nodes import (
-    _sync_concept_history, 
+    _sync_concept_history,
     _build_user_message_dict,
-    interpret_and_echo_node,
     handle_tagged_event_node
 )
+from graph.split_nodes import truth_commit_node, concept_history_update_node
 from config.sections import PRD_SECTIONS
 
 @pytest.fixture
@@ -81,15 +81,15 @@ def test_promotion_requires_traceable_source_and_confidence(mock_semantic_state)
     
     # Simulate promotion gate
     with patch("utils.logger.log_event"), patch("graph.nodes._get_llm", return_value=MagicMock()):
-        # Interpret and echo makes it CURRENT because it is a direct assertion
-        new_state = interpret_and_echo_node(mock_semantic_state)
+        # Truth commit makes it CURRENT because it is a direct assertion
+        new_state = concept_history_update_node(mock_semantic_state)
         
     assert new_state["concept_history"]["prd"]["status"] == ConceptStatus.CURRENT.value
 
 def test_correction_supersedes_prior_concept(mock_semantic_state):
     msg1 = simulate_user_message(mock_semantic_state, "We need a PRD.")
     with patch("utils.logger.log_event"), patch("graph.nodes._get_llm", return_value=MagicMock()):
-        new_state = interpret_and_echo_node(mock_semantic_state)
+        new_state = concept_history_update_node(mock_semantic_state)
         mock_semantic_state.update(new_state)
         
     assert mock_semantic_state["concept_history"]["prd"]["status"] == ConceptStatus.CURRENT.value

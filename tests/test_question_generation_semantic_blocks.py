@@ -1,7 +1,8 @@
 import pytest
 from unittest.mock import patch, MagicMock
 from graph.state import PRDState, ConceptStatus
-from graph.nodes import interpret_and_echo_node, generate_questions_node
+from graph.nodes import generate_questions_node
+from graph.split_nodes import blocker_transition_node, semantic_assessor_node
 
 @pytest.fixture(autouse=True)
 def mock_llm_and_nlp():
@@ -10,7 +11,7 @@ def mock_llm_and_nlp():
         mock_nlp.return_value = MagicMock()
         yield
 
-@patch("graph.nodes._classify_intent_rule", return_value=("DIRECT_ANSWER", "mock answer", "FAST_REGEX"))
+@patch("graph.nodes._classify_intent_rule", return_value=("DIRECT_ANSWER", "mock answer", "FAST_REGEX", None))
 def test_generic_workflow_blocker_cleared_after_workflow_answer(mock_intent):
     # Setup state with initial generic workflow blocker
     state = PRDState(
@@ -26,14 +27,20 @@ def test_generic_workflow_blocker_cleared_after_workflow_answer(mock_intent):
         recent_questions=["How does the process work?"],
     )
     
-    # Process through interpret node
-    res = interpret_and_echo_node(state)
+    # Process through blocker transition node directly
+    state["reply_intent"] = "DIRECT_ANSWER"
+    extraction = semantic_assessor_node(state)
+    state.update(extraction)
+    state["subpart_evidence_candidates"] = ["workflow_sequence_missing"]
+    
+    updated_state = blocker_transition_node(state)
+    state.update(updated_state)
     
     # Workflow sequence should be cleared and replaced by mapping_logic_missing due to 'send'
-    assert "workflow_sequence_missing" not in res["remaining_subparts"]
-    assert "mapping_logic_missing" in res["remaining_subparts"]
+    assert "workflow_sequence_missing" not in state["remaining_subparts"]
+    assert "mapping_logic_missing" in state["remaining_subparts"]
 
-@patch("graph.nodes._classify_intent_rule", return_value=("DIRECT_ANSWER", "mock answer", "FAST_REGEX"))
+@patch("graph.nodes._classify_intent_rule", return_value=("DIRECT_ANSWER", "mock answer", "FAST_REGEX", None))
 def test_workflow_blocker_replaced_by_narrower_mapping_blocker(mock_intent):
     state = PRDState(
         thread_id="test2",
@@ -47,11 +54,16 @@ def test_workflow_blocker_replaced_by_narrower_mapping_blocker(mock_intent):
         ]
     )
     
-    res = interpret_and_echo_node(state)
-    assert "mapping_logic_missing" not in res["remaining_subparts"]
-    assert "destination_handling_missing" in res["remaining_subparts"]
+    state["reply_intent"] = "DIRECT_ANSWER"
+    extraction = semantic_assessor_node(state)
+    state.update(extraction)
+    state["subpart_evidence_candidates"] = ["mapping_logic_missing"]
+    updated_state = blocker_transition_node(state)
+    state.update(updated_state)
+    assert "mapping_logic_missing" not in state["remaining_subparts"]
+    assert "destination_handling_missing" in state["remaining_subparts"]
 
-@patch("graph.nodes._classify_intent_rule", return_value=("DIRECT_ANSWER", "mock answer", "FAST_REGEX"))
+@patch("graph.nodes._classify_intent_rule", return_value=("DIRECT_ANSWER", "mock answer", "FAST_REGEX", None))
 def test_partially_answered_blocker_generates_narrower_same_domain_followup(mock_intent):
     state = PRDState(
         thread_id="test3",
@@ -65,10 +77,15 @@ def test_partially_answered_blocker_generates_narrower_same_domain_followup(mock
         ]
     )
     
-    res = interpret_and_echo_node(state)
+    state["reply_intent"] = "DIRECT_ANSWER"
+    extraction = semantic_assessor_node(state)
+    state.update(extraction)
+    state["subpart_evidence_candidates"] = ["workflow_sequence_missing"]
+    updated_state = blocker_transition_node(state)
+    state.update(updated_state)
     # The blocker gets a specific extension for narrower partial followup
-    assert "workflow_sequence_missing" not in res["remaining_subparts"]
-    assert "workflow_sequence_missing_specific_interaction" in res["remaining_subparts"]
+    assert "workflow_sequence_missing" not in state["remaining_subparts"]
+    assert "workflow_sequence_missing_specific_interaction" in state["remaining_subparts"]
 
 def test_conflicted_concepts_force_conflict_question_before_other_blockers():
     state = PRDState(

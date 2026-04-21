@@ -1,8 +1,8 @@
 import pytest
 from unittest.mock import patch, MagicMock
 from graph.state import PRDState
-from graph.nodes import _classify_intent_rule, interpret_and_echo_node
-from graph.routing import route_after_echo
+from graph.nodes import _classify_intent_rule
+from graph.routing import route_after_intent as route_after_echo
 
 def test_regex_fast_path_handles_obvious_direct_clarification_question():
     pass

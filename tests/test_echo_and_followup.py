@@ -2,16 +2,12 @@ import os
 os.environ["GOOGLE_API_KEY"] = "fake_key_for_testing"
 
 import pytest
-from graph.nodes import interpret_and_echo_node, generate_questions_node
+from graph.nodes import generate_questions_node
+from graph.split_nodes import echo_generation_node
 from graph.state import PRDState
 
 def test_weak_echo_is_suppressed(mocker):
-    mocker.patch("graph.nodes._classify_intent_rule", return_value=("DIRECT_ANSWER", None, "mock"))
-    mocker.patch("graph.nodes.IntegrityValidator.validate_mutation", return_value=None)
-    mocker.patch("graph.nodes.build_conversation_understanding_output", return_value={
-        "draft_readiness": {"is_ready": False, "hard_blockers": []},
-        "current_concepts": []
-    })
+    # No need to mock intent classifier, we provide state explicitly
     # Simulate a raw answer that is too long / describes a workflow
     raw_answer = "First we extract data from the Outlook email -> then map it in Excel -> then trigger the PDF retrieval system."
     state = PRDState(
@@ -19,30 +15,25 @@ def test_weak_echo_is_suppressed(mocker):
         raw_answer_buffer=raw_answer,
         current_questions="How does the workflow work?",
         thread_id="test",
-        run_id="test"
+        reply_intent="DIRECT_ANSWER"
     )
-    result = interpret_and_echo_node(state)
+    result = echo_generation_node(state)
     chat_history = result.get("chat_history", [])
     
     # Assert echo is completely dropped (not returned)
     assert len(chat_history) == 0
 
 def test_echo_when_present_is_clean_and_non_repetitive(mocker):
-    mocker.patch("graph.nodes._classify_intent_rule", return_value=("DIRECT_ANSWER", None, "mock"))
-    mocker.patch("graph.nodes.IntegrityValidator.validate_mutation", return_value=None)
-    mocker.patch("graph.nodes.build_conversation_understanding_output", return_value={
-        "draft_readiness": {"is_ready": False, "hard_blockers": []},
-        "current_concepts": []
-    })
+    # Provide state explicitly
     # Simulate a clean, short answer
     raw_answer = "we use SAP for this."
     state = PRDState(
         section_index=0,
         raw_answer_buffer=raw_answer,
         thread_id="test",
-        run_id="test"
+        reply_intent="DIRECT_ANSWER"
     )
-    result = interpret_and_echo_node(state)
+    result = echo_generation_node(state)
     chat_history = result.get("chat_history", [])
     
     # Assert echo exists and is clean

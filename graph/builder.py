@@ -20,15 +20,17 @@ from graph.nodes import (
 from graph.split_nodes import (
     numeric_validation_node,
     intent_classifier_node,
+    clarification_router_node,
+    repair_mode_node,
     option_resolution_node,
     semantic_assessor_node,
     blocker_transition_node,
     contradiction_validator_node,
+    truth_eligibility_node,
     truth_commit_node,
     concept_history_update_node,
+    echo_generation_node,
     state_cleanup_node,
-    rephrase_question_node,
-    repair_repeated_question_node,
     handle_numeric_error_node
 )
 from graph.routing import (
@@ -84,15 +86,17 @@ def build_graph(checkpointer: MemorySaver | None = None):
     builder.add_node("handle_tagged_event", handle_tagged_event_node)
     builder.add_node("numeric_validation", numeric_validation_node)
     builder.add_node("intent_classifier", intent_classifier_node)
+    builder.add_node("clarification_router", clarification_router_node)
+    builder.add_node("repair_mode", repair_mode_node)
     builder.add_node("option_resolution", option_resolution_node)
     builder.add_node("semantic_assessor", semantic_assessor_node)
     builder.add_node("blocker_transition", blocker_transition_node)
     builder.add_node("contradiction_validator", contradiction_validator_node)
+    builder.add_node("truth_eligibility", truth_eligibility_node)
     builder.add_node("truth_commit", truth_commit_node)
     builder.add_node("concept_history_update", concept_history_update_node)
+    builder.add_node("echo_generation", echo_generation_node)
     builder.add_node("state_cleanup", state_cleanup_node)
-    builder.add_node("rephrase_question", rephrase_question_node)
-    builder.add_node("repair_repeated_question", repair_repeated_question_node)
     builder.add_node("handle_numeric_error", handle_numeric_error_node)
     
     builder.add_node("answer_clarification", answer_clarification_node)
@@ -151,29 +155,30 @@ def build_graph(checkpointer: MemorySaver | None = None):
     builder.add_edge("handle_tagged_event", "detect_impact")
     
     # Intent split routing
+    builder.add_edge("intent_classifier", "clarification_router")
+    
     builder.add_conditional_edges(
-        "intent_classifier",
+        "clarification_router",
         route_after_intent,
         {
             "option_resolution": "option_resolution",
             "answer_clarification": "answer_clarification",
-            "rephrase_question": "rephrase_question",
-            "repair_repeated_question": "repair_repeated_question",
-            "handle_numeric_error": "handle_numeric_error",
-            "rebuild_mirror": "rebuild_mirror"
+            "repair_mode": "repair_mode",
+            "handle_numeric_error": "handle_numeric_error"
         }
     )
     
-    builder.add_edge("rephrase_question", "await_answer")
-    builder.add_edge("repair_repeated_question", "generate_questions")
+    builder.add_edge("repair_mode", "generate_questions")
     builder.add_edge("handle_numeric_error", "await_answer")
+    builder.add_edge("answer_clarification", "await_answer")
     
     builder.add_edge("option_resolution", "semantic_assessor")
     builder.add_edge("semantic_assessor", "blocker_transition")
     builder.add_edge("blocker_transition", "contradiction_validator")
     
+    builder.add_edge("contradiction_validator", "truth_eligibility")
     builder.add_conditional_edges(
-        "contradiction_validator",
+        "truth_eligibility",
         route_after_contradiction,
         {
             "truth_commit": "truth_commit",
@@ -182,7 +187,8 @@ def build_graph(checkpointer: MemorySaver | None = None):
     )
     
     builder.add_edge("truth_commit", "concept_history_update")
-    builder.add_edge("concept_history_update", "state_cleanup")
+    builder.add_edge("concept_history_update", "echo_generation")
+    builder.add_edge("echo_generation", "state_cleanup")
     builder.add_edge("state_cleanup", "detect_impact")
     
     builder.add_edge("detect_impact", "draft")

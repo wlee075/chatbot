@@ -21,7 +21,7 @@ class TestStructuredFallbacks(unittest.TestCase):
         # Mocks a successful outcome when handling a long business problem
         mock_invoke.return_value = {
             "question_id": "q1",
-            "question_text": "What are the exact manual steps?",
+            "single_next_question": "What are the exact manual steps?",
             "subparts": ["process"]
         }
         res = generate_questions_node(self.state)

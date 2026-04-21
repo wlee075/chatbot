@@ -135,17 +135,8 @@ def route_after_answer(state: PRDState) -> str:
 
 
 def route_after_intent(state: PRDState) -> str:
+    route = state.get("clarification_route_id", "option_resolution")
     reply_intent = state.get("reply_intent")
-    if reply_intent in ("DIRECT_CLARIFICATION_QUESTION", "UNCLEAR_META"):
-        route = "answer_clarification"
-    elif reply_intent in ("REPHRASE_REQUEST", "AMBIGUOUS"):
-        route = "rephrase_question"
-    elif reply_intent in ("REPETITION_COMPLAINT", "COMPLAINT_OR_META"):
-        route = "repair_repeated_question"
-    elif reply_intent == "NUMERIC_ERROR":
-        route = "handle_numeric_error"
-    else:
-        route = "option_resolution"
         
     log_event(
         thread_id=state.get("thread_id", ""),

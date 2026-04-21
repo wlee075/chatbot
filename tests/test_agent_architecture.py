@@ -12,7 +12,7 @@ from graph.nodes import answer_clarification_node, log_event
 @patch('graph.split_nodes.log_event')
 @patch('graph.split_nodes._classify_intent_rule')
 def test_intent_classifier_node_does_not_crash_on_log_event(mock_classify, mock_log_event):
-    mock_classify.return_value = ("DIRECT_ANSWER", None, "regex")
+    mock_classify.return_value = ("DIRECT_ANSWER", None, "regex", None)
     # Using real intent classifier node without patching get_llm fully, but getting LLM is patched anyway implicitly?
     # Actually wait, we should mock the whole LLM to avoid real API
     with patch('graph.split_nodes._get_llm') as mock_llm:
@@ -24,13 +24,13 @@ def test_intent_classifier_node_does_not_crash_on_log_event(mock_classify, mock_
 def test_new_split_nodes_respect_log_event_contract(mock_llm):
     # This will truly run the log_event (since it's not mocked) 
     # to ensure it doesn't raise a TypeError.
-    with patch('graph.split_nodes._classify_intent_rule', return_value=("AMBIGUOUS", None, "llm_fallback")):
+    with patch('graph.split_nodes._classify_intent_rule', return_value=("AMBIGUOUS", None, "llm_fallback", None)):
         res = intent_classifier_node({"current_questions": "A?", "raw_answer_buffer": "wait no"})
     assert isinstance(res, dict)
 
 def test_which_step_are_you_unclear_of_classifies_as_direct_clarification_question():
     from graph.nodes import _classify_intent_rule
-    intent, _, source = _classify_intent_rule("Can you specify the user persona?", "which step are you unclear of")
+    intent, _, source, _ = _classify_intent_rule("Can you specify the user persona?", "which step are you unclear of")
     assert intent == "DIRECT_CLARIFICATION_QUESTION"
     assert source == "FAST_REGEX"
 
@@ -50,7 +50,7 @@ def test_clarification_answer_uses_remaining_blockers_to_answer():
         "chat_history": []
     }
     with patch('graph.nodes._get_llm') as mock_get_llm:
-        mock_get_llm.return_value.invoke.return_value.content = "I need details."
+        mock_get_llm.return_value.invoke.return_value.content = "I need details?"
         res = answer_clarification_node(state)
     chat_hist = res.get("chat_history", [])
     assert chat_hist[-1]["role"] == "assistant"
@@ -80,11 +80,11 @@ def test_clarification_answer_does_not_fall_back_to_generic_more_details_questio
         "chat_history": []
     }
     with patch('graph.nodes._get_llm') as mock_get_llm:
-        mock_get_llm.return_value.invoke.return_value.content = "I need details."
+        mock_get_llm.return_value.invoke.return_value.content = "I need details?"
         res = answer_clarification_node(state)
     chat_hist = res.get("chat_history", [])
     # Should specifically mention missing details for the blocker, rather than pure generic fallback
-    assert "Still missing details for" in chat_hist[-1]["content"]
+    assert "I still need details for" in chat_hist[-1]["content"]
     assert "user_persona_definition" in chat_hist[-1]["content"]
     assert "Please tell me more details" not in chat_hist[-1]["content"]
 
@@ -105,16 +105,16 @@ def test_mixed_intent_turn_escalates_to_model_classifier():
 def test_inconclusive_meta_turn_returns_unclear_meta_not_direct_answer():
     from graph.nodes import _classify_intent_rule
     # Escalates, but model fails or returns unknown
-    intent, _, source = _classify_intent_rule("Which?", "idk", llm=None)
+    intent, _, source, _ = _classify_intent_rule("Which?", "idk", llm=None)
     assert intent == "UNCLEAR_META"
     assert source == "SAFE_FALLBACK"
 
 def test_classifier_output_contract_is_consistent_across_branches():
     from graph.nodes import _classify_intent_rule
-    i1, a1, s1 = _classify_intent_rule("Q", "why are you asking me the same question")
+    i1, a1, s1, _ = _classify_intent_rule("Q", "why are you asking me the same question")
     assert isinstance(i1, str) and isinstance(a1, str) and isinstance(s1, str)
     
-    i2, a2, s2 = _classify_intent_rule("Q", "this is just a normal answer")
+    i2, a2, s2, _ = _classify_intent_rule("Q", "this is just a normal answer")
     assert isinstance(i2, str) and isinstance(a2, str) and isinstance(s2, str)
 
 def test_direct_clarification_paraphrase_not_in_regex_still_resolved_via_model():
@@ -163,7 +163,7 @@ def test_semantic_assessor_node_does_not_mutate_confirmed_truth():
     }
     res = semantic_assessor_node(state)
     assert "confirmed_qa_store" not in res
-    assert "resolved_subparts" in res
+    assert "snippets_by_subpart" in res
 
 @patch('graph.split_nodes.build_conversation_understanding_output')
 def test_interpretation_contradiction_truth_commit_sequence_preserves_single_responsibility_boundaries(mock_build):
@@ -200,7 +200,8 @@ def test_truth_commit_log_only_fires_after_truth_commit_agent(mock_val, mock_log
         "section_index": 0,
         "store_version": 1,
         "current_concepts": [],
-        "raw_answer_buffer": "some truth"
+        "raw_answer_buffer": "some truth",
+        "is_eligible": True
     }
     res = truth_commit_node(state)
     assert "confirmed_qa_store" in res
@@ -211,46 +212,41 @@ def test_truth_commit_log_only_fires_after_truth_commit_agent(mock_val, mock_log
 @patch('graph.split_nodes._get_llm')
 @patch('graph.split_nodes._classify_intent_rule')
 def test_regex_fast_path_handles_obvious_meta_intents(mock_classify, mock_llm):
-    mock_classify.return_value = ("REPHRASE_REQUEST", None, "regex")
+    mock_classify.return_value = ("REPHRASE_REQUEST", None, "regex", None)
     res = intent_classifier_node({"current_questions": "A?", "raw_answer_buffer": "I don't understand"})
     assert res["reply_intent"] == "REPHRASE_REQUEST"
 
 @patch('graph.split_nodes._get_llm')
 @patch('graph.split_nodes._classify_intent_rule')
 def test_ambiguous_meta_intent_uses_bounded_fallback_not_raw_prompt_loop(mock_classify, mock_llm):
-    mock_classify.return_value = ("AMBIGUOUS", None, "llm_fallback")
+    mock_classify.return_value = ("AMBIGUOUS", None, "llm_fallback", None)
     res = intent_classifier_node({"current_questions": "A?", "raw_answer_buffer": "wait no"})
     assert res["reply_intent"] == "AMBIGUOUS"
 
 # 4. Granular Response Routing
 
 from graph.routing import route_after_intent
-from graph.split_nodes import rephrase_question_node, repair_repeated_question_node, handle_numeric_error_node
+from graph.split_nodes import clarification_router_node, handle_numeric_error_node
+
+def _min_state(intent: str) -> dict:
+    return {"thread_id": "t", "run_id": "r", "section_index": 0, "reply_intent": intent}
 
 def test_direct_clarification_question_routes_to_answer_clarification():
-    assert route_after_intent({"reply_intent": "DIRECT_CLARIFICATION_QUESTION"}) == "answer_clarification"
+    assert clarification_router_node(_min_state("DIRECT_CLARIFICATION_QUESTION"))["clarification_route_id"] == "answer_clarification"
 
 def test_rephrase_request_does_not_use_normal_question_generation_path():
-    assert route_after_intent({"reply_intent": "REPHRASE_REQUEST"}) == "rephrase_question"
+    assert clarification_router_node(_min_state("REPHRASE_REQUEST"))["clarification_route_id"] == "repair_mode"
 
 def test_repetition_complaint_routes_to_repair_path_before_question_generation():
-    assert route_after_intent({"reply_intent": "REPETITION_COMPLAINT"}) == "repair_repeated_question"
+    assert clarification_router_node(_min_state("REPETITION_COMPLAINT"))["clarification_route_id"] == "repair_mode"
 
 def test_numeric_error_does_not_route_to_generate_questions():
-    assert route_after_intent({"reply_intent": "NUMERIC_ERROR"}) == "handle_numeric_error"
+    assert clarification_router_node(_min_state("NUMERIC_ERROR"))["clarification_route_id"] == "handle_numeric_error"
 
 def test_route_after_intent_mapping_matches_response_mode_design():
     # Verify the fallback defaults to option resolution
-    assert route_after_intent({"reply_intent": "DIRECT_ANSWER"}) == "option_resolution"
-
-def test_rephrase_and_repetition_paths_do_not_overlap_question_responsibility():
-    # Verify output payload does not contain general elicitation prompts
-    state = {"current_questions": "Some blocker?"}
-    rephrase_payload = rephrase_question_node(state)
-    assert "rephrased_question_text" in rephrase_payload
-    
-    repair_payload = repair_repeated_question_node(state)
-    assert "narrowed_question_spec" in repair_payload
+    assert clarification_router_node(_min_state("DIRECT_ANSWER"))["clarification_route_id"] == "option_resolution"
+    assert route_after_intent({"clarification_route_id": "option_resolution"}) == "option_resolution"
 
 # 5. Meta-Question Fallback and Draft Precedence Logic
 
@@ -259,7 +255,7 @@ def test_what_kind_of_details_classifies_as_meta_clarification_not_direct_answer
     # Ends with '?' and short. Or explicitly contains "what kind of".
     assert should_escalate_to_model("what kind of details?", "Which details do you need?") is True
     # Without LLM, it falls back to UNCLEAR_META instead of escaping to DIRECT_ANSWER.
-    intent, _, _ = _classify_intent_rule("Which details do you need?", "what kind of details?", llm=None)
+    intent, _, _, _ = _classify_intent_rule("Which details do you need?", "what kind of details?", llm=None)
     assert intent == "UNCLEAR_META"
 
 def test_meta_clarification_turn_does_not_trigger_draft_mode():
@@ -269,27 +265,28 @@ def test_meta_clarification_turn_does_not_trigger_draft_mode():
     assert route_after_intent({"reply_intent": "AMBIGUOUS"}) != "semantic_assessor"
 
 def test_clarification_turn_routes_to_answer_clarification_or_rephrase_path():
-    from graph.routing import route_after_intent
-    assert route_after_intent({"reply_intent": "UNCLEAR_META"}) == "answer_clarification"
-    assert route_after_intent({"reply_intent": "AMBIGUOUS"}) == "rephrase_question"
+    from graph.split_nodes import clarification_router_node
+    assert clarification_router_node(_min_state("UNCLEAR_META"))["clarification_route_id"] == "answer_clarification"
+    assert clarification_router_node(_min_state("AMBIGUOUS"))["clarification_route_id"] == "repair_mode"
 
 def test_draft_trigger_is_blocked_when_user_turn_is_meta_question():
     from graph.nodes import draft_node
     # Test that early intent shortcuts prevent draft
     # Not purely testing draft_node itself, but ensuring state.reply_intent routes never land here by testing routing sequence.
-    # We achieved this by routing Unclear_Meta out of semantic assessor.
+    from graph.split_nodes import clarification_router_node
     from graph.routing import route_after_intent
-    assert route_after_intent({"reply_intent": "UNCLEAR_META"}) not in ["semantic_assessor", "truth_commit", "draft"]
+    route_id = clarification_router_node(_min_state("UNCLEAR_META"))["clarification_route_id"]
+    route = route_after_intent({"clarification_route_id": route_id})
+    assert route not in ["semantic_assessor", "truth_commit", "draft"]
 
 def test_response_mode_precedence_meta_question_over_draft_mode():
-    from graph.routing import route_after_intent
+    from graph.split_nodes import clarification_router_node
     # Draft is down path of semantic validation; meta questions must preempt it.
-    assert route_after_intent({"reply_intent": "DIRECT_CLARIFICATION_QUESTION"}) == "answer_clarification"
-    assert route_after_intent({"reply_intent": "COMPLAINT_OR_META"}) == "repair_repeated_question"
+    assert clarification_router_node(_min_state("DIRECT_CLARIFICATION_QUESTION"))["clarification_route_id"] == "answer_clarification"
+    assert clarification_router_node(_min_state("COMPLAINT_OR_META"))["clarification_route_id"] == "repair_mode"
 def test_low_confidence_intent_fallback_routes_to_safe_meta_path():
-    from graph.routing import route_after_intent
-    state = {"reply_intent": "UNCLEAR_META"}
-    assert route_after_intent(state) == "answer_clarification"
+    from graph.split_nodes import clarification_router_node
+    assert clarification_router_node(_min_state("UNCLEAR_META"))["clarification_route_id"] == "answer_clarification"
 
 def test_clarification_answer_response_type_cannot_render_draft_ui(mocker):
     from graph.nodes import answer_clarification_node
@@ -311,8 +308,10 @@ def test_clarification_answer_response_type_cannot_render_draft_ui(mocker):
     assert chat_entries[-1]["type"] == "clarification_answer"
 
 def test_unclear_meta_cannot_flow_to_truth_commit():
+    from graph.split_nodes import clarification_router_node
     from graph.routing import route_after_intent
-    state = {"reply_intent": "UNCLEAR_META"}
+    route_id = clarification_router_node(_min_state("UNCLEAR_META"))["clarification_route_id"]
+    state = {"clarification_route_id": route_id}
     
     route = route_after_intent(state)
     assert route != "truth_commit"

@@ -2,7 +2,8 @@ import pytest
 from unittest.mock import patch, MagicMock
 from graph.state import PRDState
 from utils.adjudicator import invoke_llm_adjudicator, AdjudicatorDecision
-from graph.nodes import interpret_and_echo_node, generate_questions_node
+from graph.nodes import generate_questions_node
+from graph.split_nodes import blocker_transition_node
 
 # --- Unit Tests for the Adjudicator Itself ---
 
@@ -54,7 +55,7 @@ def mock_integration_services():
     with patch("graph.nodes._get_llm") as mock_llm, patch("graph.nodes._get_nlp") as mock_nlp, patch("graph.nodes._classify_intent_rule") as mock_intent:
         mock_llm.return_value = MagicMock()
         mock_nlp.return_value = MagicMock()
-        mock_intent.return_value = ("DIRECT_ANSWER", "mock", "MOCK")
+        mock_intent.return_value = ("DIRECT_ANSWER", {}, "mock", 1.0)
         yield mock_nlp
 
 def test_rule_based_filter_runs_before_llm_fallback(mock_integration_services):
@@ -70,8 +71,11 @@ def test_rule_based_filter_runs_before_llm_fallback(mock_integration_services):
         chat_history=[{"role": "user", "content": "I send it.", "semantics": {"action_graph": [{"verb": "send"}]}}]
     )
     
-    with patch("utils.adjudicator.invoke_llm_adjudicator") as mock_adj:
-        interpret_and_echo_node(state)
+    state["subpart_evidence_candidates"] = ["workflow_sequence_missing"]
+    
+    with patch("graph.split_nodes.invoke_llm_adjudicator") as mock_adj:
+        updated = blocker_transition_node(state)
+        state.update(updated)
         mock_adj.assert_not_called()
 
 def test_llm_fallback_only_invoked_on_ambiguous_cases(mock_integration_services):
@@ -89,11 +93,14 @@ def test_llm_fallback_only_invoked_on_ambiguous_cases(mock_integration_services)
         chat_history=[{"role": "user", "content": "well it really depends on the day and how the team feels but usually there is some manual stuff going on before it ends."}]
     )
     
-    with patch("utils.adjudicator.invoke_llm_adjudicator") as mock_adj:
+    state["subpart_evidence_candidates"] = ["workflow_sequence_missing"]
+
+    with patch("graph.split_nodes.invoke_llm_adjudicator") as mock_adj:
         mock_adj.return_value = AdjudicatorDecision(task_type="blocker_clearing", decision_result=False, confidence_score=0.9, reason="No exact sequence")
-        res = interpret_and_echo_node(state)
+        updated = blocker_transition_node(state)
+        state.update(updated)
         mock_adj.assert_called_once()
-        assert "workflow_sequence_missing_specific_interaction" in res["remaining_subparts"]
+        assert "workflow_sequence_missing_specific_interaction" in state["remaining_subparts"]
 
 def test_adjudicator_not_called_from_non_ambiguous_clear_case(mock_integration_services):
     state = PRDState(
@@ -104,6 +111,9 @@ def test_adjudicator_not_called_from_non_ambiguous_clear_case(mock_integration_s
         raw_answer_buffer="I export.",
         chat_history=[{"role": "user", "content": "I export.", "semantics": {"action_graph": [{"verb": "export"}]}}]
     )
-    with patch("utils.adjudicator.invoke_llm_adjudicator") as mock_adj:
-        interpret_and_echo_node(state)
+    state["subpart_evidence_candidates"] = ["workflow_sequence_missing"]
+
+    with patch("graph.split_nodes.invoke_llm_adjudicator") as mock_adj:
+        updated = blocker_transition_node(state)
+        state.update(updated)
         mock_adj.assert_not_called()

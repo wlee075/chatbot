@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import MagicMock, patch
-from graph.nodes import _segment_text_with_provenance, interpret_and_echo_node, build_conversation_understanding_output, ProofStatus
+from graph.nodes import _segment_text_with_provenance, build_conversation_understanding_output, ProofStatus
 
 # ── CITATION DETERMINISM TESTS ──
 
@@ -131,34 +131,6 @@ def test_only_eligible_claim_spans_can_receive_citations(mocker):
     assert True
 
 # ── CLARIFICATION ECHO BYPASS TESTS ──
-
-def test_clarification_intent_skips_echo_layer_entirely(mocker):
-    state = {
-        "section_index": 0,
-        "chat_history": [{"role": "user", "content": "What do you mean?"}],
-        "raw_answer_buffer": "What do you mean?",
-        "concept_history": {},
-        "confirmed_qa_store": {},
-        "store_version": 1
-    }
-    
-    # Mock LLM and _get_llm
-    class MockResponse:
-        def __init__(self, text): self.content = text
-    mocker.patch("graph.nodes._get_llm", return_value=MagicMock())
-    mocker.patch("graph.nodes.llm_invoke", return_value=MockResponse("CLARIFICATION_REQUEST"))
-    
-    result = interpret_and_echo_node(state)
-    
-    # Verify the 'Got it' wrapper is totally absent
-    chat_hist = result.get("chat_history", [])
-    if chat_hist:
-        assert chat_hist[-1]["role"] == "assistant"
-        assert chat_hist[-1]["content"] == ""
-
-    # "pending_echo" is also checked by the router downstream
-    pending = result.get("pending_echo")
-    assert not pending
 
 def test_clarification_response_starts_directly_with_answer_or_question():
     # If the prefix is empty, then the frontend logic will correctly only display

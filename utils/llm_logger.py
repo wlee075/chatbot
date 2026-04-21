@@ -79,7 +79,8 @@ def llm_invoke(
     section = state.get("current_section", state.get("section_index", -1))
     iteration = state.get("iteration", -1)
     call_id = str(uuid.uuid4())
-    model = getattr(llm, "model", None) or getattr(getattr(llm, "bound", None), "model", "unknown")
+    model_obj = getattr(llm, "model", None) or getattr(getattr(llm, "bound", None), "model", "unknown")
+    model = model_obj if isinstance(model_obj, str) else "mocked_model"
     prompt_chars = sum(len(m.content) if hasattr(m, "content") else len(str(m)) for m in messages)
     start_ts = _now_iso()
     t0 = time.monotonic()

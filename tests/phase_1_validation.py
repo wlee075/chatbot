@@ -14,7 +14,7 @@ sys.modules["langgraph.types"] = MagicMock()
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from graph.nodes import generate_questions_node, interpret_and_echo_node, handle_tagged_event_node
+from graph.nodes import generate_questions_node, handle_tagged_event_node
 from graph.state import PRDState
 from utils.telemetry import log_integrity_failure
 from utils.validator import IntegrityValidator

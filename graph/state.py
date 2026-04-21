@@ -265,12 +265,16 @@ class PRDState(TypedDict):
     # Semantic Assessor -> Contradiction Validator -> Truth Commit instead of all in one node.
     interpreted_answer: str
     echo_text: str
+    subpart_evidence_candidates: list
     resolved_subparts: list
     snippets_by_subpart: dict
     matched_option: str
     has_conflicts: bool
     conflict_records: list
     current_concepts: list
+    is_eligible: bool
+    eligibility_reason: str
+    clarification_route_id: str
     
     rephrased_question_text: str
     narrowed_question_spec: str
@@ -326,7 +330,7 @@ class PRDState(TypedDict):
 
     # ── Structured event payload (message tagging, D-M14) ─────────────────
     # Set by await_answer_node when user submits a structured tagged event.
-    # Cleared by handle_tagged_event_node or interpret_and_echo_node.
+    # Cleared by handle_tagged_event_node or the semantic evaluation pipeline.
     # Fields: {event_type, content, target_message_id, target_content, ...optional}
     pending_event: dict
 

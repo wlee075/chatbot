@@ -821,7 +821,7 @@ if st.session_state.graph_started:
                     content = content.replace("I have all the details I need for this section. Let's move on.", "").strip()
 
                 # --- Render Logic ---
-                if msg_type in ("system", "elicit", "clarification_answer"):
+                if msg_type in ("system", "elicit", "clarification_answer", "numeric_validation_error"):
                     content_segs = msg.get("content_segments")
                     if content_segs:
                         html_pieces = []
@@ -838,16 +838,28 @@ if st.session_state.graph_started:
                                  s_msg_id = p.get("source_message_id", "")
                                  status = p.get("proof_status", "EXACT_SURFACE")
                                  
-                                 # Deduplicate sources
+                                 # Track how often Streamlit is re-rendering the same valid snippets
                                  source_key = (s_msg_id, snippet_html)
+                                 
+                                 _global_renders = st.session_state.setdefault("_citation_render_counts", {})
+                                 _global_renders[source_key] = _global_renders.get(source_key, 0) + 1
+                                 if _global_renders[source_key] > 1:
+                                     # Explicitly log if the UI loop reprocesses this historical snippet multiple times
+                                     import logging
+                                     logging.getLogger("orchestrator_metrics").info(
+                                         "Historical snippet reuse in UI",
+                                         extra={
+                                             "event_type": "citation_render_reuse_detected",
+                                             "turn_id": sv.get("run_id", ""), 
+                                             "message_id": s_msg_id, 
+                                             "rerender_count": _global_renders[source_key], 
+                                             "same_snippet_reprocessed": True
+                                         }
+                                     )
+                                 
                                  if source_key not in citation_registry:
                                      citation_registry[source_key] = cit_counter
-                                     # Clean up snippet text for flat rendering, wiping raw HTML first
-                                     if "<" in snippet_html and ">" in snippet_html:
-                                         import logging
-                                         logging.getLogger("orchestrator_metrics").warning(f"CITATION_DEFECT | HTML leak detected in snippet: {snippet_html}")
-                                     clean_snip = re.sub(r'<[^>]+>', '', snippet_html).replace('\n', ' ').strip()
-                                     clean_snip = html.escape(clean_snip)
+                                     clean_snip = html.escape(snippet_html.replace('\n', ' ').strip())
                                      if len(clean_snip) > 100: clean_snip = clean_snip[:97] + "..."
                                      sources_list.append(f"<div style='font-size:0.85rem; color:#666; margin-bottom:4px;'><b>[{cit_counter}]</b> {speaker} &middot; {d_time} &mdash; <i>\"{clean_snip}\"</i></div>")
                                      cit_counter += 1
@@ -871,7 +883,21 @@ if st.session_state.graph_started:
                             st.markdown("<hr style='margin: 12px 0; border: none; border-top: 1px solid #ddd;'/>", unsafe_allow_html=True)
                             st.markdown("".join(sources_list), unsafe_allow_html=True)
                     else:
-                        st.markdown(_present_content(content, source_lookup, confirmed_qa_store), unsafe_allow_html=True)
+                        render_val = content
+                        if msg_type == "numeric_validation_error":
+                            reason_code = sv.get("validation_reason", "")
+                            
+                            UI_NUMERIC_ERROR_MAPPING = {
+                                "hours_per_day_exceeds_24": "That number looks off — the hours per day can’t be more than 24. Could you clarify the correct figure?",
+                                "negative_values": "That number looks off — it can't be negative. Could you clarify the correct figure?",
+                                "impossible_percentages": "That percentage looks off — it shouldn't be over 100%. Could you clarify?",
+                                "zero_when_not_allowed": "That number looks off — it must be greater than zero. Could you clarify?"
+                            }
+                            
+                            fallback_msg = "That number looks off — could you double-check and clarify the correct figure?"
+                            render_val = UI_NUMERIC_ERROR_MAPPING.get(reason_code, fallback_msg)
+
+                        st.markdown(_present_content(render_val, source_lookup, confirmed_qa_store), unsafe_allow_html=True)
                         
                     # Add helper line text inside the latest assistant box
                     if turn == turns[-1] and msg == assistant_msgs[-1] and is_waiting and not active_ref:
@@ -892,11 +918,11 @@ if st.session_state.graph_started:
                             helper_copy = "After you reply, I’ll either start drafting if I have enough detail, or ask one focused follow-up question."
                         st.caption(f"_{helper_copy}_")
 
-                    if msg_type != "clarification_answer":
+                    if msg_type not in ("clarification_answer", "numeric_validation_error"):
                         _render_message_actions(msg_id, content, "assistant", msg_type)
                     
                 elif msg_type == "draft":
-                    if sv.get("response_type") == "clarification_answer":
+                    if sv.get("response_type") in ("clarification_answer", "numeric_validation_error"):
                         continue
                     with st.expander("📝 View draft", expanded=False):
                         st.markdown(_present_content(content, source_lookup, confirmed_qa_store), unsafe_allow_html=True)
@@ -909,7 +935,7 @@ if st.session_state.graph_started:
                             st.markdown(f"**Earlier you said:**\n\n> {evidence.get('evidence_snippet', '')}")
                             
                 elif msg_type == "reflect":
-                    if sv.get("response_type") == "clarification_answer":
+                    if sv.get("response_type") in ("clarification_answer", "numeric_validation_error"):
                         continue
                     verdict = msg.get("verdict", "REWORK")
                     review_summary = _build_review_summary(msg)

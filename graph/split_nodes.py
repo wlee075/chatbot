@@ -101,30 +101,61 @@ def intent_classifier_node(state: PRDState) -> dict:
         duration_ms=duration_ms
     )
 
-    # Fast Repair Handling
-    if intent in ('REPETITION_COMPLAINT', 'REPHRASE_REQUEST', 'COMPLAINT_OR_META', 'AMBIGUOUS'):
-        if intent == 'REPETITION_COMPLAINT':
-            repair_instruction = 'REPETITION_COMPLAINT'
-        elif intent == 'REPHRASE_REQUEST':
-            repair_instruction = 'REPHRASE_REQUEST'
-        else:
-            is_repetition = ("repeat" in raw_answer.lower() or "again" in raw_answer.lower() or "same" in raw_answer.lower() or "already" in raw_answer.lower())
-            repair_instruction = "DUPLICATE_SUPPRESSED" if (intent == 'COMPLAINT_OR_META' and is_repetition) else "REPHRASE_REQUIRED"
-            
-        res = {
-            "reply_intent": intent, 
-            "repair_instruction": repair_instruction,
-            "active_question_id": "",
-            "pending_echo": "",
-            "raw_answer_buffer": ""
-        }
-        if interpretation:
-            res["reply_context_interpretation"] = interpretation
-        return res
-        
     res = {"reply_intent": intent}
     if interpretation:
         res["reply_context_interpretation"] = interpretation
+    return res
+
+def clarification_router_node(state: PRDState) -> dict:
+    """1a. Clarification Router Node"""
+    ctx = _log_ctx(state, "clarification_router")
+    log_event(**ctx, level="INFO", event_type="node_start", message="clarification_router started")
+    
+    reply_intent = state.get("reply_intent", "")
+    route = "option_resolution"
+    fallback_state = "proceeding to normal extraction"
+    
+    if reply_intent in ("DIRECT_CLARIFICATION_QUESTION", "UNCLEAR_META"):
+        route = "answer_clarification"
+        fallback_state = "diverting to clarify user question"
+    elif reply_intent in ("REPHRASE_REQUEST", "AMBIGUOUS", "REPETITION_COMPLAINT", "COMPLAINT_OR_META"):
+        route = "repair_mode"
+        fallback_state = "diverting to repair state"
+    elif reply_intent == "NUMERIC_ERROR":
+        route = "handle_numeric_error"
+        fallback_state = "diverting to numeric error handler"
+        
+    log_event(**ctx, level="INFO", event_type="clarification_route_selected", message=f"Routed to {route}", route_selected=route, fallback_state=fallback_state)
+    
+    return {
+        "clarification_route_id": route
+    }
+
+def repair_mode_node(state: PRDState) -> dict:
+    """1b. Repair Mode Node"""
+    ctx = _log_ctx(state, "repair_mode")
+    log_event(**ctx, level="INFO", event_type="node_start", message="repair_mode started")
+    
+    intent = state.get("reply_intent", "")
+    raw_answer = state.get("raw_answer_buffer", "").strip()
+    
+    if intent == 'REPETITION_COMPLAINT':
+        repair_instruction = 'REPETITION_COMPLAINT'
+    elif intent == 'REPHRASE_REQUEST':
+        repair_instruction = 'REPHRASE_REQUEST'
+    else:
+        is_repetition = ("repeat" in raw_answer.lower() or "again" in raw_answer.lower() or "same" in raw_answer.lower() or "already" in raw_answer.lower())
+        repair_instruction = "DUPLICATE_SUPPRESSED" if (intent == 'COMPLAINT_OR_META' and is_repetition) else "REPHRASE_REQUIRED"
+        
+    res = {
+        "repair_instruction": repair_instruction,
+        "active_question_id": "",
+        "pending_echo": "",
+        "raw_answer_buffer": ""
+    }
+    
+    log_event(**ctx, level="INFO", event_type="repair_mode_evaluated", message="Repair mode evaluated", repair_instruction=repair_instruction)
+    
     return res
 
 
@@ -185,13 +216,13 @@ def semantic_assessor_node(state: PRDState) -> dict:
             candidates.append((cl, g_idx, sent))
             g_idx += 1
 
-    resolved_subparts = []
+    subpart_evidence_candidates = []
     snippets_by_subpart = {}
     ans_lower = raw_answer.lower()
 
     if is_numeric_repair or intent == "DIRECT_ANSWER" or "both" in ans_lower or "all" in ans_lower:
-        resolved_subparts = list(remaining_subparts)
-        for sp in resolved_subparts:
+        subpart_evidence_candidates = list(remaining_subparts)
+        for sp in subpart_evidence_candidates:
             snippets_by_subpart[sp] = raw_answer
     else:
         for sp in remaining_subparts:
@@ -222,16 +253,16 @@ def semantic_assessor_node(state: PRDState) -> dict:
                     sb = len(sp_norm & _tokenize_norm(sent))
                     if sb > fb_score: fb_score, fb_sent = sb, sent
                 snippets_by_subpart[sp] = fb_sent
-                if fb_sent: resolved_subparts.append(sp)
+                if fb_sent: subpart_evidence_candidates.append(sp)
             else:
-                resolved_subparts.append(sp)
+                subpart_evidence_candidates.append(sp)
                 base_b = best_s - (1 if best_p else 0)
                 overlap_ratio = base_b / max(len(sp_norm), 1)
                 if overlap_ratio < 0.5: snippets_by_subpart[sp] = best_sent
                 elif best_cl and _has_reversal(best_cl): snippets_by_subpart[sp] = best_sent
                 else: snippets_by_subpart[sp] = best_cl
 
-    _new_remaining_raw = [s for s in remaining_subparts if s not in resolved_subparts]
+    _new_remaining_raw = [s for s in remaining_subparts if s not in subpart_evidence_candidates]
 
     chat_hist = state.get("chat_history", [])
     latest_semantics = {}
@@ -251,7 +282,7 @@ def semantic_assessor_node(state: PRDState) -> dict:
         has_mapping_mentions = any(w in raw_answer.lower() for w in ["product code", "match", "id", "name", "criteria", "email"])
 
     return {
-        "resolved_subparts": resolved_subparts,
+        "subpart_evidence_candidates": subpart_evidence_candidates,
         "snippets_by_subpart": snippets_by_subpart,
         "new_remaining_raw": _new_remaining_raw,
         "action_verbs": action_verbs,
@@ -260,23 +291,28 @@ def semantic_assessor_node(state: PRDState) -> dict:
 
 def blocker_transition_node(state: PRDState) -> dict:
     """Phase 2b: Blocker Transition Node"""
-    resolved_subparts = state.get("resolved_subparts", [])
+    ctx = _log_ctx(state, "blocker_transition")
+    log_event(**ctx, level="INFO", event_type="node_start", message="blocker_transition started")
+
+    subpart_evidence_candidates = state.get("subpart_evidence_candidates", [])
     _new_remaining_raw = state.get("new_remaining_raw", [])
     action_verbs = state.get("action_verbs", [])
     has_mapping_mentions = state.get("has_mapping_mentions", False)
     raw_answer = state.get("raw_answer_buffer", "").strip()
     question = state.get("current_questions", "").strip()
-    intent = state.get("reply_intent", "")
-    matched_option = state.get("matched_option")
+    
+    current_blocking = list(state.get("blocking_fields", []))
+    resolved_subparts = []
 
     transitioned_remaining = []
     for s in _new_remaining_raw:
         transitioned_remaining.append(s)
 
-    for resolved_b in resolved_subparts:
+    for resolved_b in subpart_evidence_candidates:
         b_lower = resolved_b.lower()
+        transitioned_item = None
         if "workflow" in b_lower or "sequence" in b_lower:
-            if action_verbs: transitioned_remaining.append("mapping_logic_missing")
+            if action_verbs: transitioned_item = "mapping_logic_missing"
             elif len(raw_answer.split()) > 10:
                 decision = invoke_llm_adjudicator(
                     task_type="blocker_clearing",
@@ -289,11 +325,11 @@ def blocker_transition_node(state: PRDState) -> dict:
                     },
                     llm=_get_llm(),
                 )
-                if decision and decision.decision_result: transitioned_remaining.append(decision.recommended_next_blocker_if_any or "mapping_logic_missing")
-                else: transitioned_remaining.append(resolved_b + "_specific_interaction")
-            else: transitioned_remaining.append(resolved_b + "_specific_interaction")
+                if decision and decision.decision_result: transitioned_item = decision.recommended_next_blocker_if_any or "mapping_logic_missing"
+                else: transitioned_item = resolved_b + "_specific_interaction"
+            else: transitioned_item = resolved_b + "_specific_interaction"
         elif "mapping" in b_lower or "logic" in b_lower:
-            if has_mapping_mentions: transitioned_remaining.append("destination_handling_missing")
+            if has_mapping_mentions: transitioned_item = "destination_handling_missing"
             elif len(raw_answer.split()) > 10:
                 decision = invoke_llm_adjudicator(
                     task_type="blocker_clearing",
@@ -306,41 +342,40 @@ def blocker_transition_node(state: PRDState) -> dict:
                     },
                     llm=_get_llm(),
                 )
-                if decision and decision.decision_result: transitioned_remaining.append(decision.recommended_next_blocker_if_any or "destination_handling_missing")
-                else: transitioned_remaining.append(resolved_b + "_specific_fields")
-            else: transitioned_remaining.append(resolved_b + "_specific_fields")
+                if decision and decision.decision_result: transitioned_item = decision.recommended_next_blocker_if_any or "destination_handling_missing"
+                else: transitioned_item = resolved_b + "_specific_fields"
+            else: transitioned_item = resolved_b + "_specific_fields"
         elif "owner" in b_lower:
-            transitioned_remaining.append("escalation_path_missing")
+            transitioned_item = "escalation_path_missing"
+
+        if transitioned_item:
+            transitioned_remaining.append(transitioned_item)
+            log_event(**ctx, level="INFO", event_type="blocker_evaluation", field=resolved_b, verdict="transitioned", message=f"Blocker {resolved_b} transitioned to {transitioned_item}")
+        else:
+            resolved_subparts.append(resolved_b)
+            log_event(**ctx, level="INFO", event_type="blocker_evaluation", field=resolved_b, verdict="cleared", message=f"Blocker {resolved_b} cleared")
 
     new_remaining = []
     for s in transitioned_remaining:
         if s not in new_remaining: new_remaining.append(s)
 
-    # Echo string generation
-    echo_text = ""
-    interpreted = raw_answer
-    if intent == 'BLENDED':
-        echo_answer = "both matter. I'll proceed on that basis"
-        interpreted = "Both options matter: " + raw_answer
-        echo_text = f"You're right — I should have captured that. It sounds like {echo_answer} unless one is clearly the priority."
-    else:
-        if matched_option:
-            interpreted = matched_option
-            echo_text = f"I understand, the focus is {interpreted}."
-        else:
-            clean_ans = raw_answer.strip()
-            if len(clean_ans) > 60 or "->" in clean_ans or "\n" in clean_ans or len(clean_ans.split()) > 15:
-                echo_text = ""
-            else:
-                if clean_ans and clean_ans[0].islower():
-                    clean_ans = clean_ans[0].upper() + clean_ans[1:]
-                echo_text = f"Got it. {clean_ans.rstrip('.')}."
-
-    return {
+    # Mutate blocking fields by removing any cleared subparts (resolved_subparts)
+    removed_count = 0
+    for sp in resolved_subparts:
+        if sp in current_blocking:
+            current_blocking.remove(sp)
+            removed_count += 1
+            
+    return_payload = {
         "remaining_subparts": new_remaining,
-        "interpreted_answer": interpreted,
-        "echo_text": echo_text
+        "resolved_subparts": resolved_subparts,
+        "blocking_fields": current_blocking
     }
+    
+    current_count = state.get("missing_required_fields_count", 0)
+    return_payload["missing_required_fields_count"] = max(0, current_count - removed_count)
+
+    return return_payload
 
 
 def contradiction_validator_node(state: PRDState) -> dict:
@@ -359,13 +394,36 @@ def contradiction_validator_node(state: PRDState) -> dict:
         "current_concepts": bridge["current_concepts"]
     }
 
+def truth_eligibility_node(state: PRDState) -> dict:
+    """3b. Truth Eligibility Node"""
+    ctx = _log_ctx(state, "truth_eligibility")
+    log_event(**ctx, level="INFO", event_type="node_start", message="truth_eligibility started")
+    
+    conflict_records = state.get("conflict_records", [])
+    has_conflicts = len(conflict_records) > 0
+    is_eligible = not has_conflicts
+    reason = "conflicted concepts must be resolved before committing to canonical truth" if has_conflicts else "no conflicts detected"
+    
+    log_event(
+        **ctx, level="INFO", event_type="truth_gate_evaluated",
+        message=f"Truth eligibility evaluated to {is_eligible}",
+        is_eligible=is_eligible,
+        conflict_count=len(conflict_records),
+        reason=reason
+    )
+    
+    return {
+        "is_eligible": is_eligible,
+        "eligibility_reason": reason
+    }
+
 def truth_commit_node(state: PRDState) -> dict:
     """4. Truth Commit Node"""
     ctx = _log_ctx(state, "truth_commit")
     log_event(**ctx, level="INFO", event_type="node_start", message="truth_commit started")
 
     # Eligibility check payload provided directly by the Graph State via earlier nodes
-    if state.get("has_conflicts", False):
+    if not state.get("is_eligible", False):
         log_event(
             **ctx, level="INFO", event_type="commit_truth_blocked",
             reason="conflicted concepts must be resolved before committing to canonical truth",
@@ -468,14 +526,6 @@ def truth_commit_node(state: PRDState) -> dict:
         "confirmed_qa_store": store_update,
         "store_version": current_version,
         "contradiction_log": [],
-        "chat_history": [
-            {
-                "role": "assistant",
-                "type": "echo_confirmation",
-                "section": section.title,
-                "content": state.get("echo_text", ""),
-            }
-        ] if state.get("echo_text") else [],
     }
     
     return return_payload
@@ -497,30 +547,87 @@ def concept_history_update_node(state: PRDState) -> dict:
 
     return {"concept_history": concept_history}
 
+def echo_generation_node(state: PRDState) -> dict:
+    """Phase 4b: Optional policy-driven echo generation"""
+    ctx = _log_ctx(state, "echo_generation")
+    log_event(**ctx, level="INFO", event_type="node_start", message="echo_generation started")
+    
+    intent = state.get("reply_intent", "")
+    raw_answer = state.get("raw_answer_buffer", "").strip()
+    matched_option = state.get("matched_option")
+    
+    echo_text = ""
+    interpreted = raw_answer
+
+    # Policy 1: If it's a blended intent, we compose a special echo.
+    if intent == 'BLENDED':
+        echo_answer = "both matter. I'll proceed on that basis"
+        interpreted = "Both options matter: " + raw_answer
+        echo_text = f"You're right — I should have captured that. It sounds like {echo_answer} unless one is clearly the priority."
+    else:
+        # Policy 2: Explicit options
+        if matched_option:
+            interpreted = matched_option
+            echo_text = f"I understand, the focus is {interpreted}."
+        else:
+            # Policy 3: Length gating for optional free-text
+            clean_ans = raw_answer.strip()
+            if len(clean_ans) > 60 or "->" in clean_ans or "\n" in clean_ans or len(clean_ans.split()) > 15:
+                # Do NOT generate an echo if it's too long or structured
+                echo_text = ""
+            else:
+                if clean_ans and clean_ans[0].islower():
+                    clean_ans = clean_ans[0].upper() + clean_ans[1:]
+                echo_text = f"Got it. {clean_ans.rstrip('.')}."
+                
+    return_payload = {
+        "interpreted_answer": interpreted,
+        "echo_text": echo_text
+    }
+    
+    if echo_text:
+        # Assuming the section can be retrieved or was stored in `echo_confirmation` type message if required.
+        # But we append to chat_history explicitly.
+        section_index = state.get("section_index", 0)
+        section = get_section_by_index(section_index)
+        return_payload["chat_history"] = [
+            {
+                "role": "assistant",
+                "type": "echo_confirmation",
+                "section": section.title if section else "General",
+                "content": echo_text,
+            }
+        ]
+        
+    return return_payload
+
 def state_cleanup_node(state: PRDState) -> dict:
     """Phase 4b: State Cleanup Node"""
     matched_option = state.get("matched_option", "")
     q_status = state.get("question_status", "")
     resolved_subparts = state.get("resolved_subparts", [])
     is_numeric_repair = bool(state.get("parent_question_id"))
-    
     return_payload = {
         "raw_answer_buffer": "",
         "question_status": "ANSWERED" if matched_option else q_status,
         "resolved_option_id": matched_option if matched_option else state.get("resolved_option_id", ""),
         "answered_at": str(time.time()) if matched_option else state.get("answered_at", ""),
+        "subpart_evidence_candidates": [],
+        "matched_option": "",
+        "echo_text": "",
+        "reply_intent": "",
+        "interpreted_answer": ""
     }
     
-    if resolved_subparts:
-        current_blocking = list(state.get("blocking_fields", []))
-        removed = 0
-        for sp in resolved_subparts:
-            if sp in current_blocking:
-                current_blocking.remove(sp)
-                removed += 1
-        return_payload["blocking_fields"] = current_blocking
-        current_count = state.get("missing_required_fields_count", 0)
-        return_payload["missing_required_fields_count"] = max(0, current_count - removed)
+    # State cleared items telemetry check
+    ctx = _log_ctx(state, "state_cleanup")
+    log_event(
+        **ctx, 
+        level="INFO", 
+        event_type="state_zeroed", 
+        message="State zeroed",
+        cleared_keys=list(return_payload.keys())
+    )
     
     if is_numeric_repair:
         return_payload["parent_question_id"] = ""
@@ -530,41 +637,7 @@ def state_cleanup_node(state: PRDState) -> dict:
         
     return return_payload
 
-def rephrase_question_node(state: PRDState) -> dict:
-    """Rephrase Node: Strictly rewords existing blocker context for clarity."""
-    ctx = _log_ctx(state, "rephrase_question")
-    log_event(**ctx, level="INFO", event_type="node_start", message="rephrase_question started")
-    
-    # Normally this would call an LLM to rephrase state.get("current_questions")
-    # We output purely a state payload.
-    return {
-        "rephrased_question_text": f"Let me rephrase: {state.get('current_questions', '')}",
-        "raw_answer_buffer": "",
-        "chat_history": [
-            {
-                "role": "assistant",
-                "type": "rephrase",
-                "content": "I apologize if that was unclear. Let me rephrase: " + state.get("current_questions", "")
-            }
-        ]
-    }
 
-def repair_repeated_question_node(state: PRDState) -> dict:
-    """Repetition Node: Validates if the question is stuck in a loop."""
-    ctx = _log_ctx(state, "repair_repeated_question")
-    log_event(**ctx, level="INFO", event_type="node_start", message="repair_repeated_question started")
-    
-    # Limit iteration or specify a narrowed scope. No generic question generation.
-    return {
-        "narrowed_question_spec": "escalate_to_manager",
-        "chat_history": [
-            {
-                "role": "assistant",
-                "type": "repair",
-                "content": "It seems we are going in circles. Let's try a different approach."
-            }
-        ]
-    }
 
 def handle_numeric_error_node(state: PRDState) -> dict:
     """Numeric Error Node: Protect boundary checks for quantity answers."""
@@ -572,13 +645,19 @@ def handle_numeric_error_node(state: PRDState) -> dict:
     log_event(**ctx, level="INFO", event_type="node_start", message="handle_numeric_error started")
     
     reason = state.get("validation_reason", "Invalid numeric input.")
+    
+    # [TECH DEBT] chat_history injection is currently required for Streamlit rendering compatibility 
+    # to maintain the "assistant" bubble grouping. The final render layer (UI) owns the actual English wording.
     return {
-        "numeric_validation_error_message": reason,
+        "response_type": "numeric_validation_error",
+        "validation_reason": reason,
+        "pending_numeric_clarification": True,
+        "question_status": "OPEN",
         "chat_history": [
             {
                 "role": "assistant",
-                "type": "numeric_error",
-                "content": f"I couldn't process that number. {reason} Could you clarify?"
+                "type": "numeric_validation_error",
+                "content": ""  # UI / Assembly layer formats the text
             }
         ]
     }

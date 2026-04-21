@@ -12,9 +12,9 @@ from graph.state import ConceptStatus
 from graph.nodes import (
     _sync_concept_history, 
     _build_user_message_dict,
-    interpret_and_echo_node,
     build_conversation_understanding_output
 )
+from graph.split_nodes import contradiction_validator_node, truth_commit_node
 from config.sections import PRD_SECTIONS
 
 @pytest.fixture
@@ -71,13 +71,14 @@ def test_commit_truth_blocks_on_conflict(state):
         "confidence": 0.95
     }
     
-    with patch("utils.logger.log_event") as mock_log, patch("graph.nodes._get_llm") as mock_llm:
-        mock_llm.return_value = MagicMock()
-        result = interpret_and_echo_node(state)
+    with patch("utils.logger.log_event") as mock_log:
+        validator_out = contradiction_validator_node(state)
+        state.update(validator_out)
+        result = truth_commit_node(state)
         
-    # The commit should return early and offer clarification echo, not pending_concept_updates (the qa store update)
-    assert not result.get("pending_concept_updates")
-    assert "conflict" in result.get("pending_echo", "").lower()
+    # The commit should return early and append clarification echo
+    assert "concept_updates" not in result
+    assert "conflict" in result["chat_history"][0]["content"].lower()
     
 def test_readiness_gate_blocks_drafting_on_conflict(state):
     state["concept_history"]["csv"] = {

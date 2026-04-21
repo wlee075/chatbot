@@ -1,7 +1,8 @@
 import pytest
 from unittest.mock import patch, MagicMock
 from graph.state import PRDState
-from graph.nodes import interpret_and_echo_node, generate_questions_node
+from graph.nodes import generate_questions_node
+from graph.split_nodes import repair_mode_node
 import time
 
 @pytest.fixture(autouse=True)
@@ -11,10 +12,8 @@ def mock_integration_services():
         mock_nlp.return_value = MagicMock()
         yield mock_nlp
 
-@patch("graph.nodes._classify_intent_rule")
-def test_repetition_complaint_invalidates_previous_question(mock_classify):
+def test_repetition_complaint_invalidates_previous_question():
     # Step 1: User says "why are you asking this again?" -> COMPLAINT_OR_META + is_repetition
-    mock_classify.return_value = ("COMPLAINT_OR_META", "mock", "MOCK")
     
     state = PRDState(
         thread_id="test",
@@ -22,18 +21,17 @@ def test_repetition_complaint_invalidates_previous_question(mock_classify):
         section_index=0,
         remaining_subparts=["workflow_sequence_missing"],
         raw_answer_buffer="Why are you asking me the same question again?",
+        reply_intent="COMPLAINT_OR_META",
         chat_history=[]
     )
     
-    result = interpret_and_echo_node(state)
+    result = repair_mode_node(state)
     assert result["active_question_id"] == ""
     assert result["repair_instruction"] == "DUPLICATE_SUPPRESSED"
 
 
-@patch("graph.nodes._classify_intent_rule")
-def test_unclear_wording_complaint_rewrites_question_without_changing_blocker(mock_classify):
+def test_unclear_wording_complaint_rewrites_question_without_changing_blocker():
     # User says "I don't understand" -> AMBIGUOUS -> REPHRASE_REQUIRED
-    mock_classify.return_value = ("AMBIGUOUS", "mock", "MOCK")
     
     state = PRDState(
         thread_id="test",
@@ -41,10 +39,11 @@ def test_unclear_wording_complaint_rewrites_question_without_changing_blocker(mo
         section_index=0,
         remaining_subparts=["workflow_sequence_missing"],
         raw_answer_buffer="I don't understand what you mean",
+        reply_intent="AMBIGUOUS",
         chat_history=[]
     )
     
-    result = interpret_and_echo_node(state)
+    result = repair_mode_node(state)
     assert result["active_question_id"] == ""
     assert result["repair_instruction"] == "REPHRASE_REQUIRED"
 
