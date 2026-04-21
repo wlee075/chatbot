@@ -1,28 +1,51 @@
 ---
 name: question-generation
-description: Generates the best next question in the conversation flow. Use when the previous question is resolved, a follow-up is needed, ambiguity must be narrowed, branch-specific questioning is required, or the assistant needs one focused next step without repeating itself.
+description: Generates the single best next question using structured conversation understanding inputs such as message-level meaning, concept history, known facts, blockers, and draft readiness. Use when the previous question is resolved, ambiguity must be narrowed, contradictions need clarification, or one focused next step is needed without repeating yourself.
 ---
 
 # Question Generation Skill
 
 Use this skill whenever the chatbot needs to decide **what to ask next**.
 
-## Core responsibility
+This skill works best when upstream systems already provide structured meaning from:
+
+- `message-understanding`
+- `concept-history`
+- `conversation-understanding`
+
+This skill should **consume understanding**, not recreate it.
+
+---
+
+# Core responsibility
 
 This skill owns next-question creation only.
 
 It decides:
 
-- What single question should be asked next
-- How to narrow ambiguity
-- How to follow the chosen branch
-- How to uncover missing business details efficiently
-- How to move toward drafting readiness
-- How to avoid repeating earlier questions
+- what single question should be asked next
+- how to narrow ambiguity
+- how to continue the chosen branch
+- how to uncover missing business details efficiently
+- how to move toward drafting readiness
+- how to avoid repeating itself
+- when not to ask another question
 
-This skill does **not** own answer validation, question lifecycle state transitions, telemetry, or performance tuning.
+This skill does **not** own:
 
-## Primary standard
+- raw keyword extraction
+- semantic lifecycle tracking
+- contradiction detection itself
+- answer validation
+- final truth commitment
+- telemetry / logging implementation
+- UI controls
+
+Those belong upstream.
+
+---
+
+# Primary standard
 
 Every turn should produce:
 
@@ -31,115 +54,213 @@ Every turn should produce:
 - **Plain English wording**
 - **No repeated asks**
 - **Natural conversational flow**
+- **Uses known context intelligently**
 
 Bad output:
 
-- 5 questions at once  
-- vague broad resets  
-- internal evaluator jargon  
-- repeating previous questions  
-- asking for data already known
+- 5 stacked questions
+- vague resets
+- evaluator jargon
+- asking already-known facts
+- ignoring corrections already given
+- broad lazy prompts
 
 Good output:
 
-- one clear next step that closes the biggest gap
+- one sharp next step that closes the biggest gap
 
-## When to use this skill
+---
 
-Use this skill when:
+# Upstream inputs expected
 
-- Previous question was answered
-- Reply was partial and needs one follow-up
-- A branch/option was selected
-- The assistant needs one narrower question
-- Drafting is not yet ready
-- Clarification is complete and flow should resume
-- Multiple gaps exist and one must be prioritized
+Use the smallest sufficient structured context.
 
-## Inputs required
-
-Use the smallest sufficient context:
+## Preferred Inputs
 
 - `active_question_id`
 - prior question text
 - resolution result
+- `known_facts`
+- `current_concepts`
+- `historical_concepts`
+- `conflicted_concepts`
+- `example_only_concepts`
 - chosen branch / option
-- known facts
 - unresolved blockers
 - draft readiness state
 - recent asked questions
+- concept corrections / supersessions
 
-Do not require full chat history unless necessary.
+## Example
 
-## Question selection hierarchy
+Instead of raw chat history:
 
-Choose next question in this priority order:
+Use:
 
-### 1. Highest leverage blocker
+```json
+{
+  "known_facts": {
+    "current_tool": "Excel",
+    "target_output": "Send PDF to mailbox"
+  },
+  "conflicted_concepts": ["SAP"],
+  "unresolved_blockers": ["daily volume"],
+  "recent_questions": ["Who owns the process?"]
+}
+```
+Do not require full transcript unless absolutely necessary.
+
+## Decision hierarchy
+
+Choose the next question in this order.
+
+1. Highest leverage blocker
 
 Ask the question whose answer most reduces uncertainty.
 
 Examples:
+	•	volume
+	•	owner
+	•	trigger
+	•	frequency
+	•	current pain severity
+	•	workflow bottleneck
+	•	missing destination
+	•	source system
 
-- volume
-- owner
-- trigger
-- frequency
-- current pain severity
-- current workflow steps
+2. Resolve semantic conflicts
 
-### 2. Branch continuation
+If concepts are contradicted or unclear, clarify before expanding scope.
 
-If the user selected a branch, continue within that branch.
+Examples:
+	•	SAP mentioned as current and negated
+	•	two owners named
+	•	old system vs current system unclear
+
+3. Continue chosen branch
+
+If the user selected a branch, stay within it.
 
 Example:
 
-If issue = mapping creation  
-Next ask mapping workflow details, not PDF sending.
+Main issue = mapping creation
 
-### 3. Repair unresolved contradictions
+Ask mapping workflow next, not email sending.
 
-If conflicting facts exist, clarify before expanding scope.
+4. Unlock drafting readiness
 
-### 4. Draft readiness unlocker
+Ask for the one missing field preventing a useful first draft.
 
-Ask for the one missing field preventing draft start.
+5. Decide not to ask
+
+If enough is known:
+	•	start drafting, or
+	•	summarize and confirm
+
+Do not keep asking filler questions forever.
+
+
+---
 
 ## One-question-per-turn rule
 
 Always ask exactly one primary question.
 
 Allowed:
-
-- one question sentence
-- one short lead-in + one question
+	•	one question sentence
+	•	one short lead-in + one question
 
 Not allowed:
+	•	stacked interrogations
+	•	bullet list forms
+	•	multi-part surveys
+	•	“A and B and C?” in one turn unless truly inseparable
 
-- multiple stacked questions
-- bullet list interrogations
-- giant forms unless explicitly requested
 
-## Narrow, not broad
+---
 
-Every next question should be narrower or more specific than before.
+## Use structured meaning properly
 
-Bad:
+If concept is current
 
-“What else can you tell me about the process?”
-
-Good:
-
-“How many PDF files are usually processed each day?”
-
-## Branch-aware generation
-
-If a branch is selected, stay inside it.
+Use it naturally.
 
 Example:
 
-Question: Is the main issue mapping creation or file sending?  
-User: Mapping creation.
+Known current tool = Excel
+
+Ask:
+
+“What part of the Excel process is still manual today?”
+
+If concept is historical
+
+Do not treat it as current.
+
+Bad:
+
+“How many Excel files are processed daily?”
+
+Good:
+
+“You mentioned Excel was used before. What tool is used now?”
+
+If concept is example_only
+
+Do not assume adoption.
+
+Bad:
+
+“How should Lark send the PDF?”
+
+Good:
+
+“You mentioned Lark as an example. What tool do you actually use today?”
+
+If concept is conflicted
+
+Clarify first.
+
+Good:
+
+“I heard two versions — do you currently use SAP or not?”
+
+
+---
+
+## Narrow, not broad
+
+Every next question should become narrower or more concrete than before.
+
+Bad:
+
+“Tell me more about the process.”
+
+Good:
+
+“How many PDF files are usually sent each day?”
+
+Bad:
+
+“What are the pain points?”
+
+Good:
+
+“Which step takes the most time today: mapping, retrieval, or sending?”
+
+---
+
+## Branch-aware generation
+
+If a branch is chosen, stay inside it.
+
+Example:
+
+Question:
+Is the main issue mapping creation or file sending?
+
+User:
+Mapping creation.
 
 Good next question:
 
@@ -149,92 +270,174 @@ Bad next question:
 
 “How are PDFs forwarded to the mailbox?”
 
+
+---
+
+## Correction-aware generation
+
+If the user corrected something, honor the correction immediately.
+
+Example:
+
+User:
+Not PRD, I meant PO.
+
+Good next question:
+
+“What information needs to go into the PO?”
+
+Bad next question:
+
+“How is the PRD approved?”
+
+
+---
+
 ## Plain English rule
 
-Do not expose internal terms like:
-
-- blocker
-- contradiction
-- evaluator gap
-- unresolved required field
-- ambiguity class B
+Never expose internal system language like:
+	•	unresolved blocker
+	•	contradiction class
+	•	missing required field
+	•	ambiguity bucket
+	•	semantic conflict
 
 Rewrite naturally.
 
+Bad:
+
+“There is a contradiction in ownership.”
+
 Good:
 
-“I’m still unclear on one point: who owns this step today?”
+“I’ve heard two different owners mentioned. Who handles this today?”
+
+
+---
 
 ## Repeat prevention
 
-Before finalizing a question:
+Before emitting a question:
+	1.	compare against active question
+	2.	compare against recent questions
+	3.	compare semantic intent, not just wording
+	4.	if repeated, regenerate narrower or move on
 
-1. Compare against current active question
-2. Compare against recent asked questions
-3. Compare semantic intent, not only wording
-4. If repeated, regenerate narrower or move on
+Example:
+
+Asked before:
+“How many files per day?”
+
+Do not ask later:
+“What is the daily file volume?”
+
+That is the same question.
+
+
+---
 
 ## Draft-aware routing
 
 If enough information exists, do not ask filler questions.
 
-Instead route to draft start.
+Instead:
+	•	start draft
+	•	summarize current understanding
+	•	ask for confirmation only if needed
 
 Examples:
 
-If only cosmetic curiosity remains → start drafting.
+If all core fields known except cosmetic preference → start drafting.
 
-If one critical business field missing → ask that one question.
+If only one critical gap remains → ask that one gap.
 
+
+---
 ## Templates by scenario
 
-## Scenario 1: Partial answer
-
-User gave some info but missing one detail.
+Scenario 1: Partial answer
 
 Pattern:
 
-“Got it. One thing I still need to understand: <gap>. <question>”
+“Got it. One thing I still need to understand: . ”
+
+Example:
+
+“Got it. One thing I still need to understand: volume. How many PDFs are sent daily?”
+
+
+---
 
 ## Scenario 2: Branch selected
 
 Pattern:
 
-“Understood — the main issue is <branch>. <next branch-specific question>”
+“Understood — the main issue is . ”
 
-## Scenario 3: Contradiction
+Example:
+
+“Understood — the main issue is mapping. Which mapping step is still manual?”
+
+
+---
+
+## Scenario 3: Conflict
 
 Pattern:
 
-“I’ve heard two different versions. Which is correct: <A> or <B>?”
+“I heard two different versions. Which is correct:  or ?”
 
-## Scenario 4: Draft-ready
+Example:
+
+“I heard two different versions. Do you currently use SAP or Excel?”
+
+
+---
+
+## Scenario 4: Historical replaced by current
+
+Pattern:
+
+“You mentioned  was used before. What is used now?”
+
+
+---
+## Scenario 5: Draft-ready
 
 Pattern:
 
 “Thanks — I have enough to start drafting now.”
 
+
+---
+
 ## Good examples
 
-### Example 1: Operational volume
+Example 1: Operational volume
 
 Known:
 Manual PDF forwarding issue.
 
-Good next question:
+## Good next question:
 
 “How many PDF files does the team usually process in a day?”
 
-### Example 2: Ownership
+
+---
+
+Example 2: Ownership
 
 Known:
-Problem exists, unclear owner.
+Problem exists, owner unclear.
 
 Good next question:
 
 “Who currently handles this forwarding work?”
 
-### Example 3: Trigger
+
+---
+
+Example 3: Trigger
 
 Known:
 Need automation trigger.
@@ -243,42 +446,98 @@ Good next question:
 
 “What event should trigger the forwarding automatically?”
 
+
+---
+
+Example 4: Correction-aware
+
+Known:
+PRD corrected to PO.
+
+Good next question:
+
+“What currently creates the PO today?”
+
+
+---
 ## Bad examples
+	•	“Tell me more.”
+	•	“Any other details?”
+	•	“Please provide workflow, owner, trigger, volume, pain points, SLA.”
+	•	asking already answered facts
+	•	asking about historical systems as if current
+	•	ignoring user correction
+	•	repeating prior semantic intent
 
-- “Tell me more.”
-- “Any other details?”
-- “Please provide workflow, owner, trigger, volume, pain points, SLA.”
-- repeating previous binary question
-- asking already answered facts
 
-## Quality checks before emitting question
+---
+
+## Quality checks before emitting
 
 Confirm:
+	•	one question only
+	•	not repeated
+	•	plain English
+	•	uses known context
+	•	respects corrections
+	•	branch aware
+	•	highest leverage
+	•	answerable now
+	•	moves workflow forward
 
-- one question only
-- not repeated
-- plain English
-- branch aware
-- highest leverage
-- answerable by user now
-- moves workflow forward
+
+---
 
 ## Escalation logic
 
 If no good next question exists:
+	•	start draft, or
+	•	summarize understanding and confirm
 
-- start draft, or
-- summarize current understanding and ask for confirmation
+Do not keep interrogating low-value details.
 
-Do not keep asking low-value questions forever.
+
+---
+
+## Pairing contract with upstream skills
+
+From message-understanding
+
+Consume:
+	•	entities
+	•	phrases
+	•	actions
+	•	semantic cues from latest message
+
+From concept-history
+
+Consume:
+	•	current concepts
+	•	historical concepts
+	•	conflicts
+	•	corrections
+	•	supersessions
+
+From conversation-understanding
+
+Consume:
+	•	confirmed facts
+	•	blockers
+	•	readiness
+	•	active scope
+
+This skill should not redo their work.
+
+
+---
 
 ## Success criteria
 
 This skill is working well when:
-
-- conversations move steadily forward
-- users rarely feel interrogated
-- questions feel relevant and smart
-- repeated questions decrease
-- branch transitions feel natural
-- drafts start at the right time
+	•	conversations move steadily forward
+	•	users rarely feel interrogated
+	•	questions feel relevant and smart
+	•	repeated questions decrease
+	•	corrections are respected immediately
+	•	contradictions are clarified early
+	•	drafts start at the right time

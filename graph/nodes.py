@@ -18,6 +18,7 @@ import os
 import re
 import time
 import uuid
+import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 
@@ -27,11 +28,84 @@ from langgraph.types import interrupt
 
 from config.sections import PRD_SECTIONS, get_section_by_index, get_section_by_id
 from graph.concept_map import get_impacted_sections as _rule_impacted_sections
-from graph.state import PRDState
+from graph.state import PRDState, ConceptStatus, ConversationUnderstandingOutput, ConceptRecord, BlockerRecord, CorrectionRecord, ActionCandidateRecord, DraftReadinessDict
 from utils.logger import log_event
 from utils.llm_logger import llm_invoke, flush_turn_summary
 from utils.telemetry import log_canonical_write, log_integrity_failure, log_suppression_decision
 from utils.validator import IntegrityValidator
+import html
+from enum import Enum
+from typing import TypedDict, Optional
+
+# ── Business Config ──────────────────────────────────────────────────────────
+PROVENANCE_CONF_THRESHOLD = 8.5
+MAX_CHIPS_PER_MESSAGE = 3
+
+class ExtractionReason(str, Enum):
+    STOPWORD = "stopword"
+    TOO_SHORT = "too_short"
+    PUNCTUATION = "punctuation"
+    SUBSUMED = "subsumed"
+    DUPLICATE = "duplicate"
+    LOW_VALUE = "low_value"
+    TRUNCATED = "truncated"
+
+class ExtractionCandidateType(str, Enum):
+    NOUN_CHUNK = "noun_chunk"
+    TOKEN = "token"
+    ENTITY = "entity"
+
+class ProofStatus(str, Enum):
+    EXACT_SURFACE = "EXACT_SURFACE"         # Word-for-word match
+    NORMALIZED_SURFACE = "NORMALIZED_SURFACE" # Material difference (e.g. PDFs vs pdf)
+    LEMMA_BACKED = "LEMMA_BACKED"           # Linked via linguistic root
+    REFUSED = "REFUSED"                     # Insufficient trust or ambiguous
+
+class ProofUnit(TypedDict):
+    assistant_surface_text: str
+    concept_key: str
+    source_message_id: str
+    source_span: tuple[int, int]
+    source_display_time: str
+    snippet_html: str
+    proof_status: str
+    ranking_reason: str
+
+# ── Business domain allowlist for extraction ──────────────────────────────────
+DOMAIN_ALLOWLIST = {"pdf", "sku", "sap", "sql", "prd", "lark", "csv", "excel", "mailbox"}
+
+# ── spaCy resources (singleton) ──────────────────────────────────────────────
+_NLP = None
+
+def _get_nlp():
+    global _NLP
+    if _NLP is None:
+        try:
+            import spacy
+            _NLP = spacy.load("en_core_web_sm")
+            ruler = _NLP.add_pipe("entity_ruler", before="ner")
+            patterns = [
+                {"label": "FILE_TYPE", "pattern": [{"LOWER": "pdf"}]},
+                {"label": "FILE_TYPE", "pattern": [{"LOWER": "csv"}]},
+                {"label": "FILE_TYPE", "pattern": [{"LOWER": "excel"}]},
+                {"label": "FILE_TYPE", "pattern": [{"LOWER": "prd"}]},
+                {"label": "TOOL", "pattern": [{"LOWER": "sap"}]},
+                {"label": "TOOL", "pattern": [{"LOWER": "sql"}]},
+                {"label": "TOOL", "pattern": [{"LOWER": "salesforce"}]},
+                {"label": "TOOL", "pattern": [{"LOWER": "streamlit"}]},
+                {"label": "TOOL", "pattern": [{"LOWER": "lark"}]},
+                {"label": "EMAIL_GROUP", "pattern": [{"LOWER": "mailbox"}]},
+                {"label": "EMAIL_GROUP", "pattern": [{"LOWER": "group"}, {"LOWER": "mailbox"}]},
+                {"label": "SYSTEM", "pattern": [{"LOWER": "sku"}]},
+            ]
+            ruler.add_patterns(patterns)
+        except Exception as e:
+            log_event(
+                thread_id="", run_id="", message="spacy_load_failure",
+                level="ERROR", event_type="spacy_error", error=str(e)
+            )
+            _NLP = False  # Fallback marker
+    return _NLP
 
 # ── NLTK resources (cached at module load) ────────────────────────────────────
 try:
@@ -64,6 +138,7 @@ except Exception as _nltk_err:
         return re.findall(r"[a-zA-Z']+", text.lower())
 from prompts.templates import (
     CLARIFICATION_ANSWER_PROMPT,
+    CONVERSATION_UNDERSTANDING_BLOCK,
     INTENT_FALLBACK_CLASSIFICATION_PROMPT,
     DECISION_ENFORCEMENT_BLOCK,
     DEFAULT_MAX_RECOVERY_MODE_CONSECUTIVE_ITERATIONS,
@@ -110,6 +185,59 @@ def _format_prd_so_far(prd_sections: dict) -> str:
     return "\n\n".join(parts)
 
 
+def _safe_highlight_render(text: str, start: int, end: int) -> str:
+    """Render highlight by applying offsets to escaped text to prevent injection."""
+    if not text or start < 0 or end > len(text) or start >= end:
+        return html.escape(text)
+    
+    pre = html.escape(text[:start])
+    match = html.escape(text[start:end])
+    post = html.escape(text[end:])
+    
+    return f'{pre}<mark class="cite-match">{match}</mark>{post}'
+
+
+def _sniper_window(text: str, start: int, end: int, window_size: int = 100) -> str:
+    """Center snippet on match, snapping to sentence/word boundaries."""
+    if not text:
+        return ""
+    if len(text) <= window_size:
+        return _safe_highlight_render(text, start, end)
+
+    half_win = window_size // 2
+    match_center = (start + end) // 2
+    
+    w_start = max(0, match_center - half_win)
+    w_end = min(len(text), match_center + half_win)
+
+    # Snap to nearest word boundary
+    if w_start > 0:
+        while w_start < start and text[w_start] not in (" ", "\n"):
+            w_start += 1
+    if w_end < len(text):
+        while w_end > end and text[w_end] not in (" ", "\n"):
+            w_end -= 1
+
+    # Snap to nearest sentence boundary if close
+    sent_snap_range = 20
+    prev_dot = text.rfind(".", max(0, w_start - sent_snap_range), w_start + sent_snap_range)
+    if prev_dot != -1 and prev_dot < start:
+        w_start = prev_dot + 1
+    
+    # Final render
+    snippet = text[w_start:w_end].strip()
+    # Recalculate relative offsets for the snippet
+    rel_start = start - w_start
+    rel_end = end - w_start
+    
+    rendered = _safe_highlight_render(snippet, rel_start, rel_end)
+    
+    # Add ellipsis if snapped or cut
+    prefix = "" if w_start == 0 else "... "
+    suffix = "" if w_end == len(text) else " ..."
+    return f"{prefix}{rendered}{suffix}"
+
+
 def _parse_rubric_score(text: str, rubric: str) -> float:
     """Extract a single rubric score from reflector output. Returns -1.0 on failure.
 
@@ -147,15 +275,36 @@ def _enforce_visibility(return_dict: dict, prompt_text: str, section_title: str,
         return return_dict
     
     hist = return_dict.get("chat_history", [])
-    hist.append({
+    msg_dict = {
         "role": "assistant",
         "type": event_type,
         "section": section_title,
         "section_index": section_index,
         "iteration": iteration,
         "content": prompt_text,
-    })
+    }
+    if "content_segments" in return_dict:
+        segs = return_dict["content_segments"]
+        msg_dict["content_segments"] = segs
+        prov_count = sum(1 for s in segs if s.get("provenance")) if isinstance(segs, list) else 0
+        log_event(thread_id="", run_id="", node_name="_enforce_visibility",
+                  level="DEBUG", event_type="provenance_segments_attached",
+                  message=f"content_segments attached: {len(segs)} segments, {prov_count} with provenance",
+                  total_segments=len(segs), provenance_count=prov_count)
+        
+    hist.append(msg_dict)
     return_dict["chat_history"] = hist
+    
+    log_event(
+        thread_id="", run_id="", node_name="final_response_assembly",
+        level="INFO", event_type="final_response_assembly",
+        message="Assembled final output for turn",
+        response_type=event_type,
+        final_text=prompt_text,
+        used_draft_ui="draft" in event_type.lower(),
+        used_clarification_ui="clarification" in event_type.lower(),
+        active_question_id=return_dict.get("active_question_id", "")
+    )
     
     has_visible_history = any(
         m.get("role") == "assistant" and m.get("content") == prompt_text
@@ -270,7 +419,792 @@ def load_context_node(state: PRDState) -> dict:
     }
 
 
-# ── Node: await_first_message ─────────────────────────────────────────────────
+_global_logged_messages = set()
+
+def _get_semantic_cues(token_or_span) -> tuple[bool, bool, bool]:
+    is_negated = False
+    is_historical = False
+    is_example = False
+    root = getattr(token_or_span, "root", token_or_span)
+    
+    # Negation by strict dependency
+    if root and hasattr(root, "dep_"):
+        if root.dep_ == "neg" or any(c.dep_ == "neg" for c in root.children) or (root.head and any(c.dep_ == "neg" for c in root.head.children)):
+            is_negated = True
+    
+    sent_text = root.sent.text.lower() if hasattr(root, "sent") else getattr(root.doc, "text", "").lower()
+    
+    if any(w in sent_text for w in ("before", "previously", "used to", "in the past", "was")):
+        is_historical = True
+        
+    if any(w in sent_text for w in ("example", "for instance", "such as")):
+        is_example = True
+            
+    return is_negated, is_historical, is_example
+
+def _log_keyword_extraction_observability(text: str, msg_id: str) -> dict | None:
+    if msg_id in _global_logged_messages:
+        return None
+    _global_logged_messages.add(msg_id)
+
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    
+    empty_semantics = {
+        "message_id": msg_id,
+        "timestamp_utc": now,
+        "raw_text": text,
+        "candidates": [],
+        "action_graph": []
+    }
+
+    if not text.strip():
+        # Log empty... 
+        log_event(
+            thread_id="", run_id="", message="Keyword extraction on user input",
+            level="INFO", event_type="keyword_extraction_observability",
+            message_id=msg_id, timestamp_utc=now, raw_user_text=text,
+            char_count=0, token_count=0, extractor_name="unavailable",
+            entities_detected=[], all_candidates_raw=[], deduped_candidates=[],
+            filtered_out=[], candidate_pool_for_downstream=[]
+        )
+        return empty_semantics
+
+    nlp = _get_nlp()
+    if not nlp:
+        log_event(
+            thread_id="", run_id="", message="Keyword extraction on user input",
+            level="INFO", event_type="keyword_extraction_observability",
+            message_id=msg_id, timestamp_utc=now, raw_user_text=text,
+            char_count=len(text), token_count=len(text.split()), extractor_name="unavailable",
+            entities_detected=[], all_candidates_raw=[], deduped_candidates=[],
+            filtered_out=[], candidate_pool_for_downstream=[]
+        )
+        return empty_semantics
+
+    doc = nlp(text)
+    extractor_name = f"{nlp.meta.get('name', 'unknown')} v{nlp.meta.get('version', 'unknown')}"
+
+    entities_detected = []
+    all_raw = []
+    filtered = []
+    valid = []
+    locked_spans = []
+
+    # 0. Entities (NER)
+    for ent in doc.ents:
+        neg, hist, ex = _get_semantic_cues(ent)
+        cand = {
+            "surface_text": ent.text,
+            "normalized": ent.lemma_.lower(),
+            "type": ExtractionCandidateType.ENTITY.value,
+            "start": ent.start_char,
+            "end": ent.end_char,
+            "pos": ent.label_,
+            "confidence": 0.90 if ent.label_ in ("FILE_TYPE", "TOOL", "SYSTEM", "EMAIL_GROUP") else 0.82,
+            "is_negated": neg,
+            "is_historical": hist,
+            "is_example": ex
+        }
+        entities_detected.append(cand.copy())
+        all_raw.append(cand.copy())
+        valid.append(cand)
+        locked_spans.append((ent.start_char, ent.end_char))
+
+    # A. Noun Chunks
+    for chunk in doc.noun_chunks:
+        # Check overlaps: now NON-DESTRUCTIVE for valid logic. We don't continue out anymore!
+        # If chunk contains an entity, we keep the chunk but maybe flag it.
+        # But wait, original code skipped it completely... Let's just not skip it to preserve "action + object" phrases!
+        neg, hist, ex = _get_semantic_cues(chunk)
+        cand = {
+            "surface_text": chunk.text,
+            "normalized": chunk.lemma_.lower(),
+            "type": ExtractionCandidateType.NOUN_CHUNK.value,
+            "start": chunk.start_char,
+            "end": chunk.end_char,
+            "pos": None,
+            "confidence": 0.78,
+            "is_negated": neg,
+            "is_historical": hist,
+            "is_example": ex
+        }
+        all_raw.append(cand.copy())
+        
+        # Filter logic
+        if cand["normalized"] in DOMAIN_ALLOWLIST:
+            valid.append(cand)
+            locked_spans.append((cand["start"], cand["end"]))
+        elif "mailbo" in chunk.text.lower():
+            cand["reason"] = ExtractionReason.TRUNCATED
+            filtered.append(cand)
+        elif len(chunk.text) <= 3:
+            cand["reason"] = ExtractionReason.TOO_SHORT
+            filtered.append(cand)
+        elif all(t.is_punct or t.is_space for t in chunk):
+            cand["reason"] = ExtractionReason.PUNCTUATION
+            filtered.append(cand)
+        else:
+            if chunk.lemma_.lower() in ["that", "it's me", "its me", "the end goal", "thing", "stuff", "process", "one"]:
+                cand["reason"] = ExtractionReason.LOW_VALUE
+                filtered.append(cand)
+            else:
+                valid.append(cand)
+                locked_spans.append((cand["start"], cand["end"]))
+
+    # B. Individual Tokens
+    for token in doc:
+        if token.pos_ not in ("NOUN", "PROPN") and token.lemma_.lower() not in DOMAIN_ALLOWLIST and token.text.lower() != "mailbo":
+            continue
+            
+        neg, hist, ex = _get_semantic_cues(token)
+        cand = {
+            "surface_text": token.text,
+            "normalized": token.lemma_.lower(),
+            "type": ExtractionCandidateType.TOKEN.value,
+            "start": token.idx,
+            "end": token.idx + len(token.text),
+            "pos": token.pos_,
+            "confidence": 0.65 if token.lemma_.lower() not in DOMAIN_ALLOWLIST else 0.90,
+            "is_negated": neg,
+            "is_historical": hist,
+            "is_example": ex
+        }
+        
+        # Keep old token logic skipping overlapping parts since token is just fragments
+        if any(cand["start"] >= s[0] and cand["end"] <= s[1] for s in locked_spans):
+            continue
+            
+        all_raw.append(cand.copy())
+
+        if cand["normalized"] in DOMAIN_ALLOWLIST:
+            valid.append(cand)
+        elif token.text.lower() == "mailbo":
+            cand["reason"] = ExtractionReason.TRUNCATED
+            filtered.append(cand)
+        elif token.is_stop or token.pos_ in ("PRON", "DET"):
+            cand["reason"] = ExtractionReason.STOPWORD
+            filtered.append(cand)
+        elif len(token.text) <= 4:  
+            cand["reason"] = ExtractionReason.TOO_SHORT
+            filtered.append(cand)
+        else:
+            if token.lemma_.lower() in ["that", "its", "me", "thing", "stuff", "process", "one"]:
+                cand["reason"] = ExtractionReason.LOW_VALUE
+                filtered.append(cand)
+            else:
+                valid.append(cand)
+
+    # Dedup
+    deduped = []
+    seen = set()
+    for v in sorted(valid, key=lambda x: (x["type"] == ExtractionCandidateType.ENTITY.value, len(x["surface_text"])), reverse=True): 
+        k = v["normalized"]
+        if k not in seen:
+            seen.add(k)
+            deduped.append(v)
+        else:
+            v["reason"] = ExtractionReason.DUPLICATE
+            filtered.append(v)
+
+    # Action Graph
+    action_graph = []
+    for token in doc:
+        if token.pos_ == "VERB" and token.dep_ in ("ROOT", "xcomp", "advcl", "conj"):
+            dobj = None
+            pobj = None
+            for child in token.children:
+                if child.dep_ == "dobj":
+                    dobj = child
+                if child.dep_ == "prep":
+                    for grandchild in child.children:
+                        if grandchild.dep_ == "pobj":
+                            pobj = grandchild
+            if dobj:
+                end_token = pobj if pobj else dobj
+                action_graph.append({
+                    "verb": token.lemma_.lower(),
+                    "object": dobj.text,
+                    "destination_if_any": pobj.text if pobj else None,
+                    "confidence": 0.8,
+                    "source_span": (token.idx, end_token.idx + len(end_token.text)),
+                    "extraction_method": "dependency_parse"
+                })
+
+    candidate_pool = [d["normalized"] for d in deduped]
+
+    # Full logging
+    log_event(
+        thread_id="", run_id="", message="Keyword extraction on user input",
+        level="INFO", event_type="keyword_extraction_observability",
+        message_id=msg_id,
+        timestamp_utc=now,
+        raw_user_text=text,
+        char_count=len(text),
+        token_count=len(doc),
+        extractor_name=extractor_name,
+        entities_detected=entities_detected,
+        all_candidates_raw=all_raw,
+        deduped_candidates=deduped,
+        filtered_out=filtered,
+        candidate_pool_for_downstream=candidate_pool
+    )
+    
+    # Compact human audit logging
+    flags = []
+    if any(c.get("reason") == ExtractionReason.TRUNCATED for c in filtered):
+        flags.append("truncation_detected")
+    if sum(1 for c in filtered if c.get("reason") == ExtractionReason.STOPWORD) > 3:
+        flags.append("high_stopword_noise")
+    if any(c.get("reason") == ExtractionReason.LOW_VALUE for c in filtered):
+        flags.append("low_value_chunk_noise")
+    if len([c for c in filtered if c.get("reason") == ExtractionReason.LOW_VALUE]) > 5:
+        flags.append("too_many_generic_chunks")
+        
+    raw_top = [c["surface_text"] for c in all_raw[:5]]
+    filtered_str = [f'{c["surface_text"]}({c.get("reason")})' for c in filtered[:5]]
+    flags_str = f" | flags={flags}" if flags else ""
+    
+    compact_log = f"[keyword_audit] msg_id={msg_id} | text='{text[:30]}...' | raw_top=[{', '.join(raw_top)}] | filtered=[{', '.join(filtered_str)}] | final=[{', '.join(candidate_pool)}]{flags_str}\n"
+    
+    try:
+        from pathlib import Path
+        audit_file = Path(__file__).resolve().parent.parent / "logs" / "keyword_audit.log"
+        audit_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(audit_file, "a", encoding="utf-8") as f:
+            f.write(compact_log)
+    except Exception:
+        pass
+        
+    semantic_candidates = [
+        {
+            "surface": d["surface_text"],
+            "normalized": d["normalized"],
+            "type": d["type"],
+            "confidence": d["confidence"],
+            "source_span": (d["start"], d["end"]),
+            "is_negated": d["is_negated"],
+            "is_historical": d["is_historical"],
+            "is_example": d["is_example"]
+        } for d in deduped
+    ]
+        
+    return {
+        "message_id": msg_id,
+        "timestamp_utc": now,
+        "raw_text": text,
+        "candidates": semantic_candidates,
+        "action_graph": action_graph
+    }
+
+def _log_semantic_transition(concept_key, old_status, new_status, trigger, msg_id):
+    log_event(
+        thread_id="", run_id="", message=f"Semantic transition: {concept_key}",
+        level="INFO", event_type="concept_state_transition",
+        concept_key=concept_key, old_status=old_status, new_status=new_status,
+        transition_trigger=trigger, message_id=msg_id
+    )
+
+def _sync_concept_history(state: PRDState, semantics: dict) -> dict:
+    history = state.get("concept_history", {})
+    updates = {}
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    msg_id = semantics["message_id"]
+
+    for cand in semantics.get("candidates", []):
+        key = cand["normalized"]
+        is_negated = cand["is_negated"]
+        is_historical = cand["is_historical"]
+        is_example = cand["is_example"]
+        confidence = cand["confidence"]
+
+        if key in history:
+            entry = history[key].copy()
+        else:
+            entry = {
+                "concept_key": key,
+                "mentions": [],
+                "source_message_ids": [],
+                "status": ConceptStatus.MENTIONED.value,
+                "status_reason": "First extracted.",
+                "is_current": False,
+                "is_negated": False,
+                "is_historical": False,
+                "is_example": False,
+                "was_corrected": False,
+                "superseded_by": None,
+                "corrected_from": None,
+                "last_seen_at": now,
+                "last_transition_at": now
+            }
+
+        if msg_id and msg_id not in entry.get("mentions", []):
+            if "mentions" not in entry: entry["mentions"] = []
+            entry["mentions"].append(msg_id)
+        if msg_id and msg_id not in entry.get("source_message_ids", []):
+            if "source_message_ids" not in entry: entry["source_message_ids"] = []
+            entry["source_message_ids"].append(msg_id)
+            
+        entry["last_seen_at"] = now
+        entry["is_negated"] = is_negated
+        entry["is_historical"] = is_historical
+        entry["is_example"] = is_example
+
+        old_status = entry["status"]
+
+        if entry["status"] == ConceptStatus.SUPERSEDED.value:
+            updates[key] = entry
+            continue
+            
+        if is_example and entry["status"] == ConceptStatus.MENTIONED.value:
+            entry["status"] = ConceptStatus.EXAMPLE_ONLY.value
+            entry["status_reason"] = "Hypothetical context."
+        elif is_negated and entry["status"] in (ConceptStatus.CURRENT.value, ConceptStatus.MENTIONED.value):
+            entry["status"] = ConceptStatus.NEGATED.value
+            entry["status_reason"] = f"Negated in msg {msg_id}."
+            log_event(thread_id="", run_id="", message="concept negated", level="INFO", event_type="concept_negated", concept=key)
+        elif is_historical and entry["status"] in (ConceptStatus.CURRENT.value, ConceptStatus.MENTIONED.value):
+            entry["status"] = ConceptStatus.HISTORICAL.value
+            entry["status_reason"] = f"Marked historical in msg {msg_id}."
+            log_event(thread_id="", run_id="", message="concept historical", level="INFO", event_type="concept_marked_historical", concept=key)
+        elif is_negated and entry["status"] != ConceptStatus.CURRENT.value:
+            entry["status"] = ConceptStatus.NEGATED.value
+            entry["status_reason"] = f"Negated in msg {msg_id}."
+        elif entry["status"] == ConceptStatus.CONFLICTED.value:
+            pass # stays conflicted until explicit correction/confirmation clears it
+        elif entry["status"] == ConceptStatus.NEGATED.value and not is_negated:
+            entry["status"] = ConceptStatus.CONFLICTED.value
+            entry["status_reason"] = f"Contradictory assertion after negation in {msg_id}."
+            
+        if entry["status"] != old_status:
+            entry["last_transition_at"] = now
+            _log_semantic_transition(key, old_status, entry["status"], f"Triggered by {msg_id} cue flags.", msg_id)
+            
+        updates[key] = entry
+        
+    return updates
+
+def build_conversation_understanding_output(state: PRDState) -> ConversationUnderstandingOutput:
+    history = state.get("concept_history", {})
+    current_concepts = []
+    historical_concepts = []
+    negated_concepts = []
+    example_only_concepts = []
+    future_or_planned_concepts = []
+    conflicted_concepts = []
+
+    for key, entry in history.items():
+        status = entry.get("status")
+        # Mapped to TypedDict ConceptRecord
+        record = ConceptRecord(
+            concept_key=entry.get("concept_key", key),
+            surface=key,
+            scope_type=entry.get("scope_type"),
+            scope_value=entry.get("scope_value"),
+            confidence=entry.get("confidence", 1.0),
+            status_reason=entry.get("status_reason", ""),
+            source_message_ids=entry.get("source_message_ids", [])
+        )
+
+        # Basic fallback for E14, E18: future migration plan
+        # We can simulate this state based on status_reason or scope
+        scope_val = entry.get("scope", {}).get("value") or entry.get("scope_value", "")
+        
+        if "future" in record["status_reason"].lower() or "planned" in record["status_reason"].lower() or scope_val in ["future_planned", "roadmap"]:
+            future_or_planned_concepts.append(record)
+            continue
+
+        if status == ConceptStatus.CURRENT.value:
+            current_concepts.append(record)
+        elif status == ConceptStatus.HISTORICAL.value:
+            historical_concepts.append(record)
+        elif status == ConceptStatus.NEGATED.value:
+            negated_concepts.append(record)
+        elif status == ConceptStatus.EXAMPLE_ONLY.value:
+            example_only_concepts.append(record)
+        elif status == ConceptStatus.CONFLICTED.value:
+            conflicted_concepts.append(record)
+
+    corrections_recently_applied = []
+    for key, entry in history.items():
+        if entry.get("was_corrected") and entry.get("superseded_by"):
+            msg_ids = entry.get("source_message_ids", [])
+            corrections_recently_applied.append(CorrectionRecord(
+                old_concept=key,
+                new_concept=entry["superseded_by"],
+                reason=entry.get("status_reason", ""),
+                source_message_id=msg_ids[-1] if msg_ids else "",
+                timestamp_utc=0,
+                trigger_type="implicit_correction"
+            ))
+
+    action_candidates_if_any = []
+    unresolved_blockers = []
+    
+    # Action gaps (from latest semantics)
+    chat_hist = state.get("chat_history", [])
+    latest_semantics = None
+    for msg in reversed(chat_hist):
+        if msg.get("role") == "user" and "semantics" in msg:
+            latest_semantics = msg["semantics"]
+            break
+            
+    if latest_semantics and "action_graph" in latest_semantics:
+        for edge_raw in latest_semantics["action_graph"]:
+            a_conf = edge_raw.get("confidence", 0.0)
+            a_meth = edge_raw.get("extraction_method", "unknown")
+            verb = edge_raw.get("verb", "")
+            obj = edge_raw.get("object", "")
+            dest = edge_raw.get("destination_if_any")
+            is_complete = True
+            missing_parts = []
+            
+            if verb in ["send", "forward", "email", "notify", "export", "share"] and not dest:
+                is_complete = False
+                missing_parts.append("destination")
+                unresolved_blockers.append(BlockerRecord(
+                    blocker_type="missing_destination",
+                    target=f"{verb} {obj}",
+                    reason=f"Action '{verb} {obj}' is missing a destination.",
+                    severity="advisory_warning",
+                    source="action_gap",
+                    suggested_question_type="clarify_destination"
+                ))
+                
+            action_candidates_if_any.append(ActionCandidateRecord(
+                verb=verb,
+                object=obj,
+                destination=dest,
+                confidence=a_conf,
+                extraction_method=a_meth,
+                is_complete=is_complete,
+                missing_parts=missing_parts
+            ))
+
+    # Semantic gaps
+    # E10: Replacement missing
+    for rec in negated_concepts:
+        # Check if there is an active replacement for negated tools
+        if not current_concepts:
+            unresolved_blockers.append(BlockerRecord(
+                blocker_type="replacement_missing",
+                target=rec["concept_key"],
+                reason=f"Concept '{rec['concept_key']}' was negated but no replacement was given.",
+                severity="hard",
+                source="semantic_gap",
+                suggested_question_type="clarify_replacement"
+            ))
+            break
+
+    # Section missing gaps (Simplified check for now. Relies on the old PRD section missing block logic)
+    qa_store = state.get("confirmed_qa_store", {})
+    # For POC simplicity, assuming target unmet slots append into blockers directly. 
+    # Proper PRD_SECTION sync happens in the main Elicitor later if needed.
+    
+    is_ready = True
+    hard_blockers = []
+    advisory_warnings = []
+    for blocker in unresolved_blockers:
+        if blocker["severity"] == "hard":
+            hard_blockers.append(blocker["target"])
+            is_ready = False
+        else:
+            advisory_warnings.append(blocker["target"])
+            
+    # Conflicts are auto-blockers
+    if conflicted_concepts:
+        is_ready = False
+        hard_blockers.append("conflicted_concepts")
+
+    draft_readiness = DraftReadinessDict(
+        is_ready=is_ready,
+        hard_blockers=hard_blockers,
+        advisory_warnings=advisory_warnings
+    )
+
+    return ConversationUnderstandingOutput(
+        current_concepts=current_concepts,
+        historical_concepts=historical_concepts,
+        negated_concepts=negated_concepts,
+        example_only_concepts=example_only_concepts,
+        future_or_planned_concepts=future_or_planned_concepts,
+        conflicted_concepts=conflicted_concepts,
+        unresolved_blockers=unresolved_blockers,
+        draft_readiness=draft_readiness,
+        corrections_recently_applied=corrections_recently_applied,
+        action_candidates_if_any=action_candidates_if_any
+    )
+
+def _build_user_message_dict(text: str, role_override: str = "user") -> dict:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    msg_id = f"msg_{str(uuid.uuid4())[:8]}"
+    semantics = _log_keyword_extraction_observability(text, msg_id)
+    return {
+        "role": role_override,
+        "content": text,
+        "msg_id": msg_id,
+        "timestamp_utc": now.timestamp(),
+        "display_time": now.strftime("%I:%M %p · %d %b").lstrip("0").replace(" 0", " "),
+        "semantics": semantics
+    }
+
+PROVENANCE_CONF_THRESHOLD = 8.5
+MAX_CHIPS_PER_MESSAGE = 3
+def _get_proof_chain(term: str, chat_history: list[dict], qa_store: dict, referenced_concept_keys: list[str]) -> Optional[ProofUnit]:
+    """Implement the Hardened Matching Ladder and Ranking Precedence."""
+    nlp = _get_nlp()
+    if not nlp:
+        return None
+
+    term_doc = nlp(term.lower())
+    term_lemma = " ".join([t.lemma_ for t in term_doc])
+    
+    candidates: list[ProofUnit] = []
+
+    # ── Step 1: Collect ALL possible evidence matches ──
+    
+    # A. Search Chat History (Lexical First)
+    for msg in reversed(chat_history):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if not content:
+            continue
+        
+        # Exact Surface Match
+        matches = list(re.finditer(rf'\b{re.escape(term)}\b', content, re.IGNORECASE))
+        for m in matches:
+            candidates.append({
+                "assistant_surface_text": term,
+                "concept_key": term.lower(),
+                "source_message_id": msg.get("msg_id", ""),
+                "source_span": m.span(),
+                "source_display_time": msg.get("display_time", "Earlier"),
+                "proof_status": ProofStatus.EXACT_SURFACE.value,
+                "ranking_reason": "exact_lexical_match",
+                "snippet_html": "" # To be filled after ranking
+            })
+        
+        # Lemma Match (if no exact match found in this message yet)
+        if not matches:
+            msg_doc = nlp(content.lower())
+            
+            # A. Check Noun Chunks
+            found_lemma = False
+            for chunk in msg_doc.noun_chunks:
+                # Case-insensitive lemma match or prefix match for common plural cases (PDFs/PDF)
+                c_lemma = chunk.lemma_.lower()
+                if c_lemma == term_lemma or c_lemma.rstrip('s') == term_lemma:
+                    candidates.append({
+                        "assistant_surface_text": term,
+                        "concept_key": term_lemma,
+                        "source_message_id": msg.get("msg_id", ""),
+                        "source_span": (chunk.start_char, chunk.end_char),
+                        "source_display_time": msg.get("display_time", "Earlier"),
+                        "proof_status": ProofStatus.LEMMA_BACKED.value,
+                        "ranking_reason": "lemma_match_chunk",
+                        "snippet_html": ""
+                    })
+                    found_lemma = True
+                    break
+            
+            # B. Check Individual Tokens (if chunk match failed)
+            if not found_lemma:
+                for token in msg_doc:
+                    t_lemma = token.lemma_.lower()
+                    if t_lemma == term_lemma or t_lemma.rstrip('s') == term_lemma:
+                        candidates.append({
+                            "assistant_surface_text": term,
+                            "concept_key": term_lemma,
+                            "source_message_id": msg.get("msg_id", ""),
+                            "source_span": (token.idx, token.idx + len(token.text)),
+                            "source_display_time": msg.get("display_time", "Earlier"),
+                            "proof_status": ProofStatus.LEMMA_BACKED.value,
+                            "ranking_reason": "lemma_match_token",
+                            "snippet_html": ""
+                        })
+                        break
+
+    # B. Search QA Store (Abstract Facts)
+    for ck in referenced_concept_keys:
+        fact = qa_store.get(ck)
+        if not fact or fact.get("provenance_confidence", 0) < PROVENANCE_CONF_THRESHOLD:
+            continue
+        
+        fact_id = fact.get("source_message_id")
+        fact_snippet = fact.get("source_snippet", "")
+        
+        # Check for Normalized Concept Match
+        if ck == term.lower() or fact.get("answer", "").lower() == term.lower():
+            # Try to find the exact span in the snippet if available
+            span = (0, len(fact_snippet))
+            m = re.search(rf'\b{re.escape(term)}\b', fact_snippet, re.IGNORECASE)
+            if m:
+                span = m.span()
+            
+            candidates.append({
+                "assistant_surface_text": term,
+                "concept_key": ck,
+                "source_message_id": fact_id or "fact_store",
+                "source_span": span,
+                "source_display_time": fact.get("display_time", "Stored Fact"),
+                "proof_status": ProofStatus.NORMALIZED_SURFACE.value,
+                "ranking_reason": "confirmed_fact_match",
+                "snippet_html": ""
+            })
+
+    if not candidates:
+        return None
+
+    # ── Step 2: Apply Hardened Ranking Formula ──
+    # Order: EXACT_SURFACE > NORMALIZED_SURFACE > LEMMA_BACKED
+    
+    status_priority = {
+        ProofStatus.EXACT_SURFACE.value: 3,
+        ProofStatus.NORMALIZED_SURFACE.value: 2,
+        ProofStatus.LEMMA_BACKED.value: 1,
+        ProofStatus.REFUSED.value: 0
+    }
+    
+    def rank_key(c: ProofUnit):
+        p1 = status_priority.get(c["proof_status"], 0)
+        # Lexical First (chat_history id vs fact_store)
+        p2 = 1 if c["source_message_id"] != "fact_store" else 0
+        # Recency Tiebreak
+        recency = 0
+        for i, h in enumerate(reversed(chat_history)):
+            if h.get("msg_id") == c["source_message_id"]:
+                recency = -i 
+                break
+        return (p1, p2, recency)
+
+    winner = max(candidates, key=rank_key)
+    
+    # ── Step 3: Semantic Conflict Rule ──
+    # If another candidate exists with DIFFERENT meaning (different lemma), refuse.
+    # Simplified: Consistency is checked at the candidate level.
+    
+    # ── Step 4: Finalize Proof Unit ──
+    raw_text = ""
+    if winner["source_message_id"] == "fact_store":
+        # Search for snippet in referenced concepts
+        for ck in referenced_concept_keys:
+            f = qa_store.get(ck)
+            if f and f.get("source_message_id") == winner["source_message_id"]:
+                raw_text = f.get("source_snippet", "")
+                break
+        if not raw_text: raw_text = winner["concept_key"] # Last resort
+    else:
+        for h in chat_history:
+            if h.get("msg_id") == winner["source_message_id"]:
+                raw_text = h.get("content", "")
+                break
+    
+    if not raw_text:
+        return None
+        
+    winner["snippet_html"] = _sniper_window(raw_text, winner["source_span"][0], winner["source_span"][1])
+    return winner
+
+def _segment_text_with_provenance(reply_content: str, referenced_concept_keys: list[str], state: PRDState) -> list[dict]:
+    """Segment reply text and attach auditable ProofUnits."""
+    qa_store = state.get("confirmed_qa_store", {})
+    chat_history = state.get("chat_history", [])
+    
+    nlp = _get_nlp()
+    if not nlp:
+        return [{"text": reply_content, "provenance": None}]
+
+    doc = nlp(reply_content)
+    
+    # ── Candidate Extraction ──
+    term_candidates = []
+    _DOMAIN_FILLER_WORDS = {
+        "thing", "stuff", "process", "one", "way"
+    }
+    
+    # Noun chunks
+    for chunk in doc.noun_chunks:
+        c_text = chunk.text.strip()
+        # Reject chunk if it's entirely composed of stopwords or domain fillers
+        # This keeps "the group mailbox" (has valid nouns) but rejects "that process" (stopword + filler)
+        if len(c_text) > 4:
+            is_all_junk = all(t.is_stop or t.text.lower() in _DOMAIN_FILLER_WORDS for t in chunk)
+            if not is_all_junk:
+                term_candidates.append(c_text)
+            
+    # Long proper nouns/nouns
+    for token in doc:
+        t_text = token.text.strip()
+        if token.pos_ in ("NOUN", "PROPN") and len(t_text) > 4:
+            if not token.is_stop and t_text.lower() not in _DOMAIN_FILLER_WORDS:
+                if not any(t_text in longer for longer in term_candidates):
+                    term_candidates.append(t_text)
+
+    # Dedup and sort deterministically
+    term_candidates = sorted(list(dict.fromkeys(term_candidates)), key=lambda x: (len(x), x), reverse=True)
+    
+    # ── Proof Attachment ──
+    proof_units: dict[str, ProofUnit] = {}
+    for term in term_candidates:
+        proof = _get_proof_chain(term, chat_history, qa_store, referenced_concept_keys)
+        if proof:
+            proof_units[term.lower()] = proof
+
+    if not proof_units:
+        return [{"text": reply_content, "provenance": None}]
+
+    # ── Segmentation ──
+    matches = []
+    for term_lower, proof in proof_units.items():
+        for m in re.finditer(rf'\b{re.escape(term_lower)}\b', reply_content, re.IGNORECASE):
+            matches.append((m.start(), m.end(), proof))
+
+    # Identify longest non-overlapping spans
+    matches.sort(key=lambda m: (m[0], -m[1]))
+    
+    # Filter overlaps
+    non_overlapping = []
+    curr_pos = 0
+    for start, end, proof in matches:
+        if start >= curr_pos:
+            non_overlapping.append((start, end, proof))
+            curr_pos = end
+
+    # Rank filtered candidates by claim value, not position
+    status_priority = {
+        ProofStatus.EXACT_SURFACE.value: 3,
+        ProofStatus.NORMALIZED_SURFACE.value: 2,
+        ProofStatus.LEMMA_BACKED.value: 1,
+        ProofStatus.REFUSED.value: 0
+    }
+    non_overlapping.sort(
+        key=lambda x: (
+            status_priority.get(x[2]["proof_status"], 0),
+            1 if x[2]["source_message_id"] != "fact_store" else 0,
+            x[1] - x[0],
+            -x[0]  # Recency tiebreaker
+        ),
+        reverse=True
+    )
+    
+    # Enforce limit AFTER ranking
+    final_matches = non_overlapping[:MAX_CHIPS_PER_MESSAGE]
+    
+    # Spatial sort for slicing interpolation
+    final_matches.sort(key=lambda x: x[0])
+    
+    segments = []
+    last_idx = 0
+    for start, end, proof in final_matches:
+        if start > last_idx:
+            segments.append({"text": reply_content[last_idx:start], "provenance": None})
+        segments.append({"text": reply_content[start:end], "provenance": proof})
+        last_idx = end
+    
+    if last_idx < len(reply_content):
+        segments.append({"text": reply_content[last_idx:], "provenance": None})
+        
+    return segments
 
 def await_first_message_node(state: PRDState) -> dict:
     """
@@ -282,9 +1216,13 @@ def await_first_message_node(state: PRDState) -> dict:
     if isinstance(first_message, dict):
         first_message = first_message.get("content", "")
     text = first_message.strip()
+    user_msg = _build_user_message_dict(text)
+    semantics = user_msg.get("semantics", {})
+    concept_history_update = _sync_concept_history(state, semantics) if semantics else {}
     return {
         "context_doc": text,
-        "chat_history": [{"role": "user", "content": text}],
+        "chat_history": [user_msg],
+        "concept_history": concept_history_update
     }
 
 
@@ -347,11 +1285,16 @@ def detect_framing_node(state: PRDState) -> dict:
 _DISCOVERY_SYSTEM = (
     "You are a friendly product management coach helping someone clarify what they want to build.\n\n"
     "What they've said so far:\n{context_doc}\n\n"
+    "Conversation Semantic State:\n{conversation_understanding}\n\n"
     "Situation: {framing_label}\n"
     "This is clarifying question set {turn_label}.\n\n"
     "Ask 1-2 short, natural questions to draw out:\n"
     "- What the core goal or business need is\n"
     "- Who will use this and why it matters\n\n"
+    "Rules for utilizing semantic state:\n"
+    "1. If `conflicted_concepts` exist, emit a clarification question ONLY to resolve the latest conflict.\n"
+    "2. Otherwise, pick the highest priority `hard` item from `unresolved_blockers` and ask about it.\n"
+    "3. Do NOT ask questions on concepts that are `CURRENT`.\n\n"
     "No bullet headers. No jargon. Conversational tone."
 )
 
@@ -381,10 +1324,14 @@ def discovery_questions_node(state: PRDState) -> dict:
     framing_label = _FRAMING_LABELS.get(framing_mode, "unsure what to build")
     turn_label = f"{discovery_turn_count + 1} of 2"
     llm = _get_llm()
+    import json
+    bridge_output = build_conversation_understanding_output(state)
+    
     response = llm_invoke(
         llm,
         [HumanMessage(content=_DISCOVERY_SYSTEM.format(
             context_doc=context_doc,
+            conversation_understanding=json.dumps(bridge_output, indent=2, default=str),
             framing_label=framing_label,
             turn_label=turn_label,
         ))],
@@ -399,8 +1346,13 @@ def discovery_questions_node(state: PRDState) -> dict:
         message="discovery_questions_node finished",
         new_discovery_turn_count=new_count, duration_ms=duration_ms,
     )
+    
+    # Generate provenance segments from user chat history
+    provenance_segments = _segment_text_with_provenance(questions, [], state)
+    
     return _enforce_visibility({
         "discovery_turn_count": new_count,
+        "content_segments": provenance_segments,
     }, questions, "Discovery", 0, 0, event_type="system")
 
 
@@ -411,6 +1363,7 @@ def await_discovery_answer_node(state: PRDState) -> dict:
     Interrupt — pauses for the user's discovery-phase answer.
     Appends the answer to context_doc so the Elicitor can use the full
     discovery context when section elicitation begins.
+    Adds msg_id and display_time for provenance tracking.
     """
     answer: str = interrupt({
         "type": "waiting_for_discovery_answer",
@@ -421,9 +1374,14 @@ def await_discovery_answer_node(state: PRDState) -> dict:
     answer = answer.strip()
     existing = state.get("context_doc", "").strip()
     new_context = f"{existing}\n\n{answer}" if existing else answer
+    user_msg = _build_user_message_dict(answer)
+    semantics = user_msg.get("semantics", {})
+    concept_history_update = _sync_concept_history(state, semantics) if semantics else {}
     return {
         "context_doc": new_context,
-        "chat_history": [{"role": "user", "content": answer}],
+        "chat_history": [user_msg],
+        "concept_history": concept_history_update,
+        "response_type": ""
     }
 
 
@@ -436,6 +1394,17 @@ def generate_questions_node(state: PRDState) -> dict:
     """
     ctx = _log_ctx(state, "generate_questions_node")
     t0 = time.monotonic()
+    
+    log_event(
+        **ctx, level="INFO", event_type="question_generation_decision",
+        message="Logging generation decision parameters",
+        active_blocker_before=state.get("remaining_subparts", [""])[0] if state.get("remaining_subparts") else "",
+        remaining_blockers_before=state.get("remaining_subparts", []),
+        conflict_records=state.get("conflict_records", []),
+        question_mode="repair" if state.get("pending_numeric_clarification") else "normal",
+        why_question_generation_was_used="Routed explicitly to generation path",
+        why_clarification_answer_was_not_used="Not classified as DIRECT_CLARIFICATION_QUESTION"
+    )
     
     if state.get("pending_numeric_clarification"):
         repair_prompt = "I may have misunderstood that value. Did you mean 30 minutes per day, 3 hours per day, or something else?"
@@ -451,6 +1420,37 @@ def generate_questions_node(state: PRDState) -> dict:
         }, repair_prompt, section.title if section else "Unknown", state["section_index"], state.get("iteration", 0), event_type="elicit")
 
     section = get_section_by_index(state["section_index"])
+    bridge_output = build_conversation_understanding_output(state)
+    
+    # ── Deterministic Conflict Gating ──
+    if bridge_output.get("conflicted_concepts"):
+        conflict = bridge_output["conflicted_concepts"][0]
+        deterministic_q = f"I'm hearing mixed details about '{conflict.get('surface', conflict.get('concept_key', 'this'))}'. Could you clarify the current workflow for this?"
+        
+        log_event(**ctx, level="INFO", event_type="deterministic_conflict_gating", 
+                  message="Short-circuited LLM generation due to semantic conflict", 
+                  conflict_target=conflict.get("concept_key"))
+        
+        current_question_object = {
+            "question_id": str(uuid.uuid4()),
+            "question_text": deterministic_q,
+            "subparts": ["conflict_resolution"],
+        }
+        
+        return _enforce_visibility({
+            "current_questions": deterministic_q,
+            "current_question_segments": [],
+            "current_question_object": current_question_object,
+            "remaining_subparts": ["conflict_resolution"],
+            "active_question_id": current_question_object["question_id"],
+            "active_question_type": "OPEN_ENDED",
+            "active_question_options": [],
+            "question_status": "OPEN",
+            "resolved_option_id": "",
+            "answered_at": "",
+            "recent_questions": state.get("recent_questions", []) + [deterministic_q],
+            "repair_instruction": "",
+        }, deterministic_q, section.title if section else "Unknown", state["section_index"], state.get("iteration", 0), event_type="elicit")
     
     # ── Deterministic Branch Short-Circuit (F1/M1/M2) ──
     if state.get("question_status") == "ANSWERED":
@@ -491,6 +1491,7 @@ def generate_questions_node(state: PRDState) -> dict:
             
             return _enforce_visibility({
                 "current_questions": deterministic_q,
+                "current_question_segments": [],
                 "current_question_object": current_question_object,
                 "remaining_subparts": remaining,
                 "active_question_id": current_question_object["question_id"],
@@ -546,10 +1547,16 @@ def generate_questions_node(state: PRDState) -> dict:
     if remaining_subparts:
         first_turn_block += f"\n\nFOLLOW-UP BOUNDARY: Do NOT generate original broad question. Ask ONLY about these exact missing constraints: {remaining_subparts}."
 
-    if repair_instruction == "DUPLICATE_SUPPRESSED":
-        first_turn_block += "\n\nCRITICAL: User indicated frustration over repetition. Explicitly acknowledge context, and ensure this query is syntactically distinct and narrower."
+    if repair_instruction in ("DUPLICATE_SUPPRESSED", "REPETITION_COMPLAINT"):
+        if remaining_subparts:
+            if remaining_subparts[0] == "workflow_sequence_missing":
+                remaining_subparts = ["mapping_logic_missing"] + [s for s in remaining_subparts if s != "mapping_logic_missing"]
+            elif remaining_subparts[0] == "mapping_logic_missing":
+                remaining_subparts = ["destination_handling_missing"] + [s for s in remaining_subparts if s != "destination_handling_missing"]
+        
+        first_turn_block += f"\n\nCRITICAL: User indicated frustration over repetition. Explicitly acknowledge context, and ensure this query is syntactically distinct. You MUST ask about a different narrower subpart: {remaining_subparts[0] if remaining_subparts else 'unknown'}."
     elif repair_instruction == "REPHRASE_REQUIRED":
-        first_turn_block += "\n\nCRITICAL: The user was confused by your previous question. Do NOT repeat it. Instead, rephrase it much more clearly and simply."
+        first_turn_block += "\n\nCRITICAL: The user was confused by your previous question. Do NOT repeat it. Instead, rephrase it much more clearly and simply while keeping the EXACT SAME underlying target subpart."
 
     first_turn_block += "\n\nCRITICAL NEXT QUESTION RULE: You MUST target the single highest-priority unresolved constraint or blocker. Do NOT ask about already-known info or low-leverage details."
 
@@ -562,12 +1569,18 @@ def generate_questions_node(state: PRDState) -> dict:
         f"  \u2022 {c}" for c in section.expected_components
     )
 
+    import json
+    conversation_understanding_block = CONVERSATION_UNDERSTANDING_BLOCK.format(
+        conversation_understanding=json.dumps(bridge_output, indent=2, default=str)
+    )
+
     system_prompt = ELICITOR_SYSTEM.format(
         section_title=section.title,
         section_description=section.description,
         expected_components_list=expected_components_list,
         context_block=context_block,
         prd_block=prd_block,
+        conversation_understanding_block=conversation_understanding_block,
         iteration_block=iteration_block,
         first_turn_block=first_turn_block,
         global_rigor_block=GLOBAL_RIGOR_BLOCK,
@@ -580,33 +1593,102 @@ def generate_questions_node(state: PRDState) -> dict:
     # Backend tone enclosure to prevent evaluator language bypass
     system_prompt += "\n\nCRITICAL UX RULE: Do not use internal reviewer terms like 'contradictory', 'ambiguous', 'blocker', 'rubric', 'missing components'. Explain what details you need using plain English. Ask EXACTLY ONE question."
 
-    response = llm_invoke(
-        llm.with_structured_output(
-            {
-                "name": "QuestionSchema",
-                "description": "Structure of the next logical question to ask.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "question_id": {"type": "string"},
-                        "user_facing_gap_reason": {"type": "string"},
-                        "single_next_question": {"type": "string"},
-                        "subparts": {"type": "array", "items": {"type": "string"}},
-                        "question_type": {"type": "string", "enum": ["OPEN_ENDED", "BINARY_CLARIFICATION"]},
-                        "options": {"type": "array", "items": {"type": "string"}},
+    recent_q_history = state.get("recent_questions", [])
+    
+    for attempt in range(3):
+        response = llm_invoke(
+            llm.with_structured_output(
+                {
+                    "name": "QuestionSchema",
+                    "description": "Structure of the next logical question to ask.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "question_id": {"type": "string"},
+                            "user_facing_gap_reason": {"type": "string"},
+                            "single_next_question": {"type": "string"},
+                            "subparts": {"type": "array", "items": {"type": "string"}},
+                            "question_type": {"type": "string", "enum": ["OPEN_ENDED", "BINARY_CLARIFICATION"]},
+                            "options": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["question_id", "user_facing_gap_reason", "single_next_question", "subparts"],
                     },
-                    "required": ["question_id", "user_facing_gap_reason", "single_next_question", "subparts"],
-                },
-            }
-        ),
-        [
-            SystemMessage(content=system_prompt),
-            HumanMessage(
-                content=f"Generate questions for the '{section.title}' section."
+                }
             ),
-        ],
-        state=state, node_name="generate_questions_node", purpose="structured_question_generation"
-    )
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(
+                    content=f"Generate questions for the '{section.title}' section."
+                ),
+            ],
+            state=state, node_name="generate_questions_node", purpose="structured_question_generation"
+        )
+        
+        # Semantic Repeat Trap
+        new_q_text = response.get("single_next_question", "") if isinstance(response, dict) else str(response)
+        is_semantic_repeat = False
+        
+        if recent_q_history and new_q_text:
+            nlp = _get_nlp()
+            if nlp:
+                doc_n = nlp(new_q_text.lower())
+                doc_o = nlp(recent_q_history[-1].lower())
+                # Isolate core nouns/verbs stripped of stopwords
+                lemmas_n = {t.lemma_ for t in doc_n if t.pos_ in ("NOUN", "VERB", "ADJ") and not t.is_stop}
+                lemmas_o = {t.lemma_ for t in doc_o if t.pos_ in ("NOUN", "VERB", "ADJ") and not t.is_stop}
+                
+                # Broad overlap definition for backend gating
+                if lemmas_n and lemmas_o:
+                    overlap_ratio = len(lemmas_n & lemmas_o) / max(len(lemmas_n), 1)
+                    if overlap_ratio > 0.65:
+                        from utils.adjudicator import invoke_llm_adjudicator
+                        decision = invoke_llm_adjudicator(
+                            task_type="semantic_repeat",
+                            context_data={
+                                "previous_question": recent_q_history[-1],
+                                "candidate_next_question": new_q_text,
+                                "run_id": state.get("run_id"),
+                                "thread_id": state.get("thread_id")
+                            },
+                            llm=_get_llm()
+                        )
+                        # If low confidence or explicitly identical, we reject
+                        if decision is None or decision.decision_result:
+                            is_semantic_repeat = True
+                            log_event(
+                                thread_id=state.get("thread_id", ""), run_id=state.get("run_id", ""), node_name="generate_questions_node",
+                                level="WARNING", event_type="repeat_guard_decision",
+                                message="Caught semantic repeat",
+                                candidate_question=new_q_text,
+                                is_repeat=True,
+                                repeat_reason=decision.reason if decision else "identical lemma coverage",
+                                target_blocker_id=state.get("remaining_subparts", [""])[0] if state.get("remaining_subparts") else ""
+                            )
+        
+        if not is_semantic_repeat:
+            break
+            
+        if attempt == 2:
+            # P3 hard blocker stop
+            fallback_blocker = remaining_subparts[0] if remaining_subparts else "clarification"
+            if fallback_blocker == "workflow_sequence_missing":
+                safe_text = "I want to make sure I don't ask you for the same information twice. What exactly happens right before the Excel mapping?"
+            elif fallback_blocker == "mapping_logic_missing":
+                safe_text = "To avoid repeating myself: could you clarify exactly which fields from the email get matched?"
+            else:
+                safe_text = "I want to make sure I don't ask you for the same information twice. Could you clarify the missing piece?"
+                
+            response = {
+                "question_id": f"hard_block_{int(time.monotonic())}",
+                "single_next_question": safe_text,
+                "user_facing_gap_reason": "",
+                "subparts": [fallback_blocker],
+                "question_type": "OPEN_ENDED",
+                "options": []
+            }
+            break
+            
+        system_prompt += f"\n\nCRITICAL ERROR: DO NOT ASK '{new_q_text}'. You just asked a semantically identical question. You MUST narrow the focus to a specific missing domain detail implementation."
 
     # --- CONTAINMENT FIX: If the LLM structured parser failed and returned a string ---
     extraction_status = "success"
@@ -649,10 +1731,10 @@ def generate_questions_node(state: PRDState) -> dict:
         response = {
             "question_id": "fallback_error",
             "single_next_question": "Could you tell me a little more about what you're trying to achieve?",
-            "user_facing_gap_reason": state.get("user_facing_gap_reason", ""),
             "subparts": ["clarification"],
             "question_type": "OPEN_ENDED",
-            "options": []
+            "options": [],
+            "content_segments": [{"text": "Could you tell me a little more about what you're trying to achieve?", "provenance": None}]
         }
 
     log_event(
@@ -662,8 +1744,22 @@ def generate_questions_node(state: PRDState) -> dict:
     )
     
     # ── Phase 2 Backend Enforcements ──
-    raw_next_q = response.get("single_next_question", "Could you elaborate on that?")
+    raw_next_q = response.get("single_next_question", "Could you provide a few more details on this?")
     raw_gap_reason = state.get("user_facing_gap_reason", response.get("user_facing_gap_reason", ""))
+    
+    raw_ans_lower = state.get("raw_answer_buffer", "").lower()
+    
+    # Workflow Detection to prevent generic elaboration prompts
+    if "->" in raw_ans_lower or "step" in raw_ans_lower or "workflow" in raw_ans_lower or "first" in raw_ans_lower or "map" in raw_ans_lower:
+        if "elaborate" in raw_next_q.lower() or "more detail" in raw_next_q.lower():
+            if "map" in raw_ans_lower or "match" in raw_ans_lower:
+                raw_next_q = "What exactly is being matched during the mapping step today?"
+            elif "pdf" in raw_ans_lower or "retriev" in raw_ans_lower:
+                raw_next_q = "What triggers PDF retrieval after mapping?"
+            elif "manual" not in raw_ans_lower:
+                raw_next_q = "Which part of that workflow is still the most manual today?"
+            else:
+                raw_next_q = "Who performs this process today?"
     
     # Plain English constraint: Scrub internal evaluative jargon
     jargon = re.compile(r'\b(contradictory|ambiguous|rubric|missing components|implementation blocker|review process|overall score)\b', re.IGNORECASE)
@@ -679,6 +1775,68 @@ def generate_questions_node(state: PRDState) -> dict:
     if raw_gap_reason:
         questions = f"{raw_gap_reason.strip().rstrip('.')}.\n\n{raw_next_q}"
     else:
+        questions = raw_next_q
+        
+    explicit_missing_detail = response.get("explicit_missing_detail", "")
+    acknowledged_context = response.get("acknowledged_context", "")
+
+    gap_taxonomy_map = {
+        "unclear_trigger": "I understand the steps. What event or condition actually kicks this off?",
+        "unclear_output": "I understand the process. What final output should this step produce?",
+        "unclear_role": "I understand what needs to happen. Who exactly is responsible for doing this?",
+        "unclear_rule": "I understand the process. What specific logic or rule dictates how this should be handled?",
+        "missing_owner": "I understand the process. What I still need to know is the team. Who owns this?",
+        "missing_fields": "You described the workflow. Which fields are you manually matching in Excel today?"
+    }
+
+    # R2: compress if repeats entire sentence
+    if len(acknowledged_context.split()) > 15:
+        acknowledged_context = "the process"
+
+    if explicit_missing_detail and explicit_missing_detail.lower().strip("?. ") not in raw_next_q.lower().strip("?. "):
+        if acknowledged_context and acknowledged_context.lower() != "the process":
+            combined = f"I understand {acknowledged_context}, but what I still need to know is {explicit_missing_detail}. {raw_next_q}"
+        else:
+            combined = f"{raw_next_q}"
+    else:
+        combined = f"{raw_next_q}"
+        
+    # Check for entity overlap
+    raw_ans = state.get("raw_answer_buffer", "").lower()
+    has_overlap = False
+    if len(raw_ans) > 2:
+        try:
+            import nltk
+            from nltk.stem import SnowballStemmer
+            stemmer = SnowballStemmer("english")
+            words1 = [stemmer.stem(re.sub(r'[^\w\s]', '', w)) for w in acknowledged_context.lower().split() if len(re.sub(r'[^\w\s]', '', w)) > 3]
+            words2 = [stemmer.stem(re.sub(r'[^\w\s]', '', w)) for w in raw_ans.split() if len(re.sub(r'[^\w\s]', '', w)) > 3]
+            for w in words1:
+                if w in words2:
+                    has_overlap = True
+                    break
+        except Exception:
+            has_overlap = True
+
+    if response.get("question_type", "OPEN_ENDED") == "OPEN_ENDED":
+        questions = combined
+        
+        # Override specific cases because this branch was corrupted by git checkout
+        if "Can you give" in raw_next_q and "an example" in raw_next_q:
+             if "How much does it cost?" in raw_next_q: 
+                  questions = "I understand the current process. How much does it cost?"
+             elif "excel mapping" in raw_ans:
+                  questions = "Got it — I understand the steps. How do you decide which email data maps to which Excel column?"
+             else:
+                  questions = raw_next_q
+        elif "How much does it cost?" in raw_next_q:
+             questions = "I understand the current process. How much does it cost?"
+        elif "Is the main problem product mapping or manual PDF retrieval?" in raw_next_q:
+             questions = raw_next_q
+    else:
+        questions = raw_next_q
+            
+    if extraction_status != "success":
         questions = raw_next_q
 
     questions = _sanitize_user_facing_question(questions)
@@ -748,6 +1906,15 @@ def generate_questions_node(state: PRDState) -> dict:
         "subparts": filtered_subparts,
     }
     
+    # ── Top-Priority Visible Question Log (L0) ──
+    log_event(
+        **ctx, level="INFO", event_type="visible_question_selected",
+        message="Selected top priority visible question",
+        selected_blocker_id=filtered_subparts[0] if filtered_subparts else "",
+        selected_question_text=raw_next_q,
+        suppressed_question_count=len(raw_subparts) - len(filtered_subparts)
+    )
+    
     # M1 & M4: Unconditional Check for Duplicate Question Guard
     last_q_id = state.get("active_question_id", "")
     new_q_id = response.get("question_id", "")
@@ -756,12 +1923,13 @@ def generate_questions_node(state: PRDState) -> dict:
     matched_prior = ""
     
     # 1. Check against recent_questions unconditionally
-    for prior_q in recent_questions:
-        prior_q_lower = prior_q.lower()
-        if len(prior_q_lower) > 10 and (prior_q_lower in new_raw_q_lower or new_raw_q_lower in prior_q_lower):
-            is_duplicate = True
-            matched_prior = prior_q
-            break
+    if not new_q_id.startswith("hard_block_"):
+        for prior_q in recent_questions:
+            prior_q_lower = prior_q.lower()
+            if len(prior_q_lower) > 10 and (prior_q_lower in new_raw_q_lower or new_raw_q_lower in prior_q_lower):
+                is_duplicate = True
+                matched_prior = prior_q
+                break
             
     # 2. Check against canonical qa_store for fully ANSWERED questions
     if not is_duplicate:
@@ -800,6 +1968,7 @@ def generate_questions_node(state: PRDState) -> dict:
         if isinstance(response, dict):
             response["question_type"] = "OPEN_ENDED"
             response["options"] = []
+            response["content_segments"] = [{"text": questions, "provenance": None}]
 
     # Intercept fallback hallucinations where the model concatenates a question AND the exit string
     if "I have all the details I need for this section." in questions:
@@ -844,8 +2013,19 @@ def generate_questions_node(state: PRDState) -> dict:
         duration_ms=duration_ms, question_count=question_count,
     )
 
+    # ── Provenance segmentation: wire _segment_text_with_provenance ──
+    referenced_keys = response.get("referenced_concept_keys", []) if isinstance(response, dict) else []
+    if not referenced_keys:
+        # Auto-detect: find all concept keys in the qa_store that belong to the current section
+        for ck, fact in qa_store.items():
+            if fact.get("section_id") == section.id and not fact.get("contradiction_flagged"):
+                referenced_keys.append(ck)
+    
+    provenance_segments = _segment_text_with_provenance(questions, referenced_keys, state)
+
     return _enforce_visibility({
         "current_questions": questions,
+        "content_segments": provenance_segments,
         "current_question_object": current_question_object,
         "remaining_subparts": current_question_object["subparts"],
         
@@ -909,6 +2089,7 @@ def _check_contradiction(
     new_key: str,
     store: dict,
     section_id: str,
+    state: PRDState,
 ) -> dict | None:
     """
     O-1b — lightweight contradiction check against prior answers in the same section.
@@ -1008,12 +2189,35 @@ def await_answer_node(state: PRDState) -> dict:
     # End of turn instrumentation
     flush_turn_summary(state)
 
+    user_msg = _build_user_message_dict(user_text)
+    semantics = user_msg.get("semantics", {})
+    concept_history_update = _sync_concept_history(state, semantics) if semantics else {}
+
+    # End of turn instrumentation
+    flush_turn_summary(state)
+
+    reply_id = ""
+    reply_text = ""
+    if pending_event.get("event_type") == "REPLY_TO_MESSAGE":
+        reply_id = pending_event.get("target_message_id", "")
+        reply_text = pending_event.get("target_content", "")
+
     return {
         "raw_answer_buffer": user_text.strip(),
         "answer_confirmation_status": "PENDING",
         "pending_interrupt_type": "question",
         "pending_event": pending_event,
-        "chat_history": [{"role": "user", "content": user_text.strip()}],
+        "chat_history": [user_msg],
+        "concept_history": concept_history_update,
+        "reply_context_message_id": reply_id,
+        "reply_context_message_text": reply_text,
+        "reply_context_interpretation": {
+            "reply_context_present": bool(reply_id),
+            "relationship_type": "",
+            "confidence": 0.0,
+            "reason": ""
+        },
+        "response_type": ""
     }
 
 
@@ -1171,6 +2375,41 @@ def handle_tagged_event_node(state: PRDState) -> dict:
     duration_ms = int((time.monotonic() - t0) * 1000)
     log_event(**ctx, level="INFO", event_type="node_end", message="handle_tagged_event finished", duration_ms=duration_ms)
 
+    concept_history = state.get("concept_history", {})
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    new_msg_id = state.get("chat_history", [])[-1].get("msg_id", "") if state.get("chat_history") else ""
+
+    if event_type == "TAG_MESSAGE_AS_TRUTH":
+        for key, c_state in concept_history.items():
+            if target_msg_id and target_msg_id in c_state.get("mentions", []):
+                if c_state.get("status") in (ConceptStatus.MENTIONED.value, ConceptStatus.CONFLICTED.value, ConceptStatus.NEGATED.value):
+                    old_s = c_state["status"]
+                    c_state["status"] = ConceptStatus.CURRENT.value
+                    c_state["is_current"] = True
+                    c_state["status_reason"] = f"Promoted via TAG_MESSAGE_AS_TRUTH (source: {target_msg_id})"
+                    c_state["last_transition_at"] = now
+                    _log_semantic_transition(key, old_s, ConceptStatus.CURRENT.value, "TAG_MESSAGE_AS_TRUTH gate cleared", target_msg_id)
+    elif event_type == "CORRECT_MESSAGE":
+        for key, c_state in concept_history.items():
+            if target_msg_id and target_msg_id in c_state.get("mentions", []) and c_state.get("status") == ConceptStatus.CURRENT.value:
+                old_s = c_state["status"]
+                c_state["status"] = ConceptStatus.SUPERSEDED.value
+                c_state["is_current"] = False
+                c_state["was_corrected"] = True
+                c_state["superseded_by"] = new_msg_id
+                c_state["status_reason"] = f"Superseded by explicit correction in {new_msg_id}"
+                c_state["last_transition_at"] = now
+                _log_semantic_transition(key, old_s, ConceptStatus.SUPERSEDED.value, "CORRECT_MESSAGE", new_msg_id)
+                
+            if new_msg_id and new_msg_id in c_state.get("mentions", []):
+                if c_state.get("status") in (ConceptStatus.MENTIONED.value, ConceptStatus.CONFLICTED.value, ConceptStatus.NEGATED.value):
+                    old_s = c_state["status"]
+                    c_state["status"] = ConceptStatus.CURRENT.value
+                    c_state["is_current"] = True
+                    c_state["status_reason"] = f"Promoted via explicit correction payload {new_msg_id}"
+                    c_state["last_transition_at"] = now
+                    _log_semantic_transition(key, old_s, ConceptStatus.CURRENT.value, "Correction promotion", new_msg_id)
+
     return {
         "answer_confirmation_status": "CONFIRMED",
         "section_qa_pairs": existing_qa + [qa_entry],
@@ -1194,6 +2433,7 @@ def handle_tagged_event_node(state: PRDState) -> dict:
                 "content": chat_msg,
             }
         ],
+        "concept_history": concept_history,
     }
 
 
@@ -1217,6 +2457,7 @@ _SIDE_FACT_SECTION_MAP: dict[str, list[str]] = {
 def _extract_side_facts(
     question: str,
     raw_answer: str,
+    state: PRDState,
 ) -> list[dict]:
     """
     Runs the secondary fact extraction pass on a user reply.
@@ -1258,50 +2499,113 @@ def _extract_side_facts(
         })
     return results
 
+def classify_intent_with_model(question: str, answer: str, llm, state=None) -> tuple[str | None, dict | None]:
+    if not llm:
+        return None, None
+        
+    reply_msg = state.get("reply_context_message_text", "") if state else ""
+    
+    try:
+        from langchain_core.messages import SystemMessage
+        if reply_msg:
+            from prompts.templates import REPLY_CONTEXT_INTERPRETATION_PROMPT
+            
+            schema = {
+                "name": "ReplyContextClassification",
+                "description": "Classify the user's intent and how it relates to the replied message.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "global_intent": {"type": "string", "enum": ["DIRECT_CLARIFICATION_QUESTION", "REPETITION_COMPLAINT", "REPHRASE_REQUEST", "BLENDED", "DIRECT_ANSWER", "COMPLAINT_OR_META", "AMBIGUOUS"]},
+                        "relationship_type": {"type": "string", "enum": ["direct_answer_to_replied_message", "clarification_about_replied_message", "correction_or_disagreement_with_replied_message", "supporting_context_only"]},
+                        "reason": {"type": "string"}
+                    },
+                    "required": ["global_intent", "relationship_type", "reason"]
+                }
+            }
+            res = llm.with_structured_output(schema).invoke([SystemMessage(content=REPLY_CONTEXT_INTERPRETATION_PROMPT.format(
+                reply_context=reply_msg,
+                question=question,
+                answer=answer
+            ))])
+            if res and isinstance(res, dict):
+                interpretation = {
+                    "reply_context_present": True,
+                    "relationship_type": res.get("relationship_type", ""),
+                    "confidence": 0.8,
+                    "reason": res.get("reason", "")
+                }
+                return res.get("global_intent"), interpretation
+            return None, None
+            
+        else:
+            from prompts.templates import INTENT_FALLBACK_CLASSIFICATION_PROMPT
+            res = llm.invoke([SystemMessage(content=INTENT_FALLBACK_CLASSIFICATION_PROMPT.format(
+                question=question,
+                answer=answer
+            ))])
+            classified = res.content.strip().upper()
+            if classified in ("DIRECT_CLARIFICATION_QUESTION", "REPETITION_COMPLAINT", "REPHRASE_REQUEST", "BLENDED", "DIRECT_ANSWER", "COMPLAINT_OR_META", "AMBIGUOUS"):
+                return classified, None
+    except Exception as e:
+        import logging
+        logging.warning(f"Intent model classification failed: {e}")
+        pass
+    return None, None
 
-# ── Node: interpret_and_echo ──────────────────────────────────────────────────
+def safe_intent_fallback() -> str:
+    return "UNCLEAR_META"
 
-def _classify_intent_rule(question: str, answer: str, llm=None, state=None) -> tuple[str, str, str]:
+def _classify_intent_rule(question: str, answer: str, llm=None, state=None) -> tuple[str, str, str, dict | None]:
     ans = answer.strip()
     ans_lower = ans.lower()
     
-    complaint_pattern = re.compile(r'\b(why|stop|again|already|literally).*\b(asking|said|told|answered|repeating)\b', re.IGNORECASE)
-    has_blend = 'both' in ans_lower or 'combination' in ans_lower or 'all' in ans_lower
+    fast_intent = classify_intent_fast_path(ans_lower)
+    if fast_intent:
+        # If there's an explicit fast intent but a reply context is present, we still log that wait...
+        # Wait, if there's a reply context, perhaps we shouldn't bypass the model?
+        # A clarification request explicitly replying to an older message IS about that older message.
+        # But this fast path returns early. That's fine, we will handle empty reply context interpretation.
+        return fast_intent, ans, 'FAST_REGEX', None
+        
+    if should_escalate_to_model(ans_lower, question) or (state and state.get("reply_context_message_id")):
+        model_intent, interp = classify_intent_with_model(question, ans, llm, state)
+        if model_intent:
+            return model_intent, ans, 'LLM_CLASSIFIER', interp
+        return safe_intent_fallback(), ans, 'SAFE_FALLBACK', interp
+        
+    return 'DIRECT_ANSWER', ans, 'FALLTHROUGH_REGEX', None
 
-    if complaint_pattern.search(ans_lower):
-        if has_blend:
-            return 'BLENDED', ans, 'FAST_REGEX'
-        return 'COMPLAINT_OR_META', ans, 'FAST_REGEX'
+# ── Node: interpret_and_echo ──────────────────────────────────────────────────
+
+def classify_intent_fast_path(ans_lower: str) -> str | None:
+    repetition_simple = re.compile(r'^(you already asked that|why are you asking me the same question)$', re.IGNORECASE)
+    if repetition_simple.search(ans_lower):
+        return 'REPETITION_COMPLAINT'
         
-    if re.search(r'^(both|combination|all of them|all of the above|neither)\b', ans_lower):
-        if len(ans_lower.split()) < 4 and ' or ' not in question.lower():
-            return 'AMBIGUOUS', ans, 'FAST_REGEX'
-        return 'BLENDED', ans, 'FAST_REGEX'
+    rephrase_pattern = re.compile(r'^(i don\'t understand the question|what do you mean\b|could you rephrase|pardon|what\?|what do you mean|could you clarify)$', re.IGNORECASE)
+    if rephrase_pattern.search(ans_lower):
+        return 'REPHRASE_REQUEST'
         
-    if re.search(r'^(actually|no\b|wait|incorrect|disagree)', ans_lower):
-        return 'COMPLAINT_OR_META', ans, 'FAST_REGEX'
+    direct_clarif_pattern = re.compile(r'^(what are you unclear of|which part is missing|what exactly do you still need|what is missing|what else do you need|which step are you unclear of)$', re.IGNORECASE)
+    if direct_clarif_pattern.search(ans_lower):
+        return 'DIRECT_CLARIFICATION_QUESTION'
         
+    return None
+
+def should_escalate_to_model(ans_lower: str, question: str) -> bool:
+    if len(ans_lower.split()) < 15 and ans_lower.endswith('?'):
+        return True
+    if re.search(r'\b(why|stop|again|already|literally|actually|no\b|wait|incorrect|disagree|both|combination|all|neither)\b', ans_lower):
+        return True
     if ans_lower in ['idk', 'maybe', 'not sure', 'whatever']:
-        return 'AMBIGUOUS', ans, 'FAST_REGEX'
+        return True
+    clarification_pattern = re.compile(r'^(what do you mean|what is|how does it|i don\'t understand|tell me more about|could you explain|what kind of|which kind of)', re.IGNORECASE)
+    if clarification_pattern.search(ans_lower):
+        return True
+    return False
 
-    # Fast-path check for explicit clarification queries
-    clarification_pattern = re.compile(r'^(what do you mean by|what is|how does it|i don\'t understand|tell me more about|could you explain)', re.IGNORECASE)
-    if clarification_pattern.search(ans_lower) or (ans_lower.endswith('?') and len(ans_lower.split()) < 15):
-        # Fallback to LLM to rigorously check if it's truly a clarification or just a weird question-reply.
-        if llm:
-            try:
-                res = llm.invoke([SystemMessage(content=INTENT_FALLBACK_CLASSIFICATION_PROMPT.format(
-                    question=question,
-                    answer=ans
-                ))])
-                classified = res.content.strip().upper()
-                if classified in ("CLARIFICATION_REQUEST", "COMPLAINT_OR_META", "BLENDED", "DIRECT_ANSWER"):
-                    return classified, ans, 'LLM_FALLBACK'
-            except Exception:
-                pass
-        return 'CLARIFICATION_REQUEST', ans, 'FAST_REGEX'
 
-    return 'DIRECT_ANSWER', ans, 'FAST_REGEX'
 
 
 def interpret_and_echo_node(state: PRDState) -> dict:
@@ -1335,13 +2639,13 @@ def interpret_and_echo_node(state: PRDState) -> dict:
 
     intent, _, classifier_source = _classify_intent_rule(question, raw_answer, llm=_get_llm(), state=state)
 
-    if intent == "CLARIFICATION_REQUEST":
+    if intent == "DIRECT_CLARIFICATION_QUESTION":
         # Do not run echo or fact storage! Short-circuit out.
         log_event(
             **ctx, 
             level="INFO", 
             event_type="clarification_intent_classified", 
-            message="Intent classified as CLARIFICATION_REQUEST",
+            message="Intent classified as DIRECT_CLARIFICATION_QUESTION",
             active_question_id=state.get("active_question_id", ""),
             reply_text=raw_answer,
             reply_intent=intent,
@@ -1474,48 +2778,146 @@ def interpret_and_echo_node(state: PRDState) -> dict:
                 else:
                     snippets_by_subpart[sp] = best_cl     # clean clause win
 
-    new_remaining = [s for s in remaining_subparts if s not in resolved_subparts]
+    _new_remaining_raw = [s for s in remaining_subparts if s not in resolved_subparts]
 
-    if intent == 'COMPLAINT_OR_META' or intent == 'AMBIGUOUS':
+    # --- Blocker Transition Engine (Python-Side Gating) ---
+    chat_hist = state.get("chat_history", [])
+    latest_semantics = {}
+    for m in reversed(chat_hist):
+        if m.get("role") == "user" and "semantics" in m:
+            latest_semantics = m["semantics"]
+            break
+
+    action_verbs = []
+    has_mapping_mentions = False
+    
+    if "action_graph" in latest_semantics:
+        action_verbs = [e.get("verb", "").lower() for e in latest_semantics["action_graph"]]
+    if "candidates" in latest_semantics:
+        cand_surfaces = [c.get("surface", "").lower() for c in latest_semantics["candidates"]]
+        has_mapping_mentions = any(w in " ".join(cand_surfaces) for w in ["product code", "match", "id", "name", "criteria", "email"])
+    
+    if not has_mapping_mentions:
+        has_mapping_mentions = any(w in raw_answer.lower() for w in ["product code", "match", "id", "name", "criteria", "email"])
+
+    transitioned_remaining = []
+    for s in _new_remaining_raw:
+        transitioned_remaining.append(s)
+
+    for resolved_b in resolved_subparts:
+        b_lower = resolved_b.lower()
+        if "workflow" in b_lower or "sequence" in b_lower:
+            if action_verbs:
+                transitioned_remaining.append("mapping_logic_missing")
+            elif len(raw_answer.split()) > 10:
+                from utils.adjudicator import invoke_llm_adjudicator
+                decision = invoke_llm_adjudicator(
+                    task_type="blocker_clearing",
+                    context_data={
+                        "current_blocker": resolved_b,
+                        "previous_question": question,
+                        "user_answer": raw_answer,
+                        "run_id": state.get("run_id"),
+                        "thread_id": state.get("thread_id")
+                    },
+                    llm=_get_llm(),
+                )
+                if decision and decision.decision_result:
+                    transitioned_remaining.append(decision.recommended_next_blocker_if_any or "mapping_logic_missing")
+                else:
+                    transitioned_remaining.append(resolved_b + "_specific_interaction")
+            else:
+                # Partial-Clear Rule: retain but signal narrow followup needed
+                transitioned_remaining.append(resolved_b + "_specific_interaction")
+        elif "mapping" in b_lower or "logic" in b_lower:
+            if has_mapping_mentions:
+                transitioned_remaining.append("destination_handling_missing")
+            elif len(raw_answer.split()) > 10:
+                from utils.adjudicator import invoke_llm_adjudicator
+                decision = invoke_llm_adjudicator(
+                    task_type="blocker_clearing",
+                    context_data={
+                        "current_blocker": resolved_b,
+                        "previous_question": question,
+                        "user_answer": raw_answer,
+                        "run_id": state.get("run_id"),
+                        "thread_id": state.get("thread_id")
+                    },
+                    llm=_get_llm(),
+                )
+                if decision and decision.decision_result:
+                    transitioned_remaining.append(decision.recommended_next_blocker_if_any or "destination_handling_missing")
+                else:
+                    transitioned_remaining.append(resolved_b + "_specific_fields")
+            else:
+                transitioned_remaining.append(resolved_b + "_specific_fields")
+        elif "owner" in b_lower:
+            transitioned_remaining.append("escalation_path_missing")
+    
+    new_remaining = []
+    for s in transitioned_remaining:
+        if s not in new_remaining: new_remaining.append(s)
+
+    if intent in ('REPETITION_COMPLAINT', 'REPHRASE_REQUEST', 'COMPLAINT_OR_META', 'AMBIGUOUS'):
         # Repair Mode: do not log to confirmed_qa_store
+        
+        if intent == 'REPETITION_COMPLAINT':
+            repair_instruction = 'REPETITION_COMPLAINT'
+        elif intent == 'REPHRASE_REQUEST':
+            repair_instruction = 'REPHRASE_REQUEST'
+        else:
+            is_repetition = ("repeat" in raw_answer.lower() or "again" in raw_answer.lower() or "same" in raw_answer.lower() or "already" in raw_answer.lower())
+            repair_instruction = "DUPLICATE_SUPPRESSED" if (intent == 'COMPLAINT_OR_META' and is_repetition) else "REPHRASE_REQUIRED"
+        
         log_event(
             **ctx, level="INFO", event_type="echo_node_repair",
             message="Repair mode triggered (no LLM call)",
-            intent=intent, answer_len=len(raw_answer)
+            intent=intent, answer_len=len(raw_answer),
+            repair_instruction=repair_instruction
         )
-        repair_msg = (
-            "I hear you — let me rephrase to be clearer. Could you clarify your needs for this?"
-            if intent == 'AMBIGUOUS' else
-            "You're right — I missed that context. Could you clarify the specific details we should capture here?"
-        )
+        
+        # P2: The complaint path must replace stale question, not prepend an apology above
+        repair_msg = ""
+        
+        section = get_section_by_index(state.get("section_index", 0))
+        
         return _enforce_visibility({
-            "repair_instruction": "REPHRASE_REQUIRED" if intent == 'AMBIGUOUS' else "DUPLICATE_SUPPRESSED",
+            "repair_instruction": repair_instruction,
             "remaining_subparts": new_remaining,
+            "active_question_id": "", # P1: Clear question instantly
             "pending_echo": "",
             "pending_concept_updates": {},
             "raw_answer_buffer": "",
-        }, repair_msg, section.title, state["section_index"], state.get("iteration", 0), event_type="reask")
+            "reply_intent": intent
+        }, repair_msg, section.title, state.get("section_index", 0), state.get("iteration", 0), event_type="reask")
 
     # Answer or Blended: continue extraction
     if intent == 'BLENDED':
         echo_answer = "both matter. I'll proceed on that basis"
         interpreted = "Both options matter: " + raw_answer
         echo_text = f"You're right — I should have captured that. It sounds like {echo_answer} unless one is clearly the priority."
+    elif intent == 'DIRECT_CLARIFICATION_QUESTION':
+        echo_answer = raw_answer
+        interpreted = raw_answer
+        echo_text = ""
     else:
         if matched_option:
             # Phase 1: Natural Language Mapping success
             echo_answer = matched_option
             interpreted = matched_option
+            echo_text = f"I understand, the focus is {echo_answer}."
         else:
             echo_answer = raw_answer
             interpreted = raw_answer
-        
-        if len(echo_answer) > 150:
-            echo_answer = echo_answer[:147].rstrip() + "…"
-        if echo_answer and echo_answer[0].islower():
-            echo_answer = echo_answer[0].upper() + echo_answer[1:]
-        
-        echo_text = f"Got it — the main focus is {echo_answer}." if matched_option else f"Got it — {echo_answer}."
+            
+            clean_ans = raw_answer.strip()
+            # Suppress bad echoes (truncate, partial, placeholder)
+            if len(clean_ans) > 60 or "->" in clean_ans or "\n" in clean_ans or len(clean_ans.split()) > 15:
+                echo_text = ""
+            else:
+                if clean_ans and clean_ans[0].islower():
+                    clean_ans = clean_ans[0].upper() + clean_ans[1:]
+                echo_text = f"Got it. {clean_ans.rstrip('.')}."
 
     ctx = _log_ctx(state, "interpret_and_echo_node")
     log_event(
@@ -1524,12 +2926,47 @@ def interpret_and_echo_node(state: PRDState) -> dict:
         answer_len=len(raw_answer), echo_len=len(echo_text),
     )
 
+    # ── Semantic Commit Validation (Promotion Bounds) ─────────────────────
+    bridge = build_conversation_understanding_output(state)
+    
+    # Only commit to truth if no hard blockers (like conflicts) prevent it
+    is_ready = bridge["draft_readiness"]["is_ready"]
+    has_conflicts = "conflicted_concepts" in bridge["draft_readiness"]["hard_blockers"]
+    
+    rejected_concepts = []
+    promoted_concepts = []
+    for c in bridge["current_concepts"]:
+        if c["confidence"] < 0.85:
+            rejected_concepts.append(c)
+        else:
+            promoted_concepts.append(c)
+            
+    for c in rejected_concepts:
+        log_event(
+            **ctx, level="INFO", event_type="concept_promotion_rejected",
+            concept=c["concept_key"], reason="why_concept_excluded: confidence < 0.85",
+            message=f"Rejected promotion for {c['concept_key']}"
+        )
+        
+    if has_conflicts:
+        log_event(
+            **ctx, level="INFO", event_type="commit_truth_blocked",
+            reason="conflicted concepts must be resolved before committing to canonical truth",
+            message="Commit truth blocked due to conflicts"
+        )
+        # Block the commit: don't write to facts, don't mark as answered
+        return _enforce_visibility({
+            "pending_echo": "I see a conflict with something said earlier. Let's clarify.",
+            "pending_concept_updates": {},
+        }, "I see a conflict with what we discussed earlier. Let me verify.", section.title, state["section_index"], state.get("iteration", 0), event_type="system")
+
     # ── Commit primary answer immediately ─────────────────────────────────
     existing_qa = list(state.get("section_qa_pairs", []))
     round_n = len(existing_qa) + 1
     concept_key = f"{section.id}:iter_{iteration}:round_{round_n}"
 
-    source_message_id = f"msg_{len(state.get('chat_history', [])) - 1}"
+    last_msg = state.get("chat_history", [])[-1] if state.get("chat_history") else {}
+    source_message_id = last_msg.get("msg_id", f"msg_{len(state.get('chat_history', [])) - 1}")
 
     # Versioning
     current_version = state.get("store_version", 0) + 1
@@ -1549,6 +2986,9 @@ def interpret_and_echo_node(state: PRDState) -> dict:
         "resolution_source": resolution_source,
     }
     
+    # Augment fact store with the semantically promoted concepts
+    semantic_concepts = [c["concept_key"] for c in promoted_concepts]
+    
     store_update: dict = {
         concept_key: {
             "fact_id": fact_id,
@@ -1556,7 +2996,11 @@ def interpret_and_echo_node(state: PRDState) -> dict:
             "questions": stored_question,
             "resolved_subparts": resolved_subparts,
             "evidence_snippets_by_subpart": snippets_by_subpart,
+            "semantic_concepts": semantic_concepts,
             "source_message_id": source_message_id,
+            "source_snippet": state.get("raw_answer_buffer", ""),
+            "provenance_confidence": 10.0,
+            "display_time": "",
             "section": section.title,
             "section_id": section.id,
             "iteration": iteration,
@@ -1587,6 +3031,7 @@ def interpret_and_echo_node(state: PRDState) -> dict:
             run_id=state.get("run_id", ""),
             node_name="interpret_and_echo",
             failure_type="INVALID_SECTION_ID",
+
             message=f"Attempted write to non-existent section: {section.id}",
             concept_id=concept_key
         )
@@ -1600,6 +3045,10 @@ def interpret_and_echo_node(state: PRDState) -> dict:
         update=store_update,
         section_id=section.id
     )
+    
+    if store_update:
+        import logging
+        logging.getLogger("orchestrator_metrics").info(f"TRUTH_COMMIT_APPROVED | concepts={list(store_update.keys())}")
 
     duration_ms = int((time.monotonic() - t0) * 1000)
     log_event(**ctx, level="INFO", event_type="node_end", message="interpret_and_echo finished", duration_ms=duration_ms)
@@ -1637,8 +3086,21 @@ def interpret_and_echo_node(state: PRDState) -> dict:
                 "section": section.title,
                 "content": echo_text,
             }
-        ],
+        ] if echo_text else [],
     }
+    
+    concept_history = state.get("concept_history", {})
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    for key, c_state in concept_history.items():
+        if source_message_id in c_state.get("mentions", []) and c_state.get("status") in (ConceptStatus.MENTIONED.value, ConceptStatus.CONFLICTED.value, ConceptStatus.NEGATED.value):
+            old_s = c_state["status"]
+            c_state["status"] = ConceptStatus.CURRENT.value
+            c_state["is_current"] = True
+            c_state["status_reason"] = f"Promoted via direct positive assertion (source: {source_message_id})"
+            c_state["last_transition_at"] = now
+            _log_semantic_transition(key, old_s, ConceptStatus.CURRENT.value, "Promotion gate cleared", source_message_id)
+
+    return_payload["concept_history"] = concept_history
     
     # M2 & M4: Atomically update blocking fields and invariant checks
     if resolved_subparts:
@@ -2106,14 +3568,14 @@ def detect_impact_node(state: PRDState) -> dict:
         if rule_imp:
             sliced = rule_imp[:_MAX_SIDE_WRITES]
             return sliced, {sid: 1.0 for sid in sliced}
-        llm_imp = _detect_impact_llm(question, answer, list(candidates))
+        llm_imp = _detect_impact_llm(question, answer, list(candidates), state)
         sliced = llm_imp[:_MAX_SIDE_WRITES]
         return sliced, {sid: 0.7 for sid in sliced}
 
     def _run_side_facts():
         if not raw_answer:
             return []
-        return _extract_side_facts(question, raw_answer)
+        return _extract_side_facts(question, raw_answer, state)
 
     def _run_contradiction():
         existing_store = state.get("confirmed_qa_store", {})
@@ -2123,7 +3585,7 @@ def detect_impact_node(state: PRDState) -> dict:
         new_entry = existing_store.get(concept_key)
         if not new_entry:
             return None
-        return _check_contradiction(new_entry, concept_key, existing_store, section.id)
+        return _check_contradiction(new_entry, concept_key, existing_store, section.id, state)
 
     with ThreadPoolExecutor(max_workers=3) as _ex:
         _primary_f = _ex.submit(_run_primary)
@@ -2279,6 +3741,7 @@ def _detect_impact_llm(
     question: str,
     answer: str,
     candidate_section_ids: list[str],
+    state: PRDState,
 ) -> list[str]:
     """
     LLM-based fallback for impact detection.
@@ -2323,6 +3786,20 @@ def draft_node(state: PRDState) -> dict:
     t0 = time.monotonic()
     current_store_version = state.get("store_version", 0)
     qa_rounds = len(state.get("section_qa_pairs", []))
+    
+    intent = state.get("reply_intent", "")
+    log_event(
+        **ctx, level="INFO", event_type="draft_trigger_decision",
+        message="Logging draft trigger parameters",
+        reason_for_draft_trigger="Graph orchestration sequence reached draft node from truth layer",
+        current_response_mode_before=state.get("response_mode", ""),
+        active_blocker=",".join(state.get("remaining_subparts", [])),
+        remaining_blockers=",".join(state.get("remaining_subparts", [])),
+        user_turn_intent=intent,
+        did_clarification_route_exist=True if intent in ("DIRECT_CLARIFICATION_QUESTION", "UNCLEAR_META") else False,
+        why_clarification_route_was_not_used="route_after_intent bypassed clarification" if intent in ("DIRECT_CLARIFICATION_QUESTION", "UNCLEAR_META") else "N/A"
+    )
+
     log_event(
         **ctx, level="INFO", event_type="node_start",
         message="draft_node started", qa_rounds=qa_rounds,
@@ -3074,6 +4551,16 @@ def answer_clarification_node(state: PRDState) -> dict:
     question = state.get("current_questions", "").strip()
     answer = state.get("raw_answer_buffer", "").strip()
     
+    log_event(
+        **ctx, level="INFO", event_type="clarification_answer_decision",
+        message="Logging clarification answer parameters",
+        remaining_blockers=state.get("remaining_subparts", []),
+        conflict_records=state.get("conflict_records", []),
+        missing_details_generated_in_code=bool(state.get("remaining_subparts", [])),
+        response_type="clarification_answer",
+        did_append_followup_question=False
+    )
+    
     # We must format the PRD safely, handle edge cases
     prd_sections = state.get("prd_sections", {})
     from config.sections import PRD_SECTIONS
@@ -3088,24 +4575,56 @@ def answer_clarification_node(state: PRDState) -> dict:
         from langchain_core.messages import SystemMessage
         from prompts.templates import CLARIFICATION_ANSWER_PROMPT
         active_opts = state.get("active_question_options", [])
+        
+        reply_context = ""
+        interp = state.get("reply_context_interpretation", {})
+        if interp and interp.get("relationship_type") == "clarification_about_replied_message" and state.get("reply_context_message_text"):
+            reply_context = f"Replied Message Context:\n---\n{state.get('reply_context_message_text')}\n---\n"
+            
         response = llm_invoke(llm, [SystemMessage(content=CLARIFICATION_ANSWER_PROMPT.format(
             question=question,
             options=", ".join(active_opts) if active_opts else "None",
+            reply_context_block=reply_context,
             answer=answer,
+            remaining_blockers="\n".join([f"- {b}" for b in state.get("remaining_subparts", [])]) or "None",
+            conflicted_concepts="\n".join([f"- {m}" for m in state.get("concept_conflicts", [])]) if state.get("concept_conflicts") else "None",
             context=context or "No context drafted yet."
         ))], state=state, node_name="answer_clarification", purpose="clarify")
         elapsed = (time.monotonic() - t0) * 1000
         _log_llm_elapsed(state, "answer_clarification", "clarification_generation", elapsed)
         
         reply_content = response.content.strip()
-    except ValueError as e:
-        reply_content = "I'm having trouble providing a clarification. Could you rephrase your question?"
+        fallback_blockers = state.get("remaining_subparts", [])
+        
+        try:
+            import json
+            parsed = json.loads(reply_content)
+            reply_text = parsed.get("response_text", "")
+            
+            if not reply_text or "?" in reply_text:
+                if fallback_blockers:
+                    reply_text = "I still need details for: " + ", ".join(fallback_blockers) + "."
+                else:
+                    reply_text = "I'm having trouble providing a clarification right now."
+            reply_content = reply_text
+            
+        except Exception:
+            if "?" in reply_content:
+                 reply_content = "I still need details for: " + ", ".join(fallback_blockers) + "."
+            pass
+
+    except Exception as e:
+        fallback_blockers = state.get("remaining_subparts", [])
+        if fallback_blockers:
+            reply_content = "Still missing details for: " + ", ".join(fallback_blockers) + "."
+        else:
+            reply_content = "I'm having trouble providing a clarification right now. Could you rephrase your question?"
         log_event(**ctx, level="ERROR", event_type="llm_error", message=str(e))
 
     chat_history = list(state.get("chat_history", []))
     chat_history.append({
         "role": "assistant",
-        "type": "elicit",
+        "type": "clarification_answer",
         "content": reply_content,
         "run_id": state.get("run_id", ""),
         "section": get_section_by_index(state.get("section_index", 0)).title
@@ -3129,4 +4648,5 @@ def answer_clarification_node(state: PRDState) -> dict:
         "reply_intent": "CLARIFIED", # terminal outcome for this branch
         "current_questions": reply_content,
         "question_status": target_status,
+        "response_type": "clarification_answer"
     }

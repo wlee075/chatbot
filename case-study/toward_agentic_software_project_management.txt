@@ -1,0 +1,891 @@
+Toward Agentic Software Project Management: A Vision and
+Roadmap
+Lakshana Iruni Assalaarachchi*
+lakshana.assalaarachchi@monash.edu
+Monash University
+Clayton, Victoria, Australia
+Zainab Masood
+zmasood@psu.edu.sa
+Prince Sultan University
+Riyadh, Saudi Arabia
+Rashina Hoda
+rashina.hoda@monash.edu
+Monash University
+Clayton, Victoria, Australia
+John Grundy
+john.grundy@monash.edu
+Monash University
+Clayton, Victoria, Australia
+Abstract
+With the advent of agentic AI, Software Engineering is transforming
+to a new era dubbed Software Engineering 3.0. Software project
+management (SPM) must also evolve with such transformations to
+boost successful project completion, while keeping humans at the
+heart of it. Building on our preliminary ideas of"agentic SPM", and
+supporting literature, we present our vision of an"Agentic Project
+Manager (PM)"as a multi-agent system for SPM 3.0. They will
+work like a“junior project manager”, or an“intern project manager”
+collaboratively with software teams. We introduce four working
+modes, with varying autonomy levels to choose from, based on the
+SPM task. This addresses concerns with ethics, accountability, and
+trust related to agentic PMs. We also share insights on human PM
+role evolution and new skill requirements as a“strategic leader”and
+a“coach”for humans and agents. While creating the foundation for
+agentic SPM research, we present a research agenda for the wider
+research community.
+CCS Concepts
+•Software and its engineering → Software development pro-
+cess management;•Social and professional topics → Software
+management;Project and people management;•Computing
+methodologies→Artificial intelligence.
+Keywords
+Software Project Management, Roadmap, Agentic Project Manager,
+Agentic Software Project Management, Agentic AI
+1 Introduction
+Generative artificial intelligence (GenAI) advancements are lead-
+ing us towards an "Agentic AI" era [ 30]. Agentic AI refers to au-
+tonomous AI systems that achieve complex goals through autonomous
+decision making, proactive task execution with minimum human
+involvement, learn, and adapt by working with humans and sys-
+tems. This makes agentic AI a“living system”in contrast to other
+AI tools [40].
+Recent studies envision Software Engineering 3.0 (SE 3.0, also
+dubbed Agentic SE), a new era of SE, with agentic AI as teammates
+This version is the author’s preprint of the article accepted for AGENT workshop at
+ICSE 2026
+working collaboratively with humans in the software development
+[25]. Studies on the use of agentic SE have started identifying poten-
+tial to assist in software development activities such as coding and
+testing [1, 25]. These findings complement the ongoing practitioner
+discussions about the use of AI agents in SE, such as Zapier, for
+task automation [30], AI-powered assistants such as GitLab Duo,
+Anthropic’s Claude Code, Sourcegraph Amp [23], and Rovo Dev
+in code generation and software testing. With this paradigm shift,
+there is a need to redefine existing methodologies, roles, practices,
+and artifacts across the software development life cycle (SDLC),
+without limiting it to programming [19].
+We also noted that practitioners anticipate agentic AI is com-
+ing closer to becoming a reality in software project management
+(SPM). A recent report on AI in Project Management by Project
+Management Institute (PMI Sweden chapter) [ 33] has identified
+Information Technology (IT) as one of the top three sectors that
+uses AI in project management. As part of the ongoing AI evolution,
+it is expected to have virtual project assistants to facilitate human
+project manager (PM) [33]. Some practitioners presume a role like
+“AI-enhanced project manager”by 2030 [28].
+We concluded our recent review of practitioner literature on the
+use of GenAI in SPM with a brief vision of agentic SPM, where AI
+agents act as assistants to human PM in different SPM tasks, and
+the human PM interacts not just with people and processes but
+also with those SPM agents [7]. However, with evolving agentic AI
+concepts, this raises concerns about coordination overheads and
+the need for integrated or unified agentic systems [11, 19]. Some
+sources debate that simply adopting agentic AI as a trend can cause
+project failures due to high cost, lack of business value mapping, low
+acceptance by users, or poor risk management [15]. Lack of focus
+on such aspects has also been reported to cause failure of GenAI
+investments in more than 95% of organizations [31]. Therefore, we
+address the following research questions in this vision paper.
+(1)How SPM will evolve with AI to facilitate agentic SE?
+(2) How should an ethical multi-agent project management assistant
+be designed and used while balancing autonomy?
+https://zapier.com/ai
+https://about.gitlab.com/gitlab-duo/
+https://www.claude.com/product/claude-code
+https://sourcegraph.com/amp
+https://www.atlassian.com/software/rovo-dev
+arXiv:2601.16392v1  [cs.SE]  23 Jan 2026
+Assalaarachchi et al.
+(3) How should the human PM role evolve to facilitate responsible
+human-agent interactions?
+Referring to emerging literature, we present the"SPM with AI
+Roadmap"(in section 3.1), and build upon our earlier vision to
+propose an ethical"agentic PM"along with four"working modes"
+that adjust the autonomy of agentic PM based on each SPM task.
+We elaborate on how and why human oversight should be provided
+at each working mode to promote responsible human-agent inter-
+actions (in section 3.2). We also provide insights on human PM
+role evolution with skills requirements in the agentic SPM era (in
+section 3.3). Our proposed vision will guide AI developers in devel-
+oping atrustworthyagentic PM to increase the level of acceptance
+and adoption. Current (human) PMs can gain an understanding
+of their role evolution and upskilling requirements needed to fa-
+cilitate better human-agent collaboration in the agentic SPM era.
+Furthermore, we provide a research agenda based on this vision (in
+section 5).
+2 Related Works
+2.1 Agentic AI
+The pubic launch of ChatGPT in November 2022 made revolu-
+tionary changes across multiple industries and sectors [36]. These
+GenAI tools are now evolving into AI Agents and Agentic AI [30, 36].
+AI agents are designed as an individual entity that automates a par-
+ticular tasks with own reasoning capabilities [22, 36, 40]. On the
+other hand, Agentic AI is evolving as a solution for the coordination
+overhead issues when working with single agents for multiple tasks.
+Agentic AI is considered a living system given its advanced and
+unique capabilities in achieving complex goals through autonomous
+decision making, proactive task execution with minimum human
+involvement, multi-agent coordination, and learning and adaptabil-
+ity [36, 40]. Researchers in the SE discipline have started exploring
+the possibility of agentic SE, a new era in SE supported by agentic
+teammates, with ongoing agentic AI trends in the software industry
+[19].
+2.2 Agentic SE
+A recent vision paper envision Software Engineering 3.0 (SE 3.0, also
+dubbed Agentic SE), a new era of SE, with agentic AI as teammates
+working collaboratively with humans in the software development
+[18]. They highlight the need for redefining the SE roles [18] and
+how humans collaborate with agentic teammates to reach maximum
+potential [40]. Agentic AI is not expected to replace existing roles
+but will require redefining those roles to have a clear understand-
+ing of synergy between human teammates and agentic teammates
+[18, 25], while keeping humans at the heart of the software devel-
+opment life cycle [1]. However, most of these current studies focus
+only on agentic AI in programming and testing [ 1, 19, 25]. SPM,
+must also evolve when restructuring the SDLC with agentic AI, as
+it facilitates successful project completion, while managing avail-
+able resources and constraints [1, 7, 19]. Recent Roadmap article
+presents SPM as one of the outer loop activities in SDLC that they
+expect continuation of human role assisted by AI rather than full
+automation [1]. Therefore, it is crucial to explore how SPM could
+evolve to support agentic SE and identify responsible human-agent
+interactions.
+2.3 Agentic AI and SPM
+Several studies have identified the potential of AI and GenAI tools
+to assist PMs in the automation of routine tasks such as SPM artifact
+creation [7, 12, 24], predictive analytics [7, 12], data-driven decision
+making [7, 12, 24], enhancing communication and collaboration
+[7], and better risk management [7, 12], supporting PMs in saving
+more time for strategic activities [7, 12, 24], and achieving project
+success [7, 12]. Software practitioners have started to perceive AI
+as an assistant or a copilot rather than a tool [7].
+A vision paper in 2023 (pre-GenAI) has proposed a vision ofaug-
+mented agilewith a conceptual“agile co-pilot”, a human-centered
+assistant in agile project management. They emphasize the need
+for having human-centered values embedded in AI tools and under-
+standing the roles of the human PM and AI assistant rather than
+using AI as a replacement for the human PM role [ 20]. Building
+upon this vision and considering emerging practitioner discussions,
+we recently proposed the idea of"agentic SPM"with evolving
+AI capabilities. Our review study focused on reporting the use of
+GenAI in SPM using practitioner literature. As a conclusion, we
+presented the idea of having AI agents as assistants to the human
+PM, proactively executing SPM tasks and decision making with
+some human oversight. We highlighted the need to expand on that
+vision further to identify practitioners’ perceptions towards agentic
+SPM, and task delegation between human PM and SPM agents to
+ensure ethical human-AI collaborations [7].
+Having SPM agents as"assistants"or"junior PMs"can support hu-
+man PM with saving time from routine tasks to focus on strategic
+tasks [7, 16, 22, 28]. It is also expected to facilitate data-driven
+decision making [ 16, 22], increases efficiency and productivity
+[7, 16, 22], and achieve project success [ 16, 22, 28]. In addition
+to those expected benefits, practitioners also discuss possible chal-
+lenges with agentic SPM such as privacy and ethics, accountability,
+trust, skills gap, and fear about job security [16]. Some sources also
+highlight the need for developing ethical AI systems and gover-
+nance frameworks given the increase in risks when increasing AI
+autonomy [9, 11, 22, 38]. A recent study has demonstrated that
+losing human control over an AI system could create a negative
+impact on the society [38]. Similarly, a recent IBM article also ex-
+plains that agentic AI could raise more risks and ethical concerns
+with increasing autonomy. They emphasize the importance of en-
+hancing human accountability and ethical oversight in addition to
+technological guardrails along with agentic AI evolution [9].
+In alignment to these discussions, a recent vision paper proposes
+autonomy levels for AI agents by identifying autonomy in AI agents
+as a“double-edged sword”that also causes concerns while providing
+the benefits [ 14]. They propose five autonomy levels with user
+involvement from the minimum level as“an observer”to higher
+user involvement as“an operator”. In that study, they propose more
+autonomy for the agent with just human monitoring under the
+"Level 5: User as an Observer". Then they propose"Level 4: User
+as an Approver", "Level 3: User as a Consultant", "Level 2: User as
+a Collaborator",and"Level 1: User as an Operator",which require
+more user involvement and the lowest autonomy for the agent.
+Along these levels, from level 5 to level 1, autonomy of the agent
+decreases while increasing the user involvement. They expect this
+model to guide future vision of agentic AI design and usage across
+Toward Agentic Software Project Management: A Vision and Roadmap
+various sectors. That would help promote responsible human-agent
+interactions, address concerns on ethics, accountability, trust, and
+fears of job security [14].
+Another recent study on multi-agent systems for scaled agile
+projects has raised concerns about coordination overhead when
+single AI agents augment individual tasks [11]. Studies recommend
+future visions to build around interconnected multi-agent systems
+which are more proactive in task management, suitable for complex
+goals and dynamic environments, capable of reasoning, learning,
+and adapting [2, 36] to facilitate the envisioned agentic SE evolution
+[1, 18, 19]. Therefore, in this paper, we extend our prior vision to
+accommodate such a multi-agent system beyond individual agents
+and introduce the idea of an"agentic project manager (PM)", an
+adaptable and ethical multi-agent system for SPM that works like
+an"intern PM"or a"junior PM".
+We also note the need for clearer task delegation between hu-
+man PM and agentic PM, along with defining appropriate levels of
+autonomy for each SPM task performed by agentic PM [19]. Such
+an understanding is crucial to promote appropriate trust and ac-
+ceptance of agentic PMs by humans [7]. In doing so, we expect the
+human PM to take the role of a"coach"who guides, supervises, and
+facilitates the team, including agentic teammates, towards success-
+ful project completion.
+3 Agentic SPM
+3.1 SPM with AI Roadmap
+How SPM will evolve with AI to facilitate agentic SE?
+SPM with AI Roadmapdemonstrates the evolution of SPM
+with AI and the possibility for an"Agentic SPM era (SPM 3.0)"
+having agentic PMs working under human control (Figure 1).
+We cannot still predict a fully autonomous SPM future given
+the human-centric nature of SPM and few studies focusing on
+SPM evolution with LLMs.
+SPM transitioned from (manual) human-led SPM era (SPM 1.0)
+that used whiteboards, pens and papers to tool-supported SPM era
+(SPM 1.5), where SPM tools such as Microsoft Project, cloud-based
+platforms like Jira, and Trello [6] came to facilitate SPM activities,
+even supporting agile practices [29]. With emerging AI capabilities,
+we then entered the AI-augmented SPM era (SPM 2.0), where AI
+became an assistant, or a co-pilot [ 7, 12, 20] in SPM. SPM tools
+started integrating AI (e.g., Rovo) to facilitate successful SPM [7].
+This evolution to SPM 2.0 is parallel to the AI-augmented SE (SE
+2.0) era in the SE evolution proposed by [18].
+In our recent review study, we concluded with a vision about
+AI agents for SPM tasks and the possibility for anagentic SPM
+era (SPM 3.0) [7]. Now, we extend our vision aligning with Agentic
+SE (SE 3.0) transformations in [ 18] and propose"agentic PM"
+as a multi-agent system to support the upcoming agentic SE era.
+Agentic PM can facilitate complex goals by perceiving the scenarios
+based on multiple data sources, make decisions, and manage tasks
+proactively once allowed to them by the human PM [ 2]. After
+executing the tasks, they can learn and adapt from the feedback of
+human PM and team members (Figure 2).
+https://www.atlassian.com/software/rovo
+Figure 1: SPM with AI Roadmap (following [18])
+Along this evolution, we notice an increase in AI autonomy
+while automating more SPM tasks and positioning the human PM
+as a"coach"who guides, supervises, and facilitates the team, in-
+cluding agentic teammates, towards successful project completion.
+Although [18] envision an autonomous SE (SE 4.0 and 5.0) era, we
+do not envision a fully autonomous SPM future or replacement of
+the human PM role now or in the near future. The human-centric
+nature of the PM role [ 1], strategic leadership, emotional intelli-
+gence, empathy, and ethical oversight crucial in SPM, still require
+the presence of a human PM. A recent article presents SPM as
+one of the outer loop activities in SDLC is expected to continue
+with human control assisted by AI rather than full automation
+[1]. The recentfuture of jobsreport by the World Economic Fo-
+rum also presents human-centric skills such as analytical thinking,
+creative thinking, agility, empathy, and active listening as core
+skills required in the future despite the AI evolutions [41]. Further-
+more, software management has been highlighted as one of the
+most under-researched activities in studies using Large Language
+Models (LLMs) for SE activities [21], suggesting much progress is
+needed before higher levels of AI autonomy can be expected in SPM.
+Therefore, we present our vision of an agentic PM as an assistant to
+human PM for SPM 3.0 era (in Section 3.2) with adaptable working
+modes and insights on human PM role evolution (in Section 3.3).
+3.2 Agentic PM for SPM 3.0
+How should an ethical multi-agent project management
+assistant be designed and used while balancing auton-
+omy?
+Agentic PMis an ethical, multi-agent PM assistant that can
+perceivethe tasks at hand using multiple data sources,make
+decisions, andtake actionsbased on the assigned working
+mode (Figure 2). We propose fourworking modes(guided AI-
+autonomy mode, supervised-AI mode, Human-AI collaborative
+mode, and AI-assisted mode)to determine the autonomy level
+of the agentic PM based on task complexity and risk level.
+(Figure 3). Agentic PM can alsolearn and adaptfrom human
+feedback.
+Assalaarachchi et al.
+Our proposed agentic PM (multi-agent system) is expected to
+act as a“junior PM”or an“intern PM”on multiple SPM tasks col-
+laboratively with the human PM and team members (human and
+agentic) represented in Figure 2.
+Figure 2: Agentic PM as an assistant to human PM
+The agentic PM will be composed of multiple sub-agents work-
+ing on specialized tasks and a coordinating agent that centrally
+coordinate all sub-agents, and communications between sub-agents
+and with humans. The agentic PM willperceivethe tasks at hand
+using multiple data sources related to the scenario, and the assigned
+working mode. Then the coordinating agent candecideby analyzing
+data and assign the tasks with the working mode to specialized sub-
+agent(s) totake actionsbased on the assigned working mode. Once
+sub-agent executed the task, outcomes will be returned back to the
+coordinating agent. Human PM and the team members can then
+review those outcomes, approve/reject them, and provide feedback
+for the agentic PM tolearn and adapt. Human PM can also termi-
+nate the actions at anytime if needed via the coordinating agent.
+The coordinating agent will then communicate the decision and
+the feedback with the particular sub-agent to execute that action
+and learn for future actions. The agentic PM will include a central
+database to store all the outcomes, feedback, decisions, and related
+logs for governance and learning purposes.
+The four main capabilities of the agentic PM are described below.
+3.2.1Perceive.Agentic PM will first understand the assigned
+task and working mode by gathering information from multiple
+input sources such as SPM tools (e.g., Jira, Microsoft Project, Trello),
+documents (e.g., project plans, reports, software requirements speci-
+fication), emails, user activities, databases, other agentic teammates,
+and online resources related to the scenario. However, we expect hu-
+man PM to review and adhere to relevant national, organizational,
+or stakeholders’ guidelines on data sharing and privacy when con-
+necting the agentic PM with such data sources. This could minimize
+the ethical and data privacy concerns [7].
+We adapt the concept of varying autonomy levels for AI agents
+proposed in [14] to our context of the agentic PM and proposefour
+working modes, providing an opportunity for human PM to change
+the autonomy of the agentic PM considering the task complexity
+and risk level (Figure 3). Complexity or difficulty of a task refers to
+the capability of human or agent to meet the specific requirements
+needed to perform a task (e.g., creativity, expertise knowledge,
+social skills, effort). Risk can be identified as the uncertainty of
+the outcomes associated with delegating the task and their impact
+which create the need for accountability towards the outcome. This
+will minimize the risks associated with giving full autonomy to
+an agentic teammate [14, 38] and align with the vision of keeping
+human control as suggested in [19]. This would be similar to how
+we select different modes in LLMs (e.g., deep research mode in
+OpenAI for writing report) based on the nature of the task.
+(1) In theguided AI-autonomy mode(
+ ), the agentic PM can
+perform tasks with a higher autonomy but require human PM
+review upon final outcomes. We suggest less complex, and low
+risk tasks for this mode (e.g., meeting note taking, reminders).
+Human PM is accountable for carefully assessing the potential
+risks before assigning this working mode. This is somewhat
+similar to the idea of"Level 4: User as an approver"proposed by
+[14]. The human PM must provide detail instructions first and
+review the outcomes to approve or reject and provide feedback
+for the agentic PM to learn and adapt. Currently, we have AI
+meeting assistants such as Otter.ai, Fireflies, and AI integrations
+in video conferencing platforms such as Zoom and Microsoft
+Teams for meeting note taking. Although these AI meeting
+assistants can enhance the efficiency and productivity of PMs,
+possibility for concerns about data accuracy, misinterpretation,
+and ethical concerns such as data privacy have been reported
+[34, 37, 39]. Given the possibility for similar concerns in the
+agentic PM, we propose a guided AI-autonomy mode rather
+than a full autonomy level suggested in"Level 5: User as an
+observer"of [ 14]. The human PM oversight is encouraged for all
+outcomes, rather than over relying on the agentic PM [37, 39].
+(2) In thesupervised-AI mode(
+ ), we expect the human PM
+to provide the overview and expectations of the tasks to the
+agentic PM, and then the agentic PM could make drafts or pre-
+pare for the task (e.g., draft emails, reports). The agentic PM
+will consult the human PM time-to-time for feedback and fully
+execute the task once the human PM approve the modifications
+(e.g., sending finalized email or reports to stakeholders). This
+mode is proposed with reference to the"Level 3: User as a Con-
+sultant"autonomy level suggested by [ 14]. We can consider the
+deep research mode in OpenAI and Google Gemini as some
+related current examples [14] that still need human oversight to
+review and modify those drafts to avoid hallucinations, include
+any organizational or project-specific information missed in the
+drafts, and to avoid data privacy concerns [7].
+(3) Human-AI Collaborative mode(
+ ) will be suitable for tasks
+that require collaborative inputs from the whole team such as
+sprint planning, effort estimation, retrospectives, etc. Human
+Toward Agentic Software Project Management: A Vision and Roadmap
+PM and team members (both human and agentic) should interact
+with the agentic PM only as another collaborator supporting
+with data analysis and insights, while avoiding over reliance
+[7]. Preliminary work in this area is already being done for
+agile effort estimation [10]. This working mode aligns with the
+autonomy"Level 2: User as a collaborator"proposed by [14].
+(4) We suggest usingAI-Assisted mode(
+ ) when working with
+complex and strategic tasks such as project planning (wider
+impact upon whole project), negotiating, and mentoring which
+require more critical thinking and human-centric skills. Human
+PM needs to lead all activities under this mode, and the agentic
+PM works only as an assistant to data analysis and provide
+suggestions once requested by human PM. Through a global
+survey among PMs across various sectors, a recent PMI report
+also presents stakeholder management, project communication
+and project budgeting as the top three areas that have the lowest
+AI impact [33]. This working mode is suggested based on the
+"Level 1: User as an operator"autonomy level proposed by [ 14].
+Rovo, Microsoft Copilot, ChatGPT, Gemini are some current
+examples that works in a manner, which provide outcomes
+when users prompted them to. Still human PM needs to carefully
+review the agentic PM’s outcomes to avoid hallucinations and
+analyses practical applicability of those suggestions.
+Table 1 presents some examples of how an agentic PM is ex-
+pected to work in each working mode, their success condition(s),
+anticipated risks requiring human PM oversight, existing examples,
+and their reported ethical incidents.
+Human PM can assign the suitable working mode by carefully
+assessing task complexity and risk associated with the assigned au-
+tonomy. In our preliminary vision, we consider these two common
+task-specific factors to provide a sample illustration to guide human
+PMs on mapping SPM tasks to suitable working mode (Figure 3).
+Human PM involvement should increase with the task complex-
+ity and risk level while reducing the autonomy of the agentic PM
+as proposed in [14]. However, accountability for outcomes in all
+working modes should remain with the human PM as the ultimate
+decision maker and an ethical leader. This also supports the"whole
+of process"vision and theprinciple of ethical alignmentfor Agentic
+SE introduced in [19], in which all actions should be designed with
+ethics in mind and ultimately remain under human control. Also,
+our proposed agentic PM vision with the above four working modes
+supports the idea that activities such as SPM would stay under hu-
+man control, assisted by AI, rather than full automation [ 1, 26].
+Therefore, we introduce only four working modes by adapting the
+autonomy level 1 to level 4 and excluding a fully autonomous mode
+like level 5 in [14] for our agentic PM vision.
+3.2.2Decide.The coordinating agent can analyse the task as-
+signed, working mode, input sources, and similar past assignments
+to decide on the suitable task-specialized sub-agent(s) to assign the
+Note that some SPM tasks could be mapped to more than one working mode depending
+on the scenario (e.g., We state project planning as a suitable task under AI-assisted mode
+considering the high complexity, high risk, and need for more critical thinking required
+in most scenarios. But in some cases (e.g., small project with simple requirements),
+could assign Human-AI collaborative mode to the agentic PM in project planning). We
+present a preliminary vision to guide human PMs on ethical human-agent interactions
+with example scenarios which human PMs can adjust suited to the particular scenario.
+Figure 3: Sample illustration of SPM task mapping to working
+modes in the agentic PM based on task complexity and risk
+task. It will then communicate the task, working mode, and other
+information with that specific sub-agent to take actions.
+3.2.3Take Actions.Task-specialized sub-agents can then take
+actions allocated to them by the coordinating agent. Agents needs
+to consider the working mode since they will not take action alone
+by themselves in most working modes. They require approval or
+review of the human PM and team members in most modes. We
+suggest multiple interconnected task-specialized agents within the
+agentic PM system to perform several tasks based on the working
+mode assigned by the human PM(e.g., planning agent, email agent,
+meeting note agent, risk analysis agent, tasks management agent,
+etc.). These sub-agents can communicate with each other via the
+coordinating agent and the coordinating agent can escalate any
+issues or conflicts among agents to human PM for their review and
+decision.
+3.2.4Learn and adapt.Humans will have the capability to pro-
+vide feedback to the agentic PM so it can learn and adapt in the
+next iterations. The agentic PM will have a central database to
+maintain logs on outcomes and feedback for future applications
+using reinforcement learning capability. This will be similar to how
+a human intern learns from PM’s supervision and team members’
+feedback. Humans can also provide feedback on outcomes’ ethical
+compliance, enabling agentic PM to learn and minimize such issues
+in the next iterations.
+Our proposed vision of an agentic PM with adaptable working
+modes can guide AI developers to create ethical agentic PMs and
+their users on responsible human-AI collaborations. It will also
+help in addressing the concerns such as clear task delegation, ac-
+countability, trust, and fear of job security that leads human PMs
+to accept and adopt agentic PMs to work together with them.
+Assalaarachchi et al.
+Table 1: Examples for Agentic PM tasks performed in each working mode, their success condition(s), anticipated risks requiring
+human PM oversight, Existing Examples, and their reported ethical incidents
+Working
+Mode
+Agentic PM
+task Success condition(s) Anticipated risks (requiring Human
+PM oversight)
+Existing
+example(s)
+Ethical incident associated with existing
+examples
+Guided
+AI-Autonomy
+Mode (
+ )
+Meeting notes
+taking
+Autonomously initiates
+meeting notes taking and
+shares with all attendees
+post meeting
+• Notes could include inaccuracies,
+wrong inferences, private, confiden-
+tial or sensitive information that was
+not meant to be shared in written
+form
+• Sharing meeting note with wrong
+stakeholders or missing some atten-
+dees when sharing
+Otter.ai,
+Fireflies,
+Granola, etc.
+[34]
+Leakage of information from a confidential
+company discussion with unintended parties
+by Otter.ai after a Zoom meeting, leading to
+cancellation of business deals [4]
+Supervised-
+AI Mode (
+ )
+SPM
+document
+creation
+Create SPM documents for
+presentations and sharing
+with stakeholders
+• Missing important information
+within the document
+• Documents might include inaccura-
+cies, wrong inferences, private, confi-
+dential or sensitive information that
+was not meant to be shared in written
+form
+Deep research
+mode in
+OpenAI,
+Google
+Gemini,
+Perplexity etc.
+[14]
+Two US judges have admitted the use of
+ChatGPT and Perplexity in drafting court
+filings that included fabricated court cases.
+Those court filings were subjected to judicial
+inquiry and retracted due to erroneous data
+[5], Deloitte refunding $440,000 worth
+consultancy fee to Australian government
+due to errors, and fabricated references in
+the report generated using Azure OpenAI
+GPT-4o [32]
+Human-AI
+Collaborative
+Mode (
+ )
+Sprint
+Planning
+Analyses user stories, past
+project data and suggest
+possible user stories for the
+next sprint and story point
+estimations
+• Privacy concerns when sharing con-
+fidential project data
+• Inaccuracies in suggestions when ig-
+nored human aspects such as team
+dynamics, skills, and workload
+Rovo [8]
+Bui et al. [10] introduce Software Effort
+Estimation Agent (SEEAgent) that provide
+justifications for the estimations to avoid
+hallucinations in general LLMs and consider
+human values crucial for tasks like effort
+estimation and sprint planning (also
+suggested in [7, 20]
+AI-Assisted
+Mode (
+ )
+Project
+Planning
+Analyse data related to
+project and provide insights
+in project planning
+• Privacy concerns when sharing
+project-specific or client-related
+details
+• Generate some inaccurate or unreal-
+istic suggestions
+Rovo [8],
+GenAI tools
+like Microsoft
+Copilot,
+ChatGPT etc.
+Google AI reported to produce inaccurate or
+harmful suggestions (e.g., presenting Barack
+Obama as the first Muslim U.S. President,
+glue as an ingredient for pizza) [3]
+3.3 Human PM role evolution with Agentic SPM
+How should the human PM role evolve to facilitate re-
+sponsible human-agent interactions?
+Human PMs must upskill themselves and evolve their role
+into an"ethical and strategic leader", or a“coach”who
+guides, supervises, and facilitates the team, including agentic
+teammates, towards successful project completion.
+Emerging literature suggests the need to redefine SE roles with
+the evolution of agentic AI in SE [18, 19, 35]. Similarly, we envision
+changes to the traditional role of the software PM when having
+an agentic PM as an assistant. In our proposed vision of agentic
+PM, we rely on the idea that human-AI collaboration is crucial
+for successful project completion while keeping all actions under
+human control [19]. Hence, the human PM role will not be replaced,
+but rather augmented and assisted by agentic PMs as suggested
+earlier [20]. We propose an agentic PM as a junior PM or an intern
+PM working together with the development team (human and
+agentic teammates) and the human PM rather. This requires the
+human PM to facilitate not just human team members but also
+agentic PMs. Cognitive tasks such asproject planning, strategic
+decision making, stakeholder management, and negotiationsrely
+on the human PM, who can be assisted by the agentic PM’s data
+analysis and insights [16, 33]. To align with the principles ofethics-
+by-designandhuman, agentic, and socio-technical aspects[ 19], the
+human PM will be responsible for maintainingethical oversightand
+improvinghuman-agent collaborationsto get the full potential of
+agentic PM responsibly.
+With this expected shift, human PMs will need to master essen-
+tial skills for responsible human-agent collaboration and strategic
+leadership. A recent practitioner discussion present the skills gap
+as a challenge that emerges agentic AI evolution [16]. Through a
+review of similar literature [7, 19, 35, 40] and practitioner insights
+[16, 33, 41], we recommend human PMs enhancing skills such as:
+• Data interpretation -Review and interpret outcomes from
+agentic PM, who works mostly on data analysis and suggestions.
+• Ethical oversight -Ethics and data privacy knowledge to re-
+view agentic PM’s outcomes and continuously monitor the agen-
+tic PM for ethical compliance [9]. Human PMs must adhere to
+national, organizational and stakeholder ethical guidelines [7].
+• Critical thinking -The human PM acts as the ultimate decision
+maker for most non-trivial SPM tasks and requires critical think-
+ing to make strategic decisions. Human PM should also critically
+evaluate the risks of different SPM tasks before assigning the
+suitable working mode for the agentic PM.
+• Interpersonal skills -Skills such as emotional intelligence [27],
+empathy [17], strategic leadership, and communication remain
+Toward Agentic Software Project Management: A Vision and Roadmap
+crucial for human PM in stakeholder management, negotiations,
+and conflict resolutions.
+Human PMs must upskill themselves and evolve their role into a
+“coach”who guides, supervises, and facilitates the team, including
+agentic teammates, towards successful project completion.
+4 Limitations and Future Work
+We acknowledge the limitation of this study as a preliminary vi-
+sion without empirical evidences. We present this vision paper
+as a foundation for research on agentic AI and SPM to facilitate
+emerging agentic SE visions. Given the emerging nature of litera-
+ture on agentic AI in SE and SPM domains, where most literature
+are yet pre-prints or vision papers, we plan to validate our vision
+empirically and fill the research gaps. We also acknowledge that
+our preliminary vision is limited to two task-specific factors (com-
+plexity and risk) when introducing a sample illustration of SPM
+task mapping to suitable working mode.
+As a next step, we will conduct a survey to understand the practi-
+tioners’ perceptions towards the agentic SPM vision and the agentic
+PM with adaptable working modes. It will allow us to map the work-
+ing modes to suitable SPM tasks and identify the factors influencing
+the task delegation decision to the agentic PM through empirical
+evidences. Based on the findings from the survey and follow-up in-
+terviews, we will develop a prototype of this agentic PM which we
+can later experiment with a software development team for valida-
+tion. We expect to provide guidelines on responsible human-agent
+interactions based on those experiments. We also plan to explore
+practitioners’ perceptions on expected human PM role changes and
+upskilling requirements with this SPM evolution.
+5 A Research Agenda
+In addition to our empirical studies exploring parts of this prelimi-
+nary vision, we present the following as future research opportuni-
+ties for researchers in agentic SE and agentic SPM domains.
+• Factors affecting the acceptance of agentic PMs- It is recom-
+mended to explore factors that support the adoption of agentic
+PMs to promote them to achieve project success. It is also cru-
+cial to understand the barriers for adoption and strategies to
+overcome them. This can lead to the successful implementation
+of agentic PMs while avoiding negative returns on investments
+[15]. It is also encouraged to explore organizational strategies
+to create awareness about agentic AI among employees, de-
+velop guidelines on responsible human-agent interactions, and
+facilitate necessary ethical or data security mechanisms.
+• Software team members’ perceptions towards having an
+agentic PM- Future research can explore team members’ per-
+spectives and experiences about agentic PMs in their team and
+how team members would collaborate with agentic PMs. It can
+also be expanded to explore collaborations between the agentic
+PM and other agentic teammates (multi-agentic SE teams) given
+the emerging research on agentic SE teammates [18, 25].
+• Exploring the applicability of agentic PMs in agile method-
+ologies- Since our preliminary vision is not based on a par-
+ticular SPM methodology, future researchers can explore the
+applicability of agentic PMs in popular agile methodologies such
+as Scrum [13], using case studies with scrum teams. Since our
+proposed agentic PM vision also support agile values such as
+learning and adaptability, we recommend future empirical stud-
+ies to validate or build upon our vision to have agentic PMs in
+agile team.
+• Guidelines on responsible agentic PM development and
+usage- With the evolution of agentic AI in SE, it is crucial to de-
+velop responsible agentic AI design and usage guidelines [9, 19].
+We provide the foundation by introducing various autonomy
+modes for different tasks, and responsible human-agent inter-
+actions in our agentic PM vision, which future researchers can
+build upon and develop guidelines to support working with agen-
+tic teammates. We also present the need for human oversight to
+ensure ethical compliance when working with an agentic PM,
+which can be further validated and explored in future studies
+with practitioner experiences.
+• Impact of agentic PMs on the early career PM roles- We
+note the need for exploring the impact of agentic PMs on early
+career PM roles (interns/junior PMs) since the agentic PM is
+supposed to act in a similar role within the software team. There-
+fore, it is crucial to identify how early career PM roles should
+be redefined with new responsibilities and skills.
+• SPM education restructuring- SPM education needs to be
+restructured, including agentic AI in curricula and evaluations
+based on skills required for the agentic SPM era. Aligning with
+the idea of building awareness about agentic AI through educa-
+tion, which is presented in [19], future research can be carried
+out on restructuring SPM education involving both practitioners
+and academics.
+6 Conclusion
+Emerging literature envision agentic SE (SE 3.0) era [18], creating
+a need for transforming aspects of SDLC, like SPM, to facilitate
+agentic SE era [ 19]. Therefore in this vision paper, we build the
+foundation by introducing"SPM with AI Roadmap"to present
+evolution of SPM into agentic SPM (SPM 3.0) era supporting the
+vision of [18]. We build upon our prior vision of having AI agents for
+SPM tasks [7], and propose an ethical"agentic PM"along with four
+"working modes"that vary the autonomy of agentic PM for SPM
+tasks. These working modes provide guidance for human PMs in
+determining responsible human-agent interactions and the need for
+ethical oversight over the agentic PM’s outcomes. We cannot predict
+a full autonomous SPM future or a replacement of the human PM
+role given the human-centric nature and lack of empirical works
+about AI capabilities in SPM [1, 21]. Therefore, we envision human
+PM to evolve their role to become anethical and strategic leaderor a
+coachwith this SPM evolution. We present upskilling requirements
+for human PMs to support that role evolution.
+Our proposed vision will guide AI developers in developing a
+trustworthyagentic PMs and current (human) PMs on responsible
+human-agent interactions, possible role evolution, and upskilling
+requirements needed for the agentic SPM era. Since our study is
+limited to a preliminary vision from emerging literature, we invite
+future researchers in agentic SPM and agentic SE domains to carry
+out more empirical studies and build upon the vision as suggest in
+the research agenda (in section 5).
+Assalaarachchi et al.
+References
+[1] Silvia Abrahão, John Grundy, Mauro Pezzè, Margaret-Anne Storey, and Damian A.
+Tamburri. 2025. Software Engineering by and for Humans in an AI Era.ACM
+Transactions on Software Engineering and Methodology34, 5 (jun 2025), 1–46.
+doi:10.1145/3715111
+[2] Deepak Bhaskar Acharya, Karthigeyan Kuppan, and B. Divya. 2025. Agentic AI:
+Autonomous Intelligence for Complex Goals—A Comprehensive Survey.IEEE
+Access13 (2025), 18912–18936. doi:10.1109/ACCESS.2025.3532853
+[3] AI Incident Database. 2024. Incident 693: Google AI Reportedly Delivering
+Confidently Incorrect and Harmful Information. https://incidentdatabase.ai/
+cite/693/
+[4] AI Incident Database. 2024. Incident 811: AI-Powered Transcription Services
+Allegedly Leak Confidential Workplace Discussions. https://incidentdatabase.
+ai/cite/811/
+[5] AI Incident Database. 2025. Incident 1252: Judges in New Jersey and Mis-
+sissippi Admit AI Tools Produced Erroneous Federal Court Filings. https:
+//incidentdatabase.ai/cite/1252/
+[6] L. I. Assalaarachchi, M. P. P. Liyanage, and C. Hewagamage. 2025. A framework
+of critical success factors of cloud based project management software adoption.
+International Journal of Information Systems and Project Management13, 2 (apr
+2025), 1–20. doi:10.12821/ijispm130204
+[7] Lakshana Iruni Assalaarachchi, Zainab Masood, Rashina Hoda, and John Grundy.
+2025. Generative AI for Software Project Management: Insights from a Review
+of Software Practitioner Literature.IEEE Software(2025), 1–8. doi:10.1109/MS.
+2025.3619936 (Early Access).
+[8] Atlassian. 2025. Bring the power of human and AI collaboration to every team.
+https://www.atlassian.com/software/rovo/features
+[9] Phaedra Boinodiris and Jon Parker. 2025. The evolving ethics and gover-
+nance landscape of agentic AI. https://www.ibm.com/think/insights/ethics-
+governance-agentic-ai
+[10] Thanh-Long Bui, Hoa Khanh Dam, and Rashina Hoda. 2025. An LLM-based
+multi-agent framework for agile effort estimation. arXiv:2509.14483 http://arxiv.
+org/abs/2509.14483 (Presented at 40th IEEE/ACM International Conference on
+Automated Software Engineering).
+[11] Konrad Cinkusz, Jarosław A Chudziak, and Ewa Niewiadomska-Szynkiewicz.
+2025. Cognitive Agents Powered by Large Language Models for Agile
+Software Project Management.Electronics14, 1 (2025), 1–33. doi:10.3390/
+electronics14010087
+[12] Hoa Khanh Dam, Truyen Tran, John Grundy, Aditya Ghose, and Yasutaka Kamei.
+2019. Towards effective AI-powered agile project management. InProceedings of
+the 41st International Conference on Software Engineering: New Ideas and Emerging
+Results (ICSE-NIER ’19). IEEE Press, Piscataway, NJ, USA, 41–44. doi:10.1109/ICSE-
+NIER.2019.00019
+[13] Digital.ai. 2024.17th State of Agile Report. Technical Report. Digi-
+tal.ai. https://info.digital.ai/rs/981-LQX-968/images/RE-SA-17th-Annual-State-
+Of-Agile-Report.pdf
+[14] K. J. Kevin Feng, David W. McDonald, and Amy X. Zhang. 2025. Levels of
+Autonomy for AI Agents. arXiv:2506.12469 http://arxiv.org/abs/2506.12469
+[15] Gartner. 2025. Gartner Predicts Over 40% of Agentic AI Projects Will Be
+Canceled by End of 2027. https://www.gartner.com/en/newsroom/press-
+releases/2025-06-25-gartner-predicts-over-40-percent-of-agentic-ai-projects-
+will-be-canceled-by-end-of-2027
+[16] Brandes Gress. 2025. AI agents in project management: The new force behind
+high-performing teams. https://www.wrike.com/blog/ai-agents-in-project-
+management/
+[17] Hashini Gunatilake, John Grundy, Rashina Hoda, and Ingo Mueller. 2025. The
+Role of Empathy in Software Engineering - A Socio-Technical Grounded Theory.
+ACM Trans. Softw. Eng. Methodol.(Sept. 2025). doi:10.1145/3768315 Just Accepted.
+[18] Ahmed E. Hassan, Hao Li, Dayi Lin, Bram Adams, Tse-Hsun Chen, Yutaro
+Kashiwa, and Dong Qiu. 2025. Agentic Software Engineering: Foundational
+Pillars and a Research Roadmap. arXiv:2509.06216 http://arxiv.org/abs/2509.
+06216
+[19] Rashina Hoda. 2025. Toward Agentic Software Engineering Beyond Code:
+Framing Vision, Values, and Vocabulary. arXiv:2510.19692 [cs.SE] https:
+//arxiv.org/abs/2510.19692 (Accepted for AGENT Workshop at ICSE2026).
+[20] Rashina Hoda, Hoa Dam, Chakkrit Tantithamthavorn, Patanamon Thongta-
+nunam, and Margaret-Anne Storey. 2023. Augmented Agile: Human-Centered
+AI-Assisted Software Management.IEEE Software40, 4 (jul 2023), 106–109.
+doi:10.1109/MS.2023.3268725
+[21] Xinyi Hou, Yanjie Zhao, Yue Liu, Zhou Yang, Kailong Wang, Li Li, Xiapu Luo,
+David Lo, John Grundy, and Haoyu Wang. 2024. Large Language Models for
+Software Engineering: A Systematic Literature Review.Transactions on Software
+Engineering and Methodology33, 8, Article 220 (Dec. 2024), 79 pages. doi:10.
+1145/3695988
+[22] Laurie Hughes, Yogesh K. Dwivedi, Keyao Li, Mandanna Appanderanda,
+Mousa Ahmad Al-Bashrawi, and Inyoung Chae. 2025. AI Agents and Agentic Sys-
+tems: Redefining Global it Management.Journal of Global Information Technology
+Management28, 3 (jul 2025), 175–185. doi:10.1080/1097198X.2025.2524286
+[23] Emre Karatas. 2025. How the Agentic Approach Will Revolutionize Software En-
+gineering. https://medium.com/@emrekaratas-ai/how-the-agentic-approach-
+will-revolutionize-software-engineering-aea3b46e76b7
+[24] Benjamin Kardum and Željka Car. 2025. Exploring Stakeholders’ Perspectives
+on the Impact of Generative AI on IT Project Management Roles. In2025 MIPRO
+48th ICT and Electronics Convention. IEEE, 1862–1867. doi:10.1109/MIPRO65660.
+2025.11132036
+[25] Hao Li, Haoxiang Zhang, and Ahmed E. Hassan. 2025. The Rise of AI Teammates
+in Software Engineering (SE) 3.0: How Autonomous Coding Agents Are Reshap-
+ing Software Engineering. arXiv:2507.15003 http://arxiv.org/abs/2507.15003
+[26] Brian Lubars and Chenhao Tan. 2019. Ask not what AI can do, but what AI should
+do: towards a framework of task delegability. InProceedings of the 33rd Interna-
+tional Conference on Neural Information Processing Systems. Curran Associates
+Inc., Red Hook, NY, USA, Article 6, 11 pages.
+[27] Kashumi Madampe, Rashina Hoda, and John Grundy. 2023. The Emotional Roller
+Coaster of Responding to Requirements Changes in Software Engineering.IEEE
+Transactions on Software Engineering49, 3 (2023), 1171–1187. doi:10.1109/TSE.
+2022.3172925
+[28] Adnan Masood. 2025. AI in Project Management — How Generative and
+Agentic AI Are Redefining Strategy, Execution, and Value Delivery. https:
+//medium.com/@adnanmasood/ai-in-project-management-how-generative-
+and-agentic-ai-are-redefining-strategy-execution-and-ccfd45229e7b
+[29] Michał. 2025. The Evolution of Project Management Tools: From Gantt Charts
+to AI-Powered Platforms. https://future-code.dev/en/blog/the-evolution-of-
+project-management-tools/
+[30] Brunella Mori. 2025. Agentic AI in Project Management: The Future of
+Smart Decision-Making. https://www.linkedin.com/pulse/agentic-ai-project-
+management-future-smart-brunella-mori-zg8tc/
+[31] MIT NANDA. 2025.The GenAI Divide: State of AI in Business 2025. Technical Re-
+port. MIT. https://mlq.ai/media/quarterly_decks/v0.1_State_of_AI_in_Business_
+2025_Report.pdf
+[32] NDTV World. 2025. Deloitte’s AI Fallout Explained: The $440,000 Report That
+Backfired. https://www.ndtv.com/world-news/deloittes-ai-fallout-explained-
+the-440-000-report-that-backfired-9417098
+[33] Marly Nilsson. 2025. The AI in Project Management Global Report: 1 Year Later,
+2025 and Beyond. https://www.projectmanagement.com/articles/1049056/the-
+ai-in-project-management-global-report--1-year-later--2025-and-beyond#_
+[34] Miguel Rebelo. 2025. The 9 best AI meeting assistants in 2025. https://zapier.
+com/blog/best-ai-meeting-assistant/
+[35] Abhik Roychoudhury, Corina Pasareanu, Michael Pradel, and Baishakhi Ray.
+2025. Agentic AI Software Engineers: Programming with Trust. arXiv:2502.13767
+http://arxiv.org/abs/2502.13767
+[36] Ranjan Sapkota, Konstantinos I. Roumeliotis, and Manoj Karkee. 2026. AI Agents
+vs. Agentic AI: A Conceptual taxonomy, applications and challenges.Information
+Fusion126 (feb 2026), 103599. doi:10.1016/j.inffus.2025.103599
+[37] Simpson Grierson. 2025. Directors take note: the legal pitfalls of AI in the
+boardroom. https://www.simpsongrierson.com/insights-news/legal-updates/
+directors-take-note-the-legal-pitfalls-of-ai-in-the-boardroom
+[38] Simone Spiegler, Rashina Hoda, and Aastha Pant. 2026. Images of AI: How AI
+practitioners view the impact of Artificial Intelligence on society, now and in the
+future.Technology in Society84 (2026), 103109. doi:10.1016/j.techsoc.2025.103109
+[39] Melissa Taylormoore and Mark Cohen, Joel M.Davies. 2025. When
+every word is recorded: AI meeting tools and the new governance
+risks. https://www.whitecase.com/insight-alert/when-every-word-recorded-ai-
+meeting-tools-and-new-governance-risks
+[40] Jules White. 2024. Building Living Software Systems with Generative & Agentic
+AI. arXiv:2408.01768 https://arxiv.org/abs/2408.01768
+[41] World Economic Forum. 2025.Future of Jobs Report. Technical Report. World
+Economic Forum. https://www.weforum.org/reports/the-future-ofjobs-report-
+2025/

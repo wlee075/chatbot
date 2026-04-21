@@ -117,38 +117,65 @@ def route_after_confirmation(state: PRDState) -> str:
     return "await_answer"
 
 
+def route_after_numeric_validation(state: PRDState) -> str:
+    if state.get("validation_flag"):
+        return "handle_numeric_error"
+    return "intent_classifier"
+
 def route_after_answer(state: PRDState) -> str:
     """
-    Standard events (ANSWER, REPLY_TO_MESSAGE) → enter echo/confirmation gate.
+    Standard events (ANSWER, REPLY_TO_MESSAGE) → enter numeric check gate.
     Tagged events (TAG_MESSAGE_AS_TRUTH, CORRECT_MESSAGE) → handle directly,
-      bypassing the echo gate since the UI already identified the exact message.
+      bypassing the validation gate since the UI already identified the exact message.
     """
     event_type = state.get("pending_event", {}).get("event_type", "ANSWER")
     if event_type in ("TAG_MESSAGE_AS_TRUTH", "CORRECT_MESSAGE"):
         return "handle_tagged_event"
-    return "interpret_and_echo"
+    return "numeric_validation"
 
 
-def route_after_echo(state: PRDState) -> str:
-    """
-    Route based on intent extracted during the interpretation phase.
-    If the user asked to clarify a term, answer directly without impacting facts.
-    """
+def route_after_intent(state: PRDState) -> str:
     reply_intent = state.get("reply_intent")
-    if reply_intent == "CLARIFICATION_REQUEST":
+    if reply_intent in ("DIRECT_CLARIFICATION_QUESTION", "UNCLEAR_META"):
         route = "answer_clarification"
+    elif reply_intent in ("REPHRASE_REQUEST", "AMBIGUOUS"):
+        route = "rephrase_question"
+    elif reply_intent in ("REPETITION_COMPLAINT", "COMPLAINT_OR_META"):
+        route = "repair_repeated_question"
+    elif reply_intent == "NUMERIC_ERROR":
+        route = "handle_numeric_error"
     else:
-        route = "detect_impact"
+        route = "option_resolution"
         
     log_event(
         thread_id=state.get("thread_id", ""),
         run_id=state.get("run_id", ""),
-        node_name="route_after_echo",
+        node_name="route_after_intent",
         level="INFO",
-        event_type="clarification_route_taken",
-        message=f"Routing after echo: {reply_intent} → {route}",
-        from_node="interpret_and_echo",
-        to_node=route,
-        reason=reply_intent
+        event_type="route_after_intent_decision",
+        message=f"Routing after intent: {reply_intent} → {route}",
+        reply_intent=reply_intent,
+        chosen_route=route,
+        reason=reply_intent,
+        response_mode=state.get("response_mode", "")
     )
     return route
+
+def route_after_contradiction(state: PRDState) -> str:
+    if state.get("has_conflicts"):
+        route = "generate_questions" 
+    else:
+        route = "truth_commit"
+        
+    log_event(
+        thread_id=state.get("thread_id", ""),
+        run_id=state.get("run_id", ""),
+        node_name="route_after_contradiction",
+        level="INFO",
+        event_type="contradiction_route_taken",
+        message=f"Routing after contradiction: conflicts? {state.get('has_conflicts')} → {route}",
+        from_node="contradiction_validator",
+        to_node=route
+    )
+    return route
+

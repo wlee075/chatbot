@@ -15,6 +15,11 @@ from langgraph.types import Command
 from config.sections import PRD_SECTIONS
 from graph.builder import build_graph
 from prompts.templates import DEFAULT_MAX_SECTION_ITERATIONS
+import warnings
+
+# Suppress Checkpointer unregistered type warnings for previous Enum states inside old SQLite streams
+warnings.filterwarnings("ignore", message=".*Deserializing unregistered type graph.nodes.ExtractionCandidateType.*")
+warnings.filterwarnings("ignore", message=".*Deserializing unregistered type graph.nodes.ProofStatus.*")
 
 load_dotenv()
 
@@ -38,34 +43,6 @@ for _k, _v in {
 
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
-
-# ── Inject citation link handler near the top ────────────────────────────────
-_CITATION_HANDLER_JS = """
-<script>
-(function() {
-  window._citationHandler = function(sourceId) {
-    const elem = document.getElementById(sourceId);
-    if (!elem) {
-      console.warn('Source', sourceId, 'not found');
-      return;
-    }
-    elem.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    const parent = elem.nextElementSibling;
-    if (parent) {
-      parent.style.transition = 'background-color 0.2s';
-      parent.style.backgroundColor = '#fffacd';
-      setTimeout(() => {
-        parent.style.backgroundColor = '';
-      }, 2500);
-    }
-  };
-})();
-</script>
-"""
-
-if "__citation_js_injected" not in st.session_state:
-    st.session_state["__citation_js_injected"] = True
-    st.markdown(_CITATION_HANDLER_JS, unsafe_allow_html=True)
 
 # ── Graph (cached once per process so MemorySaver persists across reruns) ─────
 @st.cache_resource
@@ -190,7 +167,7 @@ _PLACEHOLDER_CONTEXT_RE = re.compile(
 )
 
 _SOURCE_TAG_RE = re.compile(
-    r"\[SOURCE:\s*concept_key=([^,\]]+),\s*round=(\d+)\]",
+    r"\[SOURCE:\s*concept_key=([^,\]]+),\s*round=([^\]]+)\]",
     re.IGNORECASE,
 )
 
@@ -245,6 +222,11 @@ def _build_source_message_lookup(chat_history: list[dict], store: dict) -> dict[
 # ── Inject citation click handler + hover tooltip (once per session) ──────────────────────────
 _CITATION_HANDLER_JS = """
 <style>
+div[data-testid="stChatMessageContent"],
+div[data-testid="stMarkdownContainer"] {
+  overflow: visible !important;
+}
+
 .cite-chip {
   position: relative;
   display: inline-block;
@@ -260,40 +242,11 @@ _CITATION_HANDLER_JS = """
   background-color: #e8f0ff;
 }
 
-.cite-tooltip {
-  position: absolute;
-  bottom: 125%;
-  left: 50%;
-  transform: translateX(-50%);
-  background-color: #1a1a2e;
-  color: white;
-  padding: 12px 14px;
-  border-radius: 6px;
-  font-size: 0.85rem;
-  line-height: 1.5;
-  max-width: 280px;
-  white-space: pre-wrap;
-  word-wrap: break-word;
-  z-index: 10000;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 0.2s;
-  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-}
-
-.cite-tooltip::after {
-  content: '';
-  position: absolute;
-  top: 100%;
-  left: 50%;
-  transform: translateX(-50%);
-  border: 6px solid transparent;
-  border-top-color: #1a1a2e;
-}
-
-.cite-chip:hover .cite-tooltip {
-  opacity: 1;
-  pointer-events: auto;
+.cite-match {
+  background-color: rgba(255, 215, 0, 0.4);
+  border-bottom: 2px solid #ffd700;
+  padding: 0 1px;
+  border-radius: 2px;
 }
 </style>
 
@@ -318,6 +271,10 @@ _CITATION_HANDLER_JS = """
 })();
 </script>
 """
+
+if "__citation_js_injected" not in st.session_state:
+    st.session_state["__citation_js_injected"] = True
+    st.markdown(_CITATION_HANDLER_JS, unsafe_allow_html=True)
 
 def _present_content(content: str, source_lookup: dict[str, str] | None = None, answer_store: dict | None = None) -> str:
     """
@@ -652,8 +609,16 @@ def _stream_graph_resume(payload: dict | str) -> None:
 
     status_slot.empty()
     stream_slot.empty()
-    st.session_state.last_elapsed_ms = int((time.monotonic() - t0) * 1000)
+    turn_ms = int((time.monotonic() - t0) * 1000)
+    st.session_state.last_elapsed_ms = turn_ms
     st.session_state.last_node_timings_ms = node_durations_ms
+    
+    import logging
+    metrics_logger = logging.getLogger("orchestrator_metrics")
+    metrics_logger.info(f"TURN_LATENCY_MS: {turn_ms}")
+    for nd, dur in node_durations_ms.items():
+        metrics_logger.info(f"NODE_LATENCY_MS | {nd}: {dur}")
+        
     st.rerun()
 # Render
 # ══════════════════════════════════════════════════════════════════════════════
@@ -817,6 +782,9 @@ if st.session_state.graph_started:
     if current_turn["user"] or current_turn["assistant"]:
         turns.append(current_turn)
 
+    is_waiting = bool(gstate and gstate.next) and not sv.get("is_complete", False)
+    active_ref = st.session_state.get("active_reference")
+
     for turn in turns:
         # 1. Render User Message if any
         if turn["user"]:
@@ -853,11 +821,83 @@ if st.session_state.graph_started:
                     content = content.replace("I have all the details I need for this section. Let's move on.", "").strip()
 
                 # --- Render Logic ---
-                if msg_type in ("system", "elicit"):
-                    st.markdown(_present_content(content, source_lookup, confirmed_qa_store), unsafe_allow_html=True)
-                    _render_message_actions(msg_id, content, "assistant", msg_type)
+                if msg_type in ("system", "elicit", "clarification_answer"):
+                    content_segs = msg.get("content_segments")
+                    if content_segs:
+                        html_pieces = []
+                        citation_registry = {}  # key: (s_msg_id, snippet_html), val: citation_number
+                        sources_list = []
+                        cit_counter = 1
+
+                        for seg in content_segs:
+                            p = seg.get("provenance")
+                            if p:
+                                 d_time = p.get("source_display_time", "Earlier")
+                                 speaker = "User"
+                                 snippet_html = p.get("snippet_html", "")
+                                 s_msg_id = p.get("source_message_id", "")
+                                 status = p.get("proof_status", "EXACT_SURFACE")
+                                 
+                                 # Deduplicate sources
+                                 source_key = (s_msg_id, snippet_html)
+                                 if source_key not in citation_registry:
+                                     citation_registry[source_key] = cit_counter
+                                     # Clean up snippet text for flat rendering, wiping raw HTML first
+                                     if "<" in snippet_html and ">" in snippet_html:
+                                         import logging
+                                         logging.getLogger("orchestrator_metrics").warning(f"CITATION_DEFECT | HTML leak detected in snippet: {snippet_html}")
+                                     clean_snip = re.sub(r'<[^>]+>', '', snippet_html).replace('\n', ' ').strip()
+                                     clean_snip = html.escape(clean_snip)
+                                     if len(clean_snip) > 100: clean_snip = clean_snip[:97] + "..."
+                                     sources_list.append(f"<div style='font-size:0.85rem; color:#666; margin-bottom:4px;'><b>[{cit_counter}]</b> {speaker} &middot; {d_time} &mdash; <i>\"{clean_snip}\"</i></div>")
+                                     cit_counter += 1
+                                     
+                                 cit_num = citation_registry[source_key]
+
+                                 anchor_js = f"window._citationHandler('{s_msg_id}')" if s_msg_id and s_msg_id != "fact_store" else ""
+                                 onclick_html = f" onclick=\"{anchor_js}\"" if anchor_js else ""
+                                 
+                                 # We just render the citation marker next to the keyword now
+                                 html_pieces.append(
+                                     f'<span class="cite-chip"{onclick_html}>{seg["text"]} <sup style="color:#0066cc; font-weight:bold;">[{cit_num}]</sup></span>'
+                                 )
+                            else:
+                                html_pieces.append(seg["text"])
+                                
+                        rendered_content = "".join(html_pieces)
+                        st.markdown(_present_content(rendered_content, source_lookup, confirmed_qa_store), unsafe_allow_html=True)
+                        
+                        if sources_list:
+                            st.markdown("<hr style='margin: 12px 0; border: none; border-top: 1px solid #ddd;'/>", unsafe_allow_html=True)
+                            st.markdown("".join(sources_list), unsafe_allow_html=True)
+                    else:
+                        st.markdown(_present_content(content, source_lookup, confirmed_qa_store), unsafe_allow_html=True)
+                        
+                    # Add helper line text inside the latest assistant box
+                    if turn == turns[-1] and msg == assistant_msgs[-1] and is_waiting and not active_ref:
+                        next_action = sv.get("next_action")
+                        if msg_type == "clarification_answer":
+                            helper_copy = "I just clarified the missing context. If that makes sense, we can continue."
+                        elif next_action == "START_DRAFT":
+                            helper_copy = "After you reply, I’ll likely begin drafting."
+                        elif next_action == "ASK_ONE_MORE":
+                            helper_copy = "I need one final detail before drafting."
+                        elif next_action == "ASK_MULTIPLE":
+                            helper_copy = "I still need a few key details before drafting."
+                        elif next_action == "UPDATE_DRAFT":
+                            helper_copy = "Your next reply will update the current draft."
+                        elif next_action == "WAITING_CONFIRMATION":
+                            helper_copy = "Please confirm the last point so I can continue."
+                        else:
+                            helper_copy = "After you reply, I’ll either start drafting if I have enough detail, or ask one focused follow-up question."
+                        st.caption(f"_{helper_copy}_")
+
+                    if msg_type != "clarification_answer":
+                        _render_message_actions(msg_id, content, "assistant", msg_type)
                     
                 elif msg_type == "draft":
+                    if sv.get("response_type") == "clarification_answer":
+                        continue
                     with st.expander("📝 View draft", expanded=False):
                         st.markdown(_present_content(content, source_lookup, confirmed_qa_store), unsafe_allow_html=True)
                         
@@ -869,6 +909,8 @@ if st.session_state.graph_started:
                             st.markdown(f"**Earlier you said:**\n\n> {evidence.get('evidence_snippet', '')}")
                             
                 elif msg_type == "reflect":
+                    if sv.get("response_type") == "clarification_answer":
+                        continue
                     verdict = msg.get("verdict", "REWORK")
                     review_summary = _build_review_summary(msg)
                     
@@ -877,10 +919,11 @@ if st.session_state.graph_started:
                     else:
                         st.warning("**Needs one more update ⚠️**")
                         
-                    st.markdown(
-                        _present_content(review_summary["explanation"], source_lookup, confirmed_qa_store),
-                        unsafe_allow_html=True,
-                    )
+                    with st.expander("💭 Reasoning", expanded=False):
+                        st.markdown(
+                            _present_content(review_summary["explanation"], source_lookup, confirmed_qa_store),
+                            unsafe_allow_html=True,
+                        )
                     
                     # The next_action_reason is only for backend telemetry and no longer displayed in the UI.
                     
@@ -1002,29 +1045,7 @@ with _img_col:
 with _inp_col:
     if st.session_state.graph_started:
         # Active session: answer questions or show completion state
-        is_waiting = bool(gstate and gstate.next) and not sv.get("is_complete", False)
         if is_waiting:
-            active_ref = st.session_state.get("active_reference")
-            
-            # --- Dynamic UX Transparency Text ---
-            next_action = sv.get("next_action")
-            if next_action == "START_DRAFT":
-                helper_copy = "After you reply, I’ll likely begin drafting."
-            elif next_action == "ASK_ONE_MORE":
-                helper_copy = "I need one final detail before drafting."
-            elif next_action == "ASK_MULTIPLE":
-                helper_copy = "I still need a few key details before drafting."
-            elif next_action == "UPDATE_DRAFT":
-                helper_copy = "Your next reply will update the current draft."
-            elif next_action == "WAITING_CONFIRMATION":
-                helper_copy = "Please confirm the last point so I can continue."
-            else:
-                helper_copy = "After you reply, I’ll either start drafting if I have enough detail, or ask one focused follow-up question."
-            
-            # Only render if we aren't directly replying to an interrupt which provides its own context
-            if not active_ref:
-                st.caption(f"_{helper_copy}_")
-            
             placeholder = (
                 "Reply, correct, or clarify…"
                 if active_ref else "Type your answer and press Enter…"

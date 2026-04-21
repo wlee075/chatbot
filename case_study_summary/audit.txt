@@ -1,0 +1,250 @@
+================================================================================
+IMPLEMENTATION AUDIT — Adaptive Human Oversight Framework
+================================================================================
+Date: 2026-04-20
+Audited codebase: /Users/creampuff/chatbot/
+Verdict: MOSTLY MISSING
+Coverage: ~15%
+
+================================================================================
+Q1. Do we already have any complexity scoring logic per response?
+================================================================================
+Status: NO
+
+No function, field, or heuristic anywhere in the codebase computes a
+"complexity score" for an individual chatbot response.
+
+The closest candidate is `_answer_confidence_score` in
+  graph/nodes.py:2033
+but this scores the USER'S ANSWER quality (word count, specificity), NOT the
+response risk or complexity. It feeds into `section_draft_meta` to decide
+whether to START drafting — a drafting-policy gate, not a human-oversight gate.
+
+There is also `missing_required_fields_count` and `draft_readiness_band`
+(state.py:69-71) which classify section completeness into bands like "Ready",
+"Near Ready", "Blocked". These drive `next_action` routing (nodes.py:2998),
+but they measure SECTION readiness, not per-response risk.
+
+Wiring to oversight: NONE. These scores never gate user-facing approval.
+
+================================================================================
+Q2. Do we already have any risk scoring logic per response?
+================================================================================
+Status: NO
+
+No field or function named "risk_score", "risk_level", or equivalent exists.
+
+`impacted_section_scores` (state.py:218, nodes.py:2389) assigns confidence
+floats to cross-section impact (1.0 = rule-based, 0.7 = LLM-fallback,
+0.4 = side-fact). These are used in draft_node (nodes.py:2594-2598) to skip
+low-confidence side-writes below `_SIDE_WRITE_MIN_IMPACT_SCORE = 0.5`.
+
+This is an internal drafting quality gate, NOT a user-facing risk assessment.
+It never triggers approval UI or blocks state transitions pending human review.
+
+================================================================================
+Q3. Do we classify responses into multiple autonomy modes today?
+================================================================================
+Status: NO
+
+No "mode_tag", "auto_proceed", "confirm_before_send", or "user_must_lead"
+field or enum exists anywhere in the codebase.
+
+The system has structural routing modes:
+  - next_action: "START_DRAFT" | "ASK_ONE_MORE" | "ASK_MULTIPLE" |
+    "UPDATE_DRAFT" | "ADVANCE_SECTION" | "WAITING_CONFIRMATION"
+    (state.py:67, nodes.py:2998-3009)
+
+These describe WORKFLOW steps, not autonomy/oversight levels. The system
+always operates at a single, fixed autonomy level: the chatbot acts and the
+user passively responds. There is no mechanism to switch between
+"auto-proceed" vs. "confirm-before-send" vs. "user-must-lead" per response.
+
+================================================================================
+Q4. Do we already block or require confirmation before risky state transitions?
+================================================================================
+Status: PARTIAL — but NOT risk-based
+
+The echo/confirmation gate exists:
+  - `interpret_and_echo_node` (nodes.py:1484) restates the user's answer.
+  - `answer_confirmation_status` cycles through "" → "PENDING" → "CONFIRMED"
+    or "CORRECTED" (state.py:173, nodes.py:1186, 1348, 1797, 1977, 1997).
+  - `route_after_confirmation` (routing.py:109) routes CONFIRMED → draft,
+    CORRECTED → await_answer.
+
+CRITICAL DISTINCTION: This gate confirms FACT ACCURACY ("did I hear you
+correctly?"), NOT risk governance ("this action is high-risk, are you sure?").
+Every single answer goes through the exact same echo gate regardless of risk.
+There is no conditional path where high-risk responses get MORE scrutiny.
+
+The bounds-check gate (nodes.py:1501-1511, utils/validator.py) catches
+impossible numeric inputs (e.g. team_size = 99999) via rule-based
+plausibility checks. This IS a risk gate, but only for a narrow numeric
+case. It does NOT generalize to arbitrary response risk.
+
+================================================================================
+Q5. Do we already have approve/edit/reject UI controls for assistant outputs?
+================================================================================
+Status: NO
+
+app.py contains NO approve, reject, or edit buttons for assistant-generated
+content. The only st.button instances are:
+  - Line 552: unclear context (checked — it is for sending chat input)
+  - Line 671: "↩ New" — resets session
+  - Line 752: section preview toggle
+  - Line 776: "Close" preview
+  - Line 994: "✕" — clear active reference
+
+The TAG_MESSAGE_AS_TRUTH and CORRECT_MESSAGE events are user-initiated
+actions (clicking on a past message to promote/correct it). They are NOT
+approval gates on assistant output. The assistant's responses render
+immediately with no interception point.
+
+================================================================================
+Q6. Do we log user acceptance/rejection of assistant actions?
+================================================================================
+Status: PARTIAL — correction stats only, no acceptance/rejection logging
+
+`correction_stats` (state.py:186) tracks success/failure counts for
+CORRECT_MESSAGE events (nodes.py:1353-1356). This logs whether a correction
+linkage succeeded, NOT whether a user approved or rejected an assistant
+recommendation.
+
+`event_history` (state.py:185) logs TAG_MESSAGE_AS_TRUTH and CORRECT_MESSAGE
+events with target_message_id, content, section, concept_key. This is a
+provenance log, not an acceptance/rejection log.
+
+The JSONL logger (utils/logger.py) logs routing_decision, node_start,
+node_end, suppression_observability, etc. None of these event_types capture
+user-level approval/rejection decisions on assistant output.
+
+================================================================================
+Q7. Do provenance confidence, contradiction detection, or confidence scores
+    already exist and can they be reused?
+================================================================================
+Status: YES — these exist and ARE reusable as INPUTS to a future risk scorer
+
+| Component                 | Location                        | What it does                                                     | Reusable? |
+|---------------------------|---------------------------------|------------------------------------------------------------------|-----------|
+| _answer_confidence_score  | nodes.py:2033                   | Scores user answer quality (0.0–1.0) by word count/specificity   | YES — as signal |
+| confidence_score          | section_draft_meta (state.py:203)| Per-section answer confidence                                   | YES — as signal |
+| completeness_score        | section_draft_meta (state.py:204)| Per-section fact coverage ratio                                 | YES — as signal |
+| provenance_confidence     | nodes.py:296                    | Per-fact provenance trust (threshold-gated)                     | YES — as signal |
+| _check_contradiction      | nodes.py:1080                   | Detects contradiction via subpart overlap + LLM JSON scoring    | YES — as signal |
+| contradiction_flagged     | confirmed_qa_store entries      | Boolean per canonical fact                                       | YES — as signal |
+| impacted_section_scores   | state.py:218, nodes.py:2389     | Cross-section impact confidence (1.0 / 0.7 / 0.4)              | YES — as signal |
+| section_scores            | state.py:192                    | Per-section completeness/confidence/verdict from reflector      | YES — as signal |
+
+NONE of these are currently wired to a unified risk/complexity scorer or
+mode classifier. They exist as independent signals serving their own
+subsystems (drafting policy, duplicate suppression, contradiction logging).
+
+================================================================================
+Q8. Which parts of this framework are already indirectly implemented under
+    another name?
+================================================================================
+
+| Paper concept             | Our existing equivalent              | Gap                                      |
+|---------------------------|--------------------------------------|-------------------------------------------|
+| "Guided AI-autonomy"      | Current default mode (auto-proceed)  | We ONLY have this mode; no alternatives   |
+| "Supervised-AI" (drafts)  | echo gate (interpret_and_echo_node)  | Always fires; not risk-conditional        |
+| "Human-AI Collaborative"  | —                                    | NOT IMPLEMENTED                           |
+| "AI-Assisted" (human-led) | —                                    | NOT IMPLEMENTED                           |
+| Complexity scoring        | missing_required_fields_count        | Measures section gaps, not response risk  |
+| Risk scoring              | impacted_section_scores              | Measures draft impact, not response risk  |
+| Approval UI               | —                                    | NOT IMPLEMENTED                           |
+| Acceptance logging        | correction_stats, event_history      | Logs corrections, not approve/reject      |
+| Contradiction blocking    | _check_contradiction                 | Detects but does not BLOCK transitions    |
+
+Push-harder verdicts:
+- routing_decision logs ≠ risk governance (they log WHICH node runs next,
+  not WHETHER a human should approve)
+- duplicate-question suppression ≠ oversight mode logic (it prevents
+  re-asking, not risk-gating)
+- provenance_confidence ≠ response risk (it measures source trust of
+  extracted terms, not whether the overall response is risky to commit)
+- The echo gate is NOT a "confirm-before-send" mode — it fires
+  unconditionally on every answer, providing zero risk differentiation
+
+================================================================================
+SUMMARY TABLE
+================================================================================
+
+| Capability                        | Status   | Evidence                                        |
+|-----------------------------------|----------|-------------------------------------------------|
+| Complexity scoring per response   | MISSING  | No function/field found in any source file      |
+| Risk scoring per response         | MISSING  | No function/field found in any source file      |
+| Mode classification (3 modes)     | MISSING  | No mode_tag or enum exists                      |
+| Conditional approval gate         | MISSING  | Echo gate is unconditional, not risk-based       |
+| Approve/Edit/Reject UI controls   | MISSING  | No such buttons in app.py                        |
+| User acceptance/rejection logging | MISSING  | correction_stats logs linkage, not approval      |
+| Reusable confidence signals       | EXISTS   | _answer_confidence_score, provenance_confidence  |
+| Reusable contradiction detection  | EXISTS   | _check_contradiction, contradiction_flagged      |
+| Reusable impact scoring           | EXISTS   | impacted_section_scores (1.0/0.7/0.4)            |
+| Structural routing logs           | EXISTS   | JSONL log_event with routing_decision events     |
+
+================================================================================
+REUSE CANDIDATES
+================================================================================
+1. _answer_confidence_score (nodes.py:2033) — repurpose as input signal
+2. impacted_section_scores (state.py:218) — repurpose as risk signal
+3. provenance_confidence (nodes.py:296) — repurpose as trust signal
+4. _check_contradiction return value — repurpose as risk escalation trigger
+5. log_event infrastructure (utils/logger.py) — extend with new event_types
+   for "mode_assigned", "user_approved", "user_rejected"
+6. answer_confirmation_status flow — extend to be conditional (fire only
+   when mode == "confirm-before-send") instead of unconditional
+
+================================================================================
+GAPS (ordered by severity)
+================================================================================
+1. No mode classifier function exists
+2. No per-response risk/complexity scoring function exists
+3. No conditional approval gate (echo gate is always-on, not risk-gated)
+4. No Approve/Edit/Reject UI controls in app.py
+5. No user-acceptance/rejection logging schema
+6. Contradiction detection logs but does not block state transitions
+
+================================================================================
+RECOMMENDED MINIMAL BUILD ORDER
+================================================================================
+1. Mode classifier function
+   - Create `_classify_oversight_mode(state, response) → "auto-proceed" |
+     "confirm-before-send" | "user-must-lead"`
+   - Inputs: contradiction_flagged, confidence_score, is_new_information,
+     triggers_state_transition, impacted_section_scores
+   - Location: new function in graph/nodes.py or new file graph/oversight.py
+
+2. Wire mode tag into state
+   - Add `oversight_mode: str` to PRDState (state.py)
+   - Set it in interpret_and_echo_node before routing
+
+3. Conditional echo gate
+   - Make the echo/confirmation path conditional on oversight_mode
+   - "auto-proceed" → skip echo, commit directly
+   - "confirm-before-send" → current echo behavior (restated + wait)
+   - "user-must-lead" → do NOT generate proactive suggestions; wait for
+     user to explicitly ask
+
+4. UI approval controls
+   - Add [Approve] / [Edit] / [Reject] buttons in app.py for
+     "confirm-before-send" responses
+   - Wire button clicks back to graph as structured events
+
+5. Acceptance logging
+   - Extend log_event with event_types: "mode_assigned",
+     "user_approved", "user_rejected", "user_edited"
+   - Store in event_history for governance audit trail
+
+================================================================================
+BOTTOM LINE
+================================================================================
+This is NOT already in the system. We are flattering ourselves.
+
+The codebase has strong foundational primitives — contradiction detection,
+confidence scoring, provenance tracking, echo gating, structured logging —
+but NONE of them are wired into a unified oversight framework. They each
+serve narrow, independent purposes (drafting policy, duplicate suppression,
+provenance display). The gap between "we have useful signals" and "we have
+adaptive human oversight" is the entire classifier + conditional gate + UI
++ logging pipeline. That pipeline does not exist today.

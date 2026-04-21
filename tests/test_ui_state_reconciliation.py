@@ -268,7 +268,8 @@ class TestUIStateReconciliation(unittest.TestCase):
                 mock_log.assert_any_call(thread_id="1", run_id="1", node_name="test", level="INFO", event_type="clarification_answer_emitted", message=unittest.mock.ANY, active_question_id="", current_questions="Here is the meaning.", question_status="OPEN")
                 self.assertEqual(res_ans["reply_intent"], "CLARIFIED")
 
-    def test_duplicate_guard_logging_test(self):
+    @patch("graph.nodes._get_llm")
+    def test_duplicate_guard_logging_test(self, mock_get_llm):
         from graph.nodes import generate_questions_node
         with patch("graph.nodes._log_ctx", return_value={"thread_id": "1", "run_id": "1", "node_name": "test"}):
             with patch("graph.nodes.log_event") as mock_log:
@@ -279,9 +280,20 @@ class TestUIStateReconciliation(unittest.TestCase):
                     "active_question_id": "q123",
                     "recent_questions": ["Tell me about X"]
                 }
-                mock_response_dict = {"single_next_question": "Tell me about X", "question_id": "q123", "question_type": "OPEN_ENDED", "options": [], "subparts": []}
                 
-                with patch("graph.nodes.llm_invoke", return_value=mock_response_dict), patch("graph.nodes._get_llm", return_value=MagicMock()), patch("graph.nodes.get_section_by_index", return_value=MagicMock(title="Mock", description="A", expected_components=["A"])):
+                mock_llm = MagicMock()
+                mock_llm.model = "mock_model"
+                mock_llm.with_structured_output.return_value.model = "mock_model"
+                mock_response_dict = {
+                    "single_next_question": "Can you tell me about X?", "question_id": "q123", 
+                    "question_type": "OPEN_ENDED", "options": [], "subparts": [], 
+                    "acknowledged_context": "testing", "explicit_missing_detail": "Can you tell me about X?", 
+                    "referenced_concept_keys": []
+                }
+                mock_llm.with_structured_output.return_value.invoke.return_value = mock_response_dict
+                mock_get_llm.return_value = mock_llm
+                
+                with patch("graph.nodes.get_section_by_index", return_value=MagicMock(title="Mock", description="A", expected_components=["A"])):
                     res = generate_questions_node(state)
                     
                 # Assert duplicate guard fired and altered the question
@@ -295,7 +307,7 @@ class TestUIStateReconciliation(unittest.TestCase):
                         call_found = True
                         self.assertEqual(c.kwargs.get("active_question_id"), "q123")
                         self.assertEqual(c.kwargs.get("prior_question_text"), "Tell me about X")
-                        self.assertEqual(c.kwargs.get("new_question_text"), "Tell me about X")
+                        self.assertIn("tell me about x", c.kwargs.get("new_question_text").lower())
                 self.assertTrue(call_found)
 
     def test_question_status_transition_logging_test(self):
@@ -660,6 +672,9 @@ class TestUIStateReconciliation(unittest.TestCase):
                     "question_id": "q1",
                     "single_next_question": "What tools are you using to manage this today?",
                     "user_facing_gap_reason": "gap",
+                    "acknowledged_context": "the current process",
+                    "explicit_missing_detail": "What tools are you using to manage this today?",
+                    "referenced_concept_keys": [],
                     "subparts": ["different_concept"]  # subpart differs, but exact text match should still block
                 }
                 mock_get_llm.return_value = mock_llm
@@ -674,6 +689,9 @@ class TestUIStateReconciliation(unittest.TestCase):
                     "question_id": "q2",
                     "single_next_question": "Are you using any particular software for this?",
                     "user_facing_gap_reason": "gap",
+                    "acknowledged_context": "the current process",
+                    "explicit_missing_detail": "Are you using any particular software for this?",
+                    "referenced_concept_keys": [],
                     "subparts": ["tooling"]  # overlaps with store
                 }
                 
@@ -687,12 +705,15 @@ class TestUIStateReconciliation(unittest.TestCase):
                     "question_id": "q3",
                     "single_next_question": "How much does it cost?",
                     "user_facing_gap_reason": "gap",
+                    "acknowledged_context": "the current process",
+                    "explicit_missing_detail": "How much does it cost?",
+                    "referenced_concept_keys": [],
                     "subparts": ["budget"]  # No overlap, different string
                 }
                 
                 with patch("graph.nodes.get_section_by_index", return_value=MagicMock(title="Mock", id="mock")):
                     res = generate_questions_node(state)
-                    self.assertEqual(res["current_questions"], "gap.\n\nHow much does it cost?")
+                    self.assertEqual(res["current_questions"], "I understand the current process. How much does it cost?")
 
     @patch("graph.nodes._get_llm")
     def test_fallback_option_rehydration_scope_test(self, mock_get_llm):
@@ -762,6 +783,401 @@ class TestUIStateReconciliation(unittest.TestCase):
                     # Blocking field cleanly removed as well
                     self.assertEqual(res["blocking_fields"], ["budget"])
                     self.assertEqual(res["missing_required_fields_count"], 1)
+
+    @patch("graph.nodes._get_llm")
+    def test_clarification_mode_switch_test(self, mock_get_llm):
+        # 1. clarification_mode_switch_test: Clarification request routes to answer_clarification
+        from graph.routing import route_after_echo
+        state = {"reply_intent": "CLARIFICATION_REQUEST"}
+        route = route_after_echo(state)
+        self.assertEqual(route, "answer_clarification")
+
+    def test_clarification_no_fact_capture_test(self):
+        # 2. clarification_no_fact_capture_test: No truth-state write occurs during clarification mode.
+        from graph.nodes import interpret_and_echo_node
+        with patch("graph.nodes._log_ctx", return_value={"thread_id": "1"}):
+            with patch("graph.nodes.log_event"):
+                state = {
+                    "section_index": 0,
+                    "current_questions": "What triggers this?",
+                    "raw_answer_buffer": "What do you mean?",
+                    "remaining_subparts": ["trigger"]
+                }
+                res = interpret_and_echo_node(state)
+                self.assertNotIn("confirmed_qa_store", res)
+                self.assertNotIn("store_version", res)
+
+    def test_clarification_no_echo_test(self):
+        # 3. clarification_no_echo_test: User clarification text is never echoed as 'Got it — ...'.
+        from graph.nodes import interpret_and_echo_node
+        with patch("graph.nodes._log_ctx", return_value={"thread_id": "1"}):
+            with patch("graph.nodes.log_event"):
+                state = {
+                    "section_index": 0,
+                    "current_questions": "What triggers this?",
+                    "raw_answer_buffer": "What do you mean?",
+                    "remaining_subparts": ["trigger"]
+                }
+                res = interpret_and_echo_node(state)
+                self.assertNotIn("pending_echo", res)
+                self.assertEqual(res["reply_intent"], "CLARIFICATION_REQUEST")
+
+    @patch("graph.nodes._get_llm")
+    def test_clarification_max_one_question_test(self, mock_get_llm):
+        # 4. clarification_max_one_question_test: Clarification response contains zero or one question only.
+        from graph.nodes import answer_clarification_node
+        with patch("graph.nodes._log_ctx", return_value={"thread_id": "1"}):
+            with patch("graph.nodes.log_event"):
+                with patch("graph.nodes.llm_invoke") as mock_invoke:
+                    import json
+                    mock_invoke.return_value.content = json.dumps({
+                        "explanation": "This means the system starts.",
+                        "optional_followup_question": "Does it start automatically?"
+                    })
+                    state = {"section_index": 0, "chat_history": []}
+                    with patch("graph.nodes.get_section_by_index", return_value=MagicMock(title="Mock")):
+                        res = answer_clarification_node(state)
+                        self.assertEqual(res["current_questions"], "This means the system starts.\n\nDoes it start automatically?")
+                        self.assertEqual(res["current_questions"].count("?"), 1)
+
+    @patch("graph.nodes._get_llm")
+    def test_clarification_preserves_parent_open_test(self, mock_get_llm):
+        # 5. clarification_preserves_parent_open_test: Underlying business question remains OPEN after explanation.
+        from graph.nodes import answer_clarification_node
+        with patch("graph.nodes._log_ctx", return_value={"thread_id": "1"}):
+            with patch("graph.nodes.log_event"):
+                with patch("graph.nodes.llm_invoke") as mock_invoke:
+                    import json
+                    mock_invoke.return_value.content = json.dumps({
+                        "explanation": "This means the system starts.",
+                        "optional_followup_question": "Does it start automatically?"
+                    })
+                    state = {"section_index": 0, "question_status": "OPEN", "chat_history": []}
+                    with patch("graph.nodes.get_section_by_index", return_value=MagicMock(title="Mock")):
+                        res = answer_clarification_node(state)
+                        self.assertEqual(res["question_status"], "OPEN")
+
+    def test_exact_screenshot_regression_test_clarification_mode(self):
+        # 6. exact_screenshot_regression_test_clarification_mode: "what do you mean" does not show echo + evaluator leak + stacked questions.
+        from graph.nodes import _classify_intent_rule
+        intent, _, _ = _classify_intent_rule("What triggers this?", "what do you mean")
+        self.assertEqual(intent, "CLARIFICATION_REQUEST")
+
+    @patch("graph.nodes._get_llm")
+    def test_clarification_structured_output_shape_test(self, mock_get_llm):
+        # 7. clarification_structured_output_shape_test: Clarification response is split into explanation and optional single follow-up question.
+        from graph.nodes import answer_clarification_node
+        with patch("graph.nodes._log_ctx", return_value={"thread_id": "1"}):
+            with patch("graph.nodes.log_event"):
+                with patch("graph.nodes.llm_invoke") as mock_invoke:
+                    import json
+                    mock_invoke.return_value.content = json.dumps({
+                        "explanation": "This means the system starts.",
+                        "optional_followup_question": ""
+                    })
+                    state = {"section_index": 0, "chat_history": []}
+                    with patch("graph.nodes.get_section_by_index", return_value=MagicMock(title="Mock")):
+                        res = answer_clarification_node(state)
+                        self.assertEqual(res["current_questions"], "This means the system starts.")
+
+    @patch("graph.nodes._get_llm")
+    def test_clarification_does_not_create_new_business_question_id_test(self, mock_get_llm):
+        # 8. clarification_does_not_create_new_business_question_id_test: active_question_id remains the parent business question.
+        from graph.nodes import answer_clarification_node
+        with patch("graph.nodes._log_ctx", return_value={"thread_id": "1"}):
+            with patch("graph.nodes.log_event"):
+                with patch("graph.nodes.llm_invoke") as mock_invoke:
+                    import json
+                    mock_invoke.return_value.content = json.dumps({"explanation": "Wait", "optional_followup_question": ""})
+                    state = {"section_index": 0, "active_question_id": "parent_q_123", "chat_history": []}
+                    with patch("graph.nodes.get_section_by_index", return_value=MagicMock(title="Mock")):
+                        res = answer_clarification_node(state)
+                        # ensure answer_clarification_node does not mutate or return a new active_question_id
+                        self.assertNotIn("active_question_id", res) # meaning it inherits from state unchanged
+
+    @patch("graph.nodes._get_llm")
+    def test_gap_specific_fallback_template_test(self, mock_get_llm):
+        from graph.nodes import generate_questions_node
+        with patch("graph.nodes._log_ctx", return_value={"thread_id": "1"}):
+            with patch("graph.nodes.log_event"):
+                with patch("graph.nodes.llm_invoke") as mock_invoke:
+                    # Model outputs a generic fallback
+                    mock_invoke.return_value = {
+                        "question_id": "123",
+                        "unresolved_gap_type": "missing_fields",
+                        "acknowledged_context": "I got the context.",
+                        "explicit_missing_detail": "I need more context",
+                        "single_next_question": "Can you give more details?",
+                        "subparts": [],
+                        "question_type": "OPEN_ENDED",
+                        "options": []
+                    }
+                    state = {
+                        "section_index": 0, "raw_answer_buffer": "excel mapping", "triage_decision": "", "requirement_gaps": "", "thread_id": "1", "run_id": "1", "section_qa_pairs": [], "current_draft": ""
+                    }
+                    with patch("graph.nodes.get_section_by_index", return_value=MagicMock(title="Mock")):
+                        res = generate_questions_node(state)
+                        self.assertEqual(res["current_questions"], "Got it \u2014 you described the workflow. Which fields are you manually matching in Excel today?")
+
+    @patch("graph.nodes._get_llm")
+    def test_noun_chunk_entity_reuse_test(self, mock_get_llm):
+        from graph.nodes import generate_questions_node
+        with patch("graph.nodes._log_ctx", return_value={"thread_id": "1"}):
+            with patch("graph.nodes.log_event"):
+                with patch("graph.nodes.llm_invoke") as mock_invoke:
+                    # Model outputs context without any token reuse of words length > 3
+                    mock_invoke.return_value = {
+                        "question_id": "123",
+                        "unresolved_gap_type": "unclear_rule",
+                        "acknowledged_context": "I understand the process.",
+                        "explicit_missing_detail": "the specific logic",
+                        "single_next_question": "What is the logic?",
+                        "subparts": [],
+                        "question_type": "OPEN_ENDED",
+                        "options": []
+                    }
+                    state = {
+                        "section_index": 0, "raw_answer_buffer": "excel mapping and emails", "triage_decision": "", "requirement_gaps": "", "thread_id": "1", "run_id": "1", "section_qa_pairs": [], "current_draft": ""
+                    }
+                    with patch("graph.nodes.get_section_by_index", return_value=MagicMock(title="Mock")):
+                        res = generate_questions_node(state)
+                        # Without entity reuse it relies on the fallback
+                        self.assertEqual(res["current_questions"], "Got it \u2014 I understand the steps. How do you decide which email data maps to which Excel column?")
+
+    @patch("graph.nodes._get_llm")
+    def test_acknowledged_context_contains_user_entities_test(self, mock_get_llm):
+        from graph.nodes import generate_questions_node
+        with patch("graph.nodes._log_ctx", return_value={"thread_id": "1"}):
+            with patch("graph.nodes.log_event"):
+                with patch("graph.nodes.llm_invoke") as mock_invoke:
+                    mock_invoke.return_value = {
+                        "question_id": "123",
+                        "unresolved_gap_type": "missing_owner",
+                        "acknowledged_context": "I understand you fetch emails.",
+                        "explicit_missing_detail": "the team",
+                        "single_next_question": "Who owns this?",
+                        "subparts": [],
+                        "question_type": "OPEN_ENDED",
+                        "options": []
+                    }
+                    state = {
+                        "section_index": 0, "raw_answer_buffer": "fetch emails and process", "triage_decision": "", "requirement_gaps": "", "thread_id": "1", "run_id": "1", "section_qa_pairs": [], "current_draft": ""
+                    }
+                    with patch("graph.nodes.get_section_by_index", return_value=MagicMock(title="Mock")):
+                        res = generate_questions_node(state)
+                        # The "emails" token matches! So it should pass entity overlap check.
+                        self.assertIn("What I still need to know is the team. Who owns this?", res["current_questions"])
+
+    @patch("graph.nodes._get_llm")
+    def test_no_repeat_example_prompt_after_workflow_given_test(self, mock_get_llm):
+        from graph.nodes import generate_questions_node
+        with patch("graph.nodes._log_ctx", return_value={"thread_id": "1"}):
+            with patch("graph.nodes.log_event"):
+                with patch("graph.nodes.llm_invoke") as mock_invoke:
+                    mock_invoke.return_value = {
+                        "question_id": "123",
+                        "unresolved_gap_type": "unclear_rule",
+                        "acknowledged_context": "I understand the workflow.",
+                        "explicit_missing_detail": "the exact step",
+                        "single_next_question": "Can you give an example?",
+                        "subparts": [],
+                        "question_type": "OPEN_ENDED",
+                        "options": []
+                    }
+                    state = {
+                        "section_index": 0, "raw_answer_buffer": "first I do the excel mapping workflow", "triage_decision": "", "requirement_gaps": "", "thread_id": "1", "run_id": "1", "section_qa_pairs": [], "current_draft": ""
+                    }
+                    with patch("graph.nodes.get_section_by_index", return_value=MagicMock(title="Mock")):
+                        res = generate_questions_node(state)
+                        self.assertEqual(res["current_questions"], "Got it \u2014 I understand the steps. How do you decide which email data maps to which Excel column?")
+
+    @patch("graph.nodes._get_llm")
+    def test_total_response_under_42_words_test(self, mock_get_llm):
+        from graph.nodes import generate_questions_node
+        with patch("graph.nodes._log_ctx", return_value={"thread_id": "1"}):
+            with patch("graph.nodes.log_event"):
+                with patch("graph.nodes.llm_invoke") as mock_invoke:
+                    # Model outputs an extremely long set of text
+                    mock_invoke.return_value = {
+                        "question_id": "123",
+                        "unresolved_gap_type": "unclear_output",
+                        "acknowledged_context": "I understand you fetch excel mapping emails " * 10,
+                        "explicit_missing_detail": "the specific logic missing " * 5,
+                        "single_next_question": "What is the logic that you are trying to output here in the system?",
+                        "subparts": [],
+                        "question_type": "OPEN_ENDED",
+                        "options": []
+                    }
+                    state = {
+                        "section_index": 0, "raw_answer_buffer": "fetch excel mapping", "triage_decision": "", "requirement_gaps": "", "thread_id": "1", "run_id": "1", "section_qa_pairs": [], "current_draft": ""
+                    }
+                    with patch("graph.nodes.get_section_by_index", return_value=MagicMock(title="Mock")):
+                        res = generate_questions_node(state)
+                        self.assertEqual(res["current_questions"], "Got it \u2014 I understand the process. What final output should this step produce?")
+
+    def test_role_neutral_prompt_copy_test(self):
+        # Verify ELICITOR_SYSTEM and LANGUAGE_RULES_BLOCK do not contain forced PM persona.
+        from prompts import templates
+        
+        self.assertNotIn("experienced product requirements specialist helping a product manager", templates.ELICITOR_SYSTEM)
+        self.assertIn("helping a user describe their work", templates.ELICITOR_SYSTEM)
+        self.assertNotIn("the PM has not used first", templates.LANGUAGE_RULES_BLOCK)
+        self.assertIn("the user has not used first", templates.LANGUAGE_RULES_BLOCK)
+
+    @patch("graph.nodes._get_llm")
+    def test_self_identified_pm_still_supported_test(self, mock_get_llm):
+        from graph.nodes import generate_questions_node
+        with patch("graph.nodes._log_ctx", return_value={"thread_id": "1"}):
+            with patch("graph.nodes.log_event"):
+                with patch("graph.nodes.llm_invoke") as mock_invoke:
+                    mock_invoke.return_value = {
+                        "question_id": "123",
+                        "unresolved_gap_type": "unclear_output",
+                        "acknowledged_context": "I understand you need the PM dashboard.",
+                        "explicit_missing_detail": "the dashboard logic",
+                        "single_next_question": "What is the logic for the PM dashboard?",
+                        "subparts": [],
+                        "question_type": "OPEN_ENDED",
+                        "options": []
+                    }
+                    state = {
+                        "section_index": 0, "raw_answer_buffer": "PM dashboard", "triage_decision": "", "requirement_gaps": "", "thread_id": "1", "run_id": "1", "section_qa_pairs": [], "current_draft": ""
+                    }
+                    with patch("graph.nodes.get_section_by_index", return_value=MagicMock(title="Mock")):
+                        res = generate_questions_node(state)
+                        # We still allow PM terminology if injected explicitly referencing prior context.
+                        self.assertIn("PM dashboard", res["current_questions"])
+
+    def test_segment_text_with_provenance_produces_chips(self):
+        """_segment_text_with_provenance should produce provenance-bearing segments
+        when the QA store contains facts with high confidence and matching terms."""
+        from graph.nodes import _segment_text_with_provenance
+        
+        state = {
+            "confirmed_qa_store": {
+                "problem_statement:iter_0:round_1": {
+                    "fact_id": "fact-pdf-manual",
+                    "answer": "Our workflow for PDF retrieval is completely manual and requires three people.",
+                    "source_snippet": "Our workflow for PDF retrieval is completely manual and requires three people.",
+                    "source_message_id": "msg_001",
+                    "provenance_confidence": 10.0,
+                    "display_time": "8:00 PM · 20 Apr",
+                    "section_id": "problem_statement",
+                    "is_conflict": False,
+                }
+            },
+            "chat_history": [
+                {"msg_id": "msg_001", "role": "user", "content": "Our workflow for PDF retrieval is completely manual and requires three people.", "display_time": "8:00 PM · 20 Apr"}
+            ],
+        }
+        
+        reply = "Tell me more about PDF retrieval and the manual workflow."
+        keys = list(state["confirmed_qa_store"].keys())
+        segments = _segment_text_with_provenance(reply, keys, state)
+        
+        # Should produce multiple segments, at least one with provenance
+        self.assertGreater(len(segments), 1, "Expected multiple segments from provenance segmentation")
+        prov_segments = [s for s in segments if s.get("provenance") is not None]
+        self.assertGreater(len(prov_segments), 0, "Expected at least one segment with provenance data")
+        
+        # Verify provenance structure
+        p = prov_segments[0]["provenance"]
+        self.assertEqual(p["source_message_id"], "msg_001")
+        self.assertIn("speaker", p)
+        self.assertIn("snippet", p)
+        self.assertIn("display_time", p)
+
+    def test_segment_text_with_provenance_low_confidence_skipped(self):
+        """Low-confidence facts should NOT produce provenance chips."""
+        from graph.nodes import _segment_text_with_provenance
+        
+        state = {
+            "confirmed_qa_store": {
+                "problem_statement:iter_0:round_1": {
+                    "fact_id": "fact-weak",
+                    "answer": "Something about PDF retrieval.",
+                    "source_snippet": "Something about PDF retrieval.",
+                    "source_message_id": "msg_001",
+                    "provenance_confidence": 3.0,  # Below threshold
+                    "display_time": "8:00 PM",
+                    "section_id": "problem_statement",
+                    "is_conflict": False,
+                }
+            },
+            "chat_history": [],
+        }
+        
+        reply = "Tell me about PDF retrieval."
+        keys = list(state["confirmed_qa_store"].keys())
+        segments = _segment_text_with_provenance(reply, keys, state)
+        
+        # Should be a single plain segment (no provenance)
+        self.assertEqual(len(segments), 1)
+        self.assertIsNone(segments[0].get("provenance"))
+
+    @patch("graph.nodes._get_llm")
+    def test_generate_questions_with_provenance_segments(self, mock_get_llm):
+        """Full pipeline: generate_questions_node should produce content_segments
+        with provenance when QA store has eligible facts."""
+        from graph.nodes import generate_questions_node
+        with patch("graph.nodes._log_ctx", return_value={"thread_id": "1", "run_id": "1", "node_name": "test"}):
+            with patch("graph.nodes.log_event"):
+                state = {
+                    "section_index": 0,
+                    "question_status": "ANSWERED",
+                    "current_question_object": {"question_text": "Tell me about your workflow"},
+                    "active_question_id": "q1",
+                    "recent_questions": [],
+                    "confirmed_qa_store": {
+                        "problem_statement:iter_0:round_1": {
+                            "fact_id": "fact-manual",
+                            "answer": "Our workflow for PDF retrieval is completely manual.",
+                            "source_snippet": "Our workflow for PDF retrieval is completely manual.",
+                            "source_message_id": "msg_001",
+                            "provenance_confidence": 10.0,
+                            "display_time": "8:00 PM · 20 Apr",
+                            "section_id": "problem_statement",
+                            "is_conflict": False,
+                            "resolved_subparts": [],
+                        }
+                    },
+                    "chat_history": [
+                        {"msg_id": "msg_001", "role": "user", "content": "Our workflow for PDF retrieval is completely manual.", "display_time": "8:00 PM · 20 Apr"}
+                    ],
+                }
+                
+                mock_llm = MagicMock()
+                mock_llm.model = "mock_model"
+                mock_llm.with_structured_output.return_value.model = "mock_model"
+                mock_response_dict = {
+                    "single_next_question": "Can you describe the manual workflow for PDF retrieval in more detail?",
+                    "question_id": "q2",
+                    "question_type": "OPEN_ENDED",
+                    "options": [],
+                    "subparts": ["manual_workflow"],
+                    "acknowledged_context": "manual PDF retrieval",
+                    "explicit_missing_detail": "workflow details",
+                    "referenced_concept_keys": ["problem_statement:iter_0:round_1"],
+                }
+                mock_llm.with_structured_output.return_value.invoke.return_value = mock_response_dict
+                mock_get_llm.return_value = mock_llm
+                
+                with patch("graph.nodes.get_section_by_index", return_value=MagicMock(title="Problem Statement", description="Describe the problem", expected_components=["Problem"], id="problem_statement")):
+                    res = generate_questions_node(state)
+                    
+                # The result should have content_segments
+                self.assertIn("content_segments", res, "generate_questions_node should produce content_segments")
+                segments = res["content_segments"]
+                self.assertIsInstance(segments, list)
+                self.assertGreater(len(segments), 0, "content_segments should not be empty")
+                
+                # Check that at least one segment has provenance (if the reply text contains matching terms)
+                reply_text = res["current_questions"]
+                if "manual" in reply_text.lower() or "workflow" in reply_text.lower() or "retrieval" in reply_text.lower():
+                    prov_segs = [s for s in segments if s.get("provenance") is not None]
+                    self.assertGreater(len(prov_segs), 0, 
+                        f"Expected provenance chips in segments when reply contains matching terms. "
+                        f"Reply: {reply_text!r}")
 
 if __name__ == "__main__":
     unittest.main()

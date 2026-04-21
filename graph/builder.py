@@ -14,16 +14,31 @@ from graph.nodes import (
     finalize_node,
     generate_questions_node,
     handle_tagged_event_node,
-    interpret_and_echo_node,
     rebuild_mirror_node,
     reflect_node,
+)
+from graph.split_nodes import (
+    numeric_validation_node,
+    intent_classifier_node,
+    option_resolution_node,
+    semantic_assessor_node,
+    blocker_transition_node,
+    contradiction_validator_node,
+    truth_commit_node,
+    concept_history_update_node,
+    state_cleanup_node,
+    rephrase_question_node,
+    repair_repeated_question_node,
+    handle_numeric_error_node
 )
 from graph.routing import (
     route_after_draft,
     route_after_advance,
     route_after_answer,
+    route_after_numeric_validation,
     route_after_discovery,
-    route_after_echo,
+    route_after_intent,
+    route_after_contradiction,
     route_after_framing,
     route_after_reflect,
 )
@@ -67,7 +82,19 @@ def build_graph(checkpointer: MemorySaver | None = None):
     builder.add_node("generate_questions", generate_questions_node)
     builder.add_node("await_answer", await_answer_node)
     builder.add_node("handle_tagged_event", handle_tagged_event_node)
-    builder.add_node("interpret_and_echo", interpret_and_echo_node)
+    builder.add_node("numeric_validation", numeric_validation_node)
+    builder.add_node("intent_classifier", intent_classifier_node)
+    builder.add_node("option_resolution", option_resolution_node)
+    builder.add_node("semantic_assessor", semantic_assessor_node)
+    builder.add_node("blocker_transition", blocker_transition_node)
+    builder.add_node("contradiction_validator", contradiction_validator_node)
+    builder.add_node("truth_commit", truth_commit_node)
+    builder.add_node("concept_history_update", concept_history_update_node)
+    builder.add_node("state_cleanup", state_cleanup_node)
+    builder.add_node("rephrase_question", rephrase_question_node)
+    builder.add_node("repair_repeated_question", repair_repeated_question_node)
+    builder.add_node("handle_numeric_error", handle_numeric_error_node)
+    
     builder.add_node("answer_clarification", answer_clarification_node)
     builder.add_node("detect_impact", detect_impact_node)
     builder.add_node("draft", draft_node)
@@ -107,25 +134,61 @@ def build_graph(checkpointer: MemorySaver | None = None):
         "await_answer",
         route_after_answer,
         {
-            "interpret_and_echo": "interpret_and_echo",
+            "numeric_validation": "numeric_validation",
             "handle_tagged_event": "handle_tagged_event",
         },
     )
-    builder.add_edge("handle_tagged_event", "detect_impact")
     
-    # New intercept logic for clarification requests
     builder.add_conditional_edges(
-        "interpret_and_echo",
-        route_after_echo,
+        "numeric_validation",
+        route_after_numeric_validation,
         {
-            "detect_impact": "detect_impact",
-            "answer_clarification": "answer_clarification"
+            "handle_numeric_error": "handle_numeric_error",
+            "intent_classifier": "intent_classifier",
         }
     )
     
+    builder.add_edge("handle_tagged_event", "detect_impact")
+    
+    # Intent split routing
+    builder.add_conditional_edges(
+        "intent_classifier",
+        route_after_intent,
+        {
+            "option_resolution": "option_resolution",
+            "answer_clarification": "answer_clarification",
+            "rephrase_question": "rephrase_question",
+            "repair_repeated_question": "repair_repeated_question",
+            "handle_numeric_error": "handle_numeric_error",
+            "rebuild_mirror": "rebuild_mirror"
+        }
+    )
+    
+    builder.add_edge("rephrase_question", "await_answer")
+    builder.add_edge("repair_repeated_question", "generate_questions")
+    builder.add_edge("handle_numeric_error", "await_answer")
+    
+    builder.add_edge("option_resolution", "semantic_assessor")
+    builder.add_edge("semantic_assessor", "blocker_transition")
+    builder.add_edge("blocker_transition", "contradiction_validator")
+    
+    builder.add_conditional_edges(
+        "contradiction_validator",
+        route_after_contradiction,
+        {
+            "truth_commit": "truth_commit",
+            "generate_questions": "rebuild_mirror"
+        }
+    )
+    
+    builder.add_edge("truth_commit", "concept_history_update")
+    builder.add_edge("concept_history_update", "state_cleanup")
+    builder.add_edge("state_cleanup", "detect_impact")
+    
+    builder.add_edge("detect_impact", "draft")
+    
     # Clarification completed → return straight to waiting for answer to the NEW elicited question
     builder.add_edge("answer_clarification", "await_answer")
-    builder.add_edge("detect_impact", "draft")
 
     builder.add_conditional_edges(
         "draft",
