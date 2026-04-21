@@ -2224,7 +2224,29 @@ def await_answer_node(state: PRDState) -> dict:
     reply_text = ""
     if pending_event.get("event_type") == "REPLY_TO_MESSAGE":
         reply_id = pending_event.get("target_message_id", "")
-        reply_text = pending_event.get("target_content", "")
+        
+        import logging
+        logger = logging.getLogger("orchestrator_metrics")
+        logger.info("Starting canonical reply context lookup", extra={"event_type": "reply_context_lookup_started", "msg_id": reply_id})
+        
+        # 1. Reject UI target_content boundary
+        logger.info("Dropping target_content to enforce canonical ownership contract", extra={"event_type": "reply_context_target_content_ignored"})
+        
+        # 2. Strict msg_id lookup
+        found_text = ""
+        for msg in state.get("chat_history", []):
+            if msg.get("msg_id") == reply_id:
+                found_text = msg.get("content", "")
+                break
+                
+        if found_text:
+            reply_text = found_text
+            logger.info("Reply context resolved from chat history", extra={"event_type": "reply_context_lookup_resolved", "msg_id": reply_id})
+        else:
+            logger.warning("Reply context lookup failed. Target message not found.", extra={"event_type": "reply_context_lookup_failed", "msg_id": reply_id})
+            # Safe Fallback: do not accept a leaked chunk if lookup fails
+            reply_id = ""
+            reply_text = ""
 
     return {
         "raw_answer_buffer": user_text.strip(),

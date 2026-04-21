@@ -1089,11 +1089,14 @@ with _inp_col:
                     # Build structured payload
                     active_ref = st.session_state.get("active_reference")
                     if active_ref:
+                        target_content_str = active_ref.get("target_content", "")
+                        # Truncate to purely act as a preview/debug string. Never meant for semantic interpretation.
+                        truncated_preview = target_content_str[:100] + ("..." if len(target_content_str) > 100 else "")
                         payload: dict | str = {
                             "event_type": active_ref["event_type"],
                             "content": user_input,
                             "target_message_id": active_ref["target_message_id"],
-                            "target_content": active_ref.get("target_content", ""),
+                            "target_content": truncated_preview,
                             "source_message_role": active_ref.get("source_message_role", ""),
                             "ui_action_label": active_ref.get("label", ""),
                         }
