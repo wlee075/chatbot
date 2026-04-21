@@ -882,7 +882,15 @@ PASS_SCORE_THRESHOLD = 8.5
 RECOVERY_MODE_SCORE_THRESHOLD = 5.0
 RECOVERY_MODE_RESOLVED_COMPONENT_THRESHOLD = 0.5
 
-INTENT_FALLBACK_CLASSIFICATION_PROMPT = """Classify the following answer into one of these intents: COMPLAINT, REPHRASE, DIRECT_ANSWER, AMBIGUOUS."""
+INTENT_FALLBACK_CLASSIFICATION_PROMPT = """\
+Classify the following answer into one of these intents:
+DIRECT_CLARIFICATION_QUESTION, REPETITION_COMPLAINT, REPHRASE_REQUEST, BLENDED, DIRECT_ANSWER, COMPLAINT_OR_META, AMBIGUOUS.
+
+Active Question (if any): {question}
+User Answer: {answer}
+
+Reply with exactly one of the specific intent labels above, and nothing else.\
+"""
 
 REPLY_CONTEXT_INTERPRETATION_PROMPT = """\
 The user is specifically replying to an older message in the conversation.

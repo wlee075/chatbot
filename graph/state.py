@@ -1,5 +1,5 @@
 import operator
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, Any, Literal, TypedDict, Optional
 
 
 class QuestionObject(TypedDict):
@@ -131,6 +131,47 @@ class ReplyContextInterpretation(TypedDict):
     reason: str
 
 
+class TargetedContext(TypedDict):
+    target_type: Literal["latest_question", "replied_message"]
+    target_message_id: Optional[str]
+    target_text: str
+    relationship_type: str
+    confidence: float
+
+
+class SecondaryContext(TypedDict):
+    target_available: bool
+    message_id: Optional[str]
+    text: Optional[str]
+
+class UploadedFileParams(TypedDict):
+    """Input payload from client upload."""
+    file_id: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+
+class AcceptedFile(TypedDict):
+    """Normalized accepted file format."""
+    file_id: str
+    filename: str
+    file_type: Literal["jpg", "png", "pdf"]
+
+class RejectedFile(TypedDict):
+    """Reasoning block for rejected uploads."""
+    filename: str
+    reason: Literal["no_files_uploaded", "unsupported_file_type", "malformed_file_payload", "missing_required_metadata", "empty_file"]
+
+class DescribedImage(TypedDict):
+    """Normalized image description output."""
+    file_id: str
+    filename: str
+    high_level_description: str
+    visible_elements: list[str]
+    uncertainties: list[str]
+    
+
+
 RepairInstruction = Literal["", "DUPLICATE_SUPPRESSED", "REPHRASE_REQUIRED", "CLARIFY_TARGET"]
 
 
@@ -155,6 +196,14 @@ class PRDState(TypedDict):
     # ── Session identity ─────────────────────────────────────────────────────
     thread_id: str   # stable session identifier (set once per Streamlit session)
     run_id: str      # one graph invocation — UUID generated per .invoke() call
+
+    # ── Terminal Session State ───────────────────────────────────────────────
+    session_status: str
+    session_end_reason: str
+    session_end_message: str
+    input_disabled: bool
+    draft_available: bool
+    draft_download_available: bool
 
     validation_flag: str
     validation_reason: str
@@ -298,9 +347,28 @@ class PRDState(TypedDict):
     # confirmed_qa_store must only receive CONFIRMED values.
     raw_answer_buffer: str       # latest unconfirmed raw user response
     current_question_object: QuestionObject  # structured question from Elicitor
-    remaining_subparts: list[str]            # unfilled parts
+    document_summaries: dict[str, str]  # dict mapping semantic group to text
     
-    # ── Explicit clarification loop tracking ───────────────────────────────────
+    # ── File Upload Intake State ──
+    uploaded_files: list[UploadedFileParams]
+    upload_status: Literal["accepted", "accepted_partial", "rejected"]
+    accepted_files: list[AcceptedFile]
+    rejected_files: list[RejectedFile]
+    downstream_analysis_allowed: bool
+
+    # ── Uploaded Image Description State ──
+    image_description_status: Literal["described", "no_accepted_images", "failed", ""]
+    described_images: list[DescribedImage]
+    needs_followup: bool
+
+    # ── Image Description Session Context State ──
+    session_context_status: Literal["pending_user_review", "active", "removed", "failed", ""]
+    context_source: Literal["generated", "user_edited", ""]
+    generated_context_text: str
+    active_context_text: str
+    popup_required: bool
+
+    # ── Elicitation ──clarification loop tracking ───────────────────────────────────
     active_question_id: str
     active_question_type: str
     active_question_options: list[str]
@@ -324,6 +392,9 @@ class PRDState(TypedDict):
     reply_context_message_id: str
     reply_context_message_text: str
     reply_context_interpretation: ReplyContextInterpretation
+    active_semantic_target: TargetedContext
+    secondary_semantic_context: SecondaryContext
+    context_route_hint: Literal["normal_answer", "clarification_target", "no_override"]
     pending_echo: str            # system restatement awaiting user confirmation
     pending_concept_updates: dict  # candidate Q&A not yet promoted to canonical truth
     answer_confirmation_status: str  # "" | "PENDING" | "CONFIRMED" | "CORRECTED"

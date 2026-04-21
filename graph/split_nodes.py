@@ -3,6 +3,7 @@ import re
 import datetime
 import uuid
 import logging
+from typing import Optional
 from graph.state import PRDState, ConceptStatus
 from graph.nodes import (
     _log_ctx, log_event, _get_llm, _classify_intent_rule, get_section_by_index, 
@@ -60,6 +61,18 @@ def numeric_validation_node(state: PRDState) -> dict:
 def intent_classifier_node(state: PRDState) -> dict:
     """1. Intent Classifier Node"""
     ctx = _log_ctx(state, "intent_classifier")
+    raw_answer = state.get("raw_answer_buffer", "").strip()
+    
+    import logging, re
+    metrics_logger = logging.getLogger("orchestrator_metrics")
+    metrics_logger.info("first_consumer_of_input", extra={
+        "event_type": "first_consumer_of_input",
+        "turn_id": state.get("run_id", "unknown"),
+        "node_name": "intent_classifier",
+        "input_length": len(raw_answer),
+        "looks_like_replayed_conversation": bool(re.search(r"(?i)\buser:.*\bassistant:", raw_answer)) if raw_answer else False
+    })
+    
     log_event(**ctx, level="INFO", event_type="node_start", message="intent_classifier started")
     
     question = state.get("current_questions", "").strip()
@@ -106,16 +119,90 @@ def intent_classifier_node(state: PRDState) -> dict:
         res["reply_context_interpretation"] = interpretation
     return res
 
+MIN_SUPPORTING_CONTEXT_CONFIDENCE = 0.5
+
+def target_context_selector_node(state: PRDState) -> dict:
+    """1a. Target Context Selector Node"""
+    ctx = _log_ctx(state, "target_context_selector")
+    log_event(**ctx, level="INFO", event_type="node_start", message="target_context_selector started")
+    
+    interp = state.get("reply_context_interpretation", {})
+    replied_text = state.get("reply_context_message_text", "").strip()
+    replied_id = state.get("reply_context_message_id")
+    reply_intent = state.get("reply_intent", "")
+    
+    active_target = {
+        "target_type": "latest_question",
+        "target_message_id": None,
+        "target_text": state.get("current_questions", "").strip() or "",
+        "relationship_type": "",
+        "confidence": 0.0
+    }
+    secondary_context = {
+        "target_available": False,
+        "message_id": None,
+        "text": None
+    }
+    context_route_hint = "normal_answer"
+    
+    if interp and interp.get("reply_context_present"):
+        rel_type = interp.get("relationship_type", "")
+        conf = interp.get("confidence", 0.0)
+        
+        if not replied_text and rel_type in ("correction_or_disagreement_with_replied_message", "direct_answer_to_replied_message", "clarification_about_replied_message", "supporting_context_only"):
+            log_event(**ctx, level="WARNING", event_type="target_context_selector_missing_text", message=f"Replied text missing for relationship {rel_type}, falling back to latest question.")
+        else:
+            if rel_type in ("direct_answer_to_replied_message", "correction_or_disagreement_with_replied_message"):
+                active_target.update({
+                    "target_type": "replied_message",
+                    "target_message_id": replied_id,
+                    "target_text": replied_text,
+                    "relationship_type": rel_type,
+                    "confidence": conf
+                })
+            elif rel_type == "clarification_about_replied_message":
+                context_route_hint = "clarification_target"
+                active_target.update({
+                    "target_type": "replied_message",
+                    "target_message_id": replied_id,
+                    "target_text": replied_text,
+                    "relationship_type": rel_type,
+                    "confidence": conf
+                })
+            elif rel_type == "supporting_context_only":
+                if conf >= MIN_SUPPORTING_CONTEXT_CONFIDENCE:
+                    secondary_context.update({
+                        "target_available": True,
+                        "message_id": replied_id,
+                        "text": replied_text
+                    })
+                    
+    if reply_intent == "DIRECT_ANSWER" and context_route_hint == "clarification_target":
+        log_event(**ctx, level="INFO", event_type="target_context_conflict_override", message="Relationship type overrode general intent to force clarification routing.")
+
+    log_event(**ctx, level="INFO", event_type="target_context_selector_output", message="Emitted target context overrides", 
+        active_target_type=active_target["target_type"],
+        has_secondary=secondary_context["target_available"],
+        route_hint=context_route_hint)
+
+    return {
+        "active_semantic_target": active_target,
+        "secondary_semantic_context": secondary_context,
+        "context_route_hint": context_route_hint
+    }
+
 def clarification_router_node(state: PRDState) -> dict:
-    """1a. Clarification Router Node"""
+    """1b. Clarification Router Node"""
     ctx = _log_ctx(state, "clarification_router")
     log_event(**ctx, level="INFO", event_type="node_start", message="clarification_router started")
     
     reply_intent = state.get("reply_intent", "")
+    context_route_hint = state.get("context_route_hint", "normal_answer")
+    
     route = "option_resolution"
     fallback_state = "proceeding to normal extraction"
     
-    if reply_intent in ("DIRECT_CLARIFICATION_QUESTION", "UNCLEAR_META"):
+    if context_route_hint == "clarification_target" or reply_intent in ("DIRECT_CLARIFICATION_QUESTION", "UNCLEAR_META"):
         route = "answer_clarification"
         fallback_state = "diverting to clarify user question"
     elif reply_intent in ("REPHRASE_REQUEST", "AMBIGUOUS", "REPETITION_COMPLAINT", "COMPLAINT_OR_META"):
@@ -187,12 +274,10 @@ def semantic_assessor_node(state: PRDState) -> dict:
     log_event(**ctx, level="INFO", event_type="node_start", message="semantic_assessor started")
 
     raw_answer = state.get("raw_answer_buffer", "").strip()
-    question = state.get("current_questions", "").strip()
     
-    interp = state.get("reply_context_interpretation", {})
-    if interp and interp.get("relationship_type") == "direct_answer_to_replied_message" and state.get("reply_context_message_text"):
-        log_event(**ctx, level="INFO", event_type="semantic_assessor_context_shift", message="Evaluating answer against explicitly bounded reply context instead of current active question")
-        question = state.get("reply_context_message_text")
+    # TC3: Unconditionally read from the FULL active_semantic_target object.
+    active_target = state.get("active_semantic_target", {})
+    question = active_target.get("target_text", state.get("current_questions", "")).strip()
         
     current_question_object = state.get("current_question_object", {})
     subparts = current_question_object.get("subparts", [])
@@ -593,6 +678,7 @@ def echo_generation_node(state: PRDState) -> dict:
         return_payload["chat_history"] = [
             {
                 "role": "assistant",
+                "msg_id": f"msg_{str(uuid.uuid4())[:8]}",
                 "type": "echo_confirmation",
                 "section": section.title if section else "General",
                 "content": echo_text,
@@ -661,3 +747,349 @@ def handle_numeric_error_node(state: PRDState) -> dict:
             }
         ]
     }
+
+
+def file_upload_intake_node(state: PRDState) -> dict:
+    """Processes uploaded files uniformly before semantic processing."""
+    ctx = _log_ctx(state, "file_upload_intake")
+    log_event(**ctx, level="INFO", event_type="node_start", message="file_upload_intake started")
+    
+    uploaded_files = state.get("uploaded_files", [])
+    if not uploaded_files:
+        return {
+            "upload_status": "rejected",
+            "accepted_files": [],
+            "rejected_files": [{"filename": "", "reason": "no_files_uploaded"}],
+            "downstream_analysis_allowed": False
+        }
+    
+    accepted = []
+    rejected = []
+    
+    ALLOWED_MIME_TYPES = {
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "application/pdf": "pdf"
+    }
+    ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "pdf"}
+    
+    for f in uploaded_files:
+        # Validate payload structure
+        if not isinstance(f, dict) or "file_id" not in f or "filename" not in f or "mime_type" not in f or "size_bytes" not in f:
+            rejected.append({"filename": f.get("filename", ""), "reason": "malformed_file_payload"})
+            continue
+            
+        if f["size_bytes"] == 0:
+            rejected.append({"filename": f["filename"], "reason": "empty_file"})
+            continue
+            
+        mime = str(f["mime_type"]).lower()
+        ext = f["filename"].split(".")[-1].lower() if "." in f.get("filename", "") else ""
+        
+        file_type = ""
+        # MIME type is primary validation signal (FU4)
+        if mime in ALLOWED_MIME_TYPES:
+            file_type = ALLOWED_MIME_TYPES[mime]
+        elif ext in ALLOWED_EXTENSIONS:
+            file_type = "jpg" if ext == "jpeg" else ext
+            
+        if not file_type:
+            rejected.append({"filename": f["filename"], "reason": "unsupported_file_type"})
+        else:
+            accepted.append({
+                "file_id": f["file_id"],
+                "filename": f["filename"],
+                "file_type": file_type,
+                "bytes": f.get("bytes")
+            })
+            
+    if not accepted and rejected:
+        upload_status = "rejected"
+        downstream = False
+    elif accepted and rejected:
+        upload_status = "accepted_partial"
+        downstream = True
+    else:
+        upload_status = "accepted"
+        downstream = True
+        
+    log_event(**ctx, level="INFO", event_type="file_upload_intake_result", message="file_upload_intake_result", 
+              upload_status=upload_status, accepted_count=len(accepted), rejected_count=len(rejected))
+              
+    return {
+        "upload_status": upload_status,
+        "accepted_files": accepted,
+        "rejected_files": rejected,
+        "downstream_analysis_allowed": downstream,
+        "uploaded_files": []
+    }
+    
+
+def file_upload_rejection_node(state: PRDState) -> dict:
+    """Emits rejection feedback to the user and halts downstream pipeline."""
+    ctx = _log_ctx(state, "file_upload_rejection")
+    log_event(**ctx, level="INFO", event_type="node_start", message="file_upload_rejection started")
+    
+    # We will format a user-friendly error message based on the rejected files.
+    rejected = state.get("rejected_files", [])
+    
+    # The UI layer handles rendering, but we provide the structured message payload here
+    return {
+        "chat_history": [
+            {
+                "role": "assistant",
+                "msg_id": f"msg_{str(uuid.uuid4())[:8]}",
+                "type": "file_upload_rejection_error",
+                "rejected_files": rejected,
+                "content": ""  # UI assembly layer formats this into human-readable text
+            }
+        ]
+    }
+
+def uploaded_image_description_node(state: PRDState) -> dict:
+    """Converts accepted JPG and PNG images into bounded visual descriptions."""
+    import io
+    import base64
+    from pydantic import BaseModel, Field
+    
+    class RawVisualObservation(BaseModel):
+        high_level_description: str = Field(description="A concise summary of what this image fundamentally is (e.g. screenshot, whiteboard diagram, form).")
+        distinct_visible_elements: list[str] = Field(description="List of explicitly distinct elements visible in the frame.")
+        unreadable_or_uncertain_areas: list[str] = Field(description="List of areas marked intentionally vague or unreadable.")
+        
+    ctx = _log_ctx(state, "uploaded_image_description")
+    log_event(**ctx, level="INFO", event_type="node_start", message="uploaded_image_description started")
+    
+    accepted_files = state.get("accepted_files", [])
+    image_files = [f for f in accepted_files if f.get("file_type") in ("jpg", "png")]
+    
+    if not image_files:
+        log_event(**ctx, level="INFO", event_type="image_description_result", message="No accepted images found")
+        return {
+            "image_description_status": "no_accepted_images",
+            "described_images": [],
+            "needs_followup": True
+        }
+        
+    described_images = []
+    
+    try:
+        from PIL import Image, ImageOps, UnidentifiedImageError
+        from langchain_core.messages import HumanMessage
+        llm = _get_llm().with_structured_output(RawVisualObservation)
+    except Exception as e:
+        log_event(**ctx, level="ERROR", event_type="image_description_setup_error", message=str(e))
+        return {"image_description_status": "failed", "described_images": [], "needs_followup": True}
+        
+    MAX_IMAGE_DIMENSION = 2048
+    
+    for img in image_files:
+        fid = img["file_id"]
+        
+        # 1. Binary Retrieval (IP1)
+        if "bytes" not in img or not img["bytes"]:
+            described_images.append({
+                "file_id": fid,
+                "image_description_status": "failed",
+                "error_code": "missing_binary",
+                "high_level_description": None,
+                "visible_elements": [],
+                "uncertainties": []
+            })
+            continue
+            
+        raw_bytes = img["bytes"]
+        bytes_io = io.BytesIO(raw_bytes)
+        
+        # 2. PIL Preprocessing Sequence (IP2, IP3)
+        try:
+            Image.open(bytes_io).verify()
+        except Exception:
+            described_images.append({
+                "file_id": fid,
+                "image_description_status": "failed",
+                "error_code": "corrupted_image",
+                "high_level_description": None,
+                "visible_elements": [],
+                "uncertainties": []
+            })
+            continue
+            
+        try:
+            bytes_io.seek(0)
+            pil_img = Image.open(bytes_io)
+            pil_img = ImageOps.exif_transpose(pil_img)
+            
+            orig_size = pil_img.size
+            pil_img.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION))
+            normalized_bytes = io.BytesIO()
+            pil_img.save(normalized_bytes, format="PNG")
+            img_b64 = base64.b64encode(normalized_bytes.getvalue()).decode("utf-8")
+            
+            log_event(**ctx, level="INFO", event_type="preprocessing_complete", 
+                      message="Preprocessing completed successfully",
+                      file_id=fid, orig_size=orig_size, norm_size=pil_img.size)
+        except Exception as e:
+            log_event(**ctx, level="ERROR", event_type="preprocessing_error", message=str(e), file_id=fid)
+            described_images.append({
+                "file_id": fid,
+                "image_description_status": "failed",
+                "error_code": "corrupted_image",
+                "high_level_description": None,
+                "visible_elements": [],
+                "uncertainties": []
+            })
+            continue
+
+        instruction = (
+            "You are a strict, objective visual observation engine.\n"
+            "Below is a single image file. Provide a structured description purely based on what is visibly seen.\n"
+            "Do NOT attempt to guess hidden meanings, user goals, or context outside this image.\n"
+            "Do NOT transcribe entire paragraphs, but you may quote short phrases or headers (< 15 words) if clearly readable.\n"
+            "Ensure unreadable sections are strictly flagged as uncertainties.\n"
+            "Do not invent details."
+        )
+        
+        msg = HumanMessage(
+            content=[
+                {"type": "text", "text": instruction},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                }
+            ]
+        )
+        
+        retries = 1
+        
+        for attempt in range(retries + 1):
+            try:
+                # API Boundary Log
+                log_event(**ctx, level="INFO", event_type="llm_call_start", message="Invoking multimodal API", purpose="multimodal_image_observation", file_id=fid, attempt=attempt)
+                raw_obs = llm.invoke([msg])
+                
+                # Output Schema Alignment (IP4)
+                described_images.append({
+                    "file_id": fid,
+                    "filename": img["filename"],
+                    "image_description_status": "described",
+                    "error_code": "",
+                    "high_level_description": raw_obs.high_level_description,
+                    "visible_elements": raw_obs.distinct_visible_elements,
+                    "uncertainties": raw_obs.unreadable_or_uncertain_areas
+                })
+                break
+            except Exception as e:
+                err_str = str(e).lower()
+                error_code = "parse_error" if "validation" in err_str or "pydantic" in err_str else "api_timeout"
+                log_event(**ctx, level="ERROR", event_type="llm_call_error", message=str(e), file_id=fid, error_code=error_code, attempt=attempt, error_str=str(e))
+                if attempt == retries:
+                    described_images.append({
+                        "file_id": fid,
+                        "image_description_status": "failed",
+                        "error_code": error_code,
+                        "high_level_description": None,
+                        "visible_elements": [],
+                        "uncertainties": []
+                    })
+                    
+    log_event(**ctx, level="INFO", event_type="image_description_result", 
+              message="Successfully processed images via multimodal API", count=len(described_images))
+              
+    return {
+        "image_description_status": "described",
+        "described_images": described_images,
+        "needs_followup": False
+    }
+
+def image_description_session_context_node(state: PRDState) -> dict:
+    """Converts described images into a structured editable session context draft."""
+    ctx = _log_ctx(state, "image_description_session_context")
+    log_event(**ctx, level="INFO", event_type="node_start", message="image_description_session_context started")
+    
+    # Check if a UI event is pending (Submit or Revert from the popup)
+    pending = state.get("pending_event", {})
+    if pending.get("event_type") == "SUBMIT_SESSION_CONTEXT":
+        log_event(**ctx, level="INFO", event_type="session_context_activated", message="User submitted session context")
+        return {
+            "session_context_status": "active",
+            "active_context_text": pending.get("content", ""),
+            "context_source": "user_edited" if pending.get("is_edited") else "generated",
+            "popup_required": False,
+            "pending_event": {} # Clear pending event
+        }
+    elif pending.get("event_type") == "REMOVE_SESSION_CONTEXT":
+        log_event(**ctx, level="INFO", event_type="session_context_removed", message="User removed session context")
+        return {
+            "session_context_status": "removed",
+            "active_context_text": "",
+            "popup_required": False,
+            "pending_event": {} # Clear pending event
+        }
+
+    status = state.get("image_description_status", "")
+    described_images = state.get("described_images", [])
+
+    if status != "described" or not described_images:
+        log_event(**ctx, level="INFO", event_type="session_context_skipped", message="Skipped context generation due to invalid status")
+        return {"session_context_status": "failed", "popup_required": False}
+
+    draft_blocks = []
+    try:
+        for img in described_images:
+            if img.get("image_description_status") == "failed":
+                continue
+                
+            block = [
+                "[image]",
+                img.get("filename") or "unknown",
+                "",
+                "[what_is_going_on]",
+                img.get("high_level_description") or "",
+                "",
+                "[entities]"
+            ]
+            
+            entities = img.get("visible_elements", [])
+            for e in entities:
+                block.append(f"- {e}")
+            if not entities:
+                block.append("- No specific entities identified")
+                
+            block.extend([
+                "",
+                "[visible_text]",
+                "- Unverified content",
+                "",
+                "[layout_and_structure]",
+                "Unknown spatial arrangement.",
+                "",
+                "[key_details]",
+                "- Visible elements mapped",
+                "",
+                "[uncertainties]"
+            ])
+            
+            uncerts = img.get("uncertainties", [])
+            for u in uncerts:
+                block.append(f"- {u}")
+            if not uncerts:
+                block.append("- No explicit uncertainties logged")
+                
+            draft_blocks.append("\n".join(block))
+
+        generated_text = "\n\n---\n\n".join(draft_blocks)
+        
+        log_event(**ctx, level="INFO", event_type="session_context_generated", message="Successfully generated reviewable draft")
+        return {
+            "session_context_status": "pending_user_review",
+            "context_source": "generated",
+            "generated_context_text": generated_text,
+            "popup_required": True
+        }
+    except Exception as e:
+        log_event(**ctx, level="ERROR", event_type="session_context_error", message=str(e))
+        return {
+            "session_context_status": "failed",
+            "popup_required": False
+        }

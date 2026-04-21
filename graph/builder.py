@@ -16,10 +16,12 @@ from graph.nodes import (
     handle_tagged_event_node,
     rebuild_mirror_node,
     reflect_node,
+    terminal_session_node,
 )
 from graph.split_nodes import (
     numeric_validation_node,
     intent_classifier_node,
+    target_context_selector_node,
     clarification_router_node,
     repair_mode_node,
     option_resolution_node,
@@ -31,7 +33,11 @@ from graph.split_nodes import (
     concept_history_update_node,
     echo_generation_node,
     state_cleanup_node,
-    handle_numeric_error_node
+    handle_numeric_error_node,
+    file_upload_intake_node,
+    file_upload_rejection_node,
+    uploaded_image_description_node,
+    image_description_session_context_node,
 )
 from graph.routing import (
     route_after_draft,
@@ -43,6 +49,9 @@ from graph.routing import (
     route_after_contradiction,
     route_after_framing,
     route_after_reflect,
+    route_after_file_intake,
+    route_after_multimodal_call,
+    route_after_session_context_node,
 )
 from graph.state import PRDState
 
@@ -86,6 +95,7 @@ def build_graph(checkpointer: MemorySaver | None = None):
     builder.add_node("handle_tagged_event", handle_tagged_event_node)
     builder.add_node("numeric_validation", numeric_validation_node)
     builder.add_node("intent_classifier", intent_classifier_node)
+    builder.add_node("target_context_selector", target_context_selector_node)
     builder.add_node("clarification_router", clarification_router_node)
     builder.add_node("repair_mode", repair_mode_node)
     builder.add_node("option_resolution", option_resolution_node)
@@ -98,12 +108,17 @@ def build_graph(checkpointer: MemorySaver | None = None):
     builder.add_node("echo_generation", echo_generation_node)
     builder.add_node("state_cleanup", state_cleanup_node)
     builder.add_node("handle_numeric_error", handle_numeric_error_node)
+    builder.add_node("file_upload_intake", file_upload_intake_node)
+    builder.add_node("file_upload_rejection", file_upload_rejection_node)
+    builder.add_node("uploaded_image_description", uploaded_image_description_node)
+    builder.add_node("image_description_session_context", image_description_session_context_node)
     
     builder.add_node("answer_clarification", answer_clarification_node)
     builder.add_node("detect_impact", detect_impact_node)
     builder.add_node("draft", draft_node)
     builder.add_node("reflect", reflect_node)
     builder.add_node("advance_section", advance_section_node)
+    builder.add_node("terminal_session", terminal_session_node)
     builder.add_node("finalize", finalize_node)
 
     # ── Edges ─────────────────────────────────────────────────────────────────
@@ -116,6 +131,7 @@ def build_graph(checkpointer: MemorySaver | None = None):
         {
             "generate_questions": "rebuild_mirror",
             "discovery_questions": "discovery_questions",
+            "file_upload_intake": "file_upload_intake",
         },
     )
 
@@ -126,6 +142,9 @@ def build_graph(checkpointer: MemorySaver | None = None):
         {
             "generate_questions": "rebuild_mirror",
             "discovery_questions": "discovery_questions",
+            "file_upload_intake": "file_upload_intake",
+            "image_description_session_context": "image_description_session_context",
+            "terminal_session": "terminal_session",
         },
     )
 
@@ -140,8 +159,54 @@ def build_graph(checkpointer: MemorySaver | None = None):
         {
             "numeric_validation": "numeric_validation",
             "handle_tagged_event": "handle_tagged_event",
+            "file_upload_intake": "file_upload_intake",
+            "image_description_session_context": "image_description_session_context",
+            "terminal_session": "terminal_session",
         },
     )
+    
+    builder.add_conditional_edges(
+        "file_upload_intake",
+        route_after_file_intake,
+        {
+            "uploaded_image_description": "uploaded_image_description",
+            "file_upload_rejection": "file_upload_rejection",
+            "generate_questions": "rebuild_mirror",
+            "discovery_questions": "discovery_questions",
+            "numeric_validation": "numeric_validation",
+            "handle_tagged_event": "handle_tagged_event",
+        }
+    )
+    
+    builder.add_conditional_edges(
+        "uploaded_image_description",
+        route_after_multimodal_call,
+        {
+            "image_description_session_context": "image_description_session_context",
+            "generate_questions": "generate_questions",
+            "discovery_questions": "discovery_questions"
+        }
+    )
+    
+    builder.add_conditional_edges(
+        "image_description_session_context",
+        route_after_session_context_node,
+        {
+            "await_answer": "await_answer",
+            "handle_tagged_event": "handle_tagged_event",
+            "numeric_validation": "numeric_validation",
+            "generate_questions": "generate_questions",
+            "discovery_questions": "discovery_questions"
+        }
+    )
+    # The rejection node halts further logic traversal, routing users back into await nodes implicitly
+    # Since it modifies stream history and terminates its immediate arc, it loops to whichever
+    # next loop iteration catches state completion (usually an `await_answer` manually fired again).
+    # Actually, we should route back to their previous active state wait block manually:
+    # However we don't have enough state memory here to perfectly rewind without duplicating await edges. 
+    # Just sending it to await_answer works to block progress until user remediates.
+    builder.add_edge("file_upload_rejection", "await_answer")
+
     
     builder.add_conditional_edges(
         "numeric_validation",
@@ -155,7 +220,8 @@ def build_graph(checkpointer: MemorySaver | None = None):
     builder.add_edge("handle_tagged_event", "detect_impact")
     
     # Intent split routing
-    builder.add_edge("intent_classifier", "clarification_router")
+    builder.add_edge("intent_classifier", "target_context_selector")
+    builder.add_edge("target_context_selector", "clarification_router")
     
     builder.add_conditional_edges(
         "clarification_router",
@@ -212,6 +278,7 @@ def build_graph(checkpointer: MemorySaver | None = None):
             "advance_section": "advance_section",
             "generate_questions": "rebuild_mirror",
             "draft": "draft",
+            "terminal_session": "terminal_session",
         },
     )
 
@@ -224,6 +291,9 @@ def build_graph(checkpointer: MemorySaver | None = None):
         },
     )
 
+    builder.add_edge("advance_section", "generate_questions")
+
+    builder.add_edge("terminal_session", END)
     builder.add_edge("finalize", END)
 
     return builder.compile(checkpointer=checkpointer or MemorySaver())

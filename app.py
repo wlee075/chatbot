@@ -96,6 +96,12 @@ def _build_initial_state(image_context: list[str]) -> dict:
     return {
         "thread_id": st.session_state.thread_id,
         "run_id": str(uuid.uuid4()),
+        "session_status": "",
+        "session_end_reason": "",
+        "session_end_message": "",
+        "input_disabled": False,
+        "draft_available": False,
+        "draft_download_available": False,
         "context_doc": "",
         "max_iterations": DEFAULT_MAX_SECTION_ITERATIONS,
         "phase": "discovery",
@@ -629,9 +635,14 @@ sv: dict = gstate.values if gstate else {}
 
 # ── Top bar (D-M1): visible only when session is active ───────────────────────
 if st.session_state.graph_started:
-    col_title, _sp, col_new, col_dl = st.columns([5, 2, 1, 1])
+    col_title, _sp, col_end, col_new, col_dl = st.columns([4, 1, 1, 1, 1])
     with col_title:
         st.markdown("**PRD Builder**")
+    with col_end:
+        is_pending = bool(sv.get("is_complete", False) or sv.get("input_disabled", False))
+        if st.button("⏹ End", use_container_width=True, disabled=is_pending):
+            st.session_state._pending_payload = {"event_type": "TERMINATE_SESSION", "content": ""}
+            st.rerun()
     with col_new:
         if st.button("↩ New", use_container_width=True):
             st.session_state.thread_id = str(uuid.uuid4())
@@ -794,6 +805,13 @@ if st.session_state.graph_started:
             st.markdown(f'<div id="{msg_id}"></div>', unsafe_allow_html=True)
             with st.chat_message("user"):
                 st.markdown(content)
+                
+                # Render bound image context if this turn had original attachments
+                attached_ctx = user_msg.get("attached_image_context")
+                if attached_ctx:
+                    with st.expander("🖼️ Attached Image Context", expanded=False):
+                        st.markdown(attached_ctx)
+                        
                 _render_message_actions(msg_id, content, "user", user_msg.get("type", ""))
 
         # 2. Render Single Terminal Intents for Assistant
@@ -1000,14 +1018,18 @@ if st.session_state.graph_started:
                     st.balloons()
                     st.success(_present_content(content, source_lookup, confirmed_qa_store))
 
+    if sv.get("session_status") == "ended_retry_limit":
+        st.error(f"**Session Ended:** {sv.get('session_end_message', 'Unable to get enough information to continue. Session has ended.')}")
+
 # ── Pending input: render user bubble + stream ABOVE the composer row ────────
 # Stored by the composer when user submits; processed here so the messages
 # appear after chat history, not below the input widget.
 if st.session_state.get("_pending_payload"):
     _pp = st.session_state.pop("_pending_payload")
     _pm = st.session_state.pop("_pending_user_msg", "")
-    with st.chat_message("user"):
-        st.markdown(_pm)
+    if _pm:
+        with st.chat_message("user"):
+            st.markdown(_pm)
     _stream_graph_resume(_pp)  # ends with st.rerun()
 
 # ── Latency badge (A6) — only shown when debug telemetry is enabled ─────────
@@ -1042,42 +1064,147 @@ if st.session_state.graph_started and st.session_state.get("active_reference"):
             st.session_state.active_reference = None
             st.rerun()
 
+if "upload_mode" not in st.session_state:
+    st.session_state.upload_mode = False
+
 # ── Composer row: [📎 Add image | text input] ─────────────────────────────────
 _img_col, _inp_col = st.columns([1, 13], gap="small")
 
 with _img_col:
-    with st.popover("📎", help="Add image", use_container_width=True):
+    # Safely disable the attachment button if we are currently reviewing an image draft
+    sv_tmp = st.session_state.get("stream_state", {})
+    is_reviewing = sv_tmp.get("session_context_status") == "pending_user_review"
+    
+    with st.popover("📎", use_container_width=True, disabled=is_reviewing):
         uploaded_img = st.file_uploader(
             "Share a screenshot or diagram to help describe what you're building.",
             type=["png", "jpg", "jpeg", "webp"],
             key="image_uploader",
-            label_visibility="visible",
+            label_visibility="collapsed",
         )
         if uploaded_img is not None:
             img_key = f"_img_processed_{uploaded_img.name}_{uploaded_img.size}"
             if img_key not in st.session_state:
-                with st.spinner("Reading your image…"):
-                    mime = uploaded_img.type or "image/png"
-                    description = _describe_image(uploaded_img.read(), mime)
                 st.session_state[img_key] = True
-                if description:
-                    st.session_state.image_context_buffer.append(description)
-                    st.success("✓ Image added as context.")
-                    if st.session_state.graph_started and gstate:
-                        graph.update_state(_config(), {"image_context": [description]})
-                else:
-                    st.info("Image didn't contain product-related content — skipped.")
+                mime = uploaded_img.type or "image/png"
+                payload = {
+                    "event_type": "FILE_UPLOAD",
+                    "uploaded_files": [{
+                        "file_id": f"file_{uuid.uuid4().hex[:8]}",
+                        "filename": uploaded_img.name,
+                        "size_bytes": uploaded_img.size,
+                        "mime_type": mime,
+                        "bytes": uploaded_img.read()
+                    }]
+                }
+                st.session_state._pending_payload = payload
+                st.rerun()
 
 with _inp_col:
     if st.session_state.graph_started:
         # Active session: answer questions or show completion state
         if is_waiting:
-            placeholder = (
-                "Reply, correct, or clarify…"
-                if active_ref else "Type your answer and press Enter…"
-            )
-            user_input = st.chat_input(placeholder)
-            if user_input and user_input.strip():
+            user_input = None
+            
+            if sv.get("session_context_status") == "pending_user_review":
+                img_data = sv.get("described_images", [])[0] if sv.get("described_images") else {}
+                edit_key = "edit_image_summary_mode"
+                if edit_key not in st.session_state:
+                    st.session_state[edit_key] = False
+
+                with st.container(border=True):
+                    st.markdown("### 🖼️ Review Image Context")
+                    st.caption("Check that this summary matches the uploaded image before using it in this session.")
+                    
+                    if not st.session_state[edit_key]:
+                        # Default View: Friendly summary card
+                        st.markdown(f"**Filename:** `{img_data.get('filename', 'unknown')}`")
+                        st.write(img_data.get('high_level_description', 'No description generated.'))
+                        
+                        entities = img_data.get("visible_elements", [])
+                        uncerts = img_data.get("uncertainties", [])
+                        
+                        with st.expander(f"View extracted details ({len(entities)} elements)", expanded=False):
+                            for e in entities:
+                                st.markdown(f"- {e}")
+                            if uncerts:
+                                st.markdown("**Uncertainties:**")
+                                for u in uncerts:
+                                    st.markdown(f"- {u}")
+                                    
+                        c1, c2, c3 = st.columns([2, 1, 1])
+                        with c1:
+                            if st.button("Use This Image Context", type="primary", use_container_width=True):
+                                # Compile human-friendly approved context entirely decoupled from internal schema tags
+                                approved_text = f"Image: {img_data.get('filename')}\nSummary: {img_data.get('high_level_description')}"
+                                if entities:
+                                    approved_text += "\nElements: " + ", ".join(entities)
+                                st.session_state._pending_payload = {
+                                    "event_type": "SUBMIT_SESSION_CONTEXT", 
+                                    "content": approved_text, 
+                                    "is_edited": False
+                                }
+                                st.session_state[edit_key] = False
+                                st.rerun()
+                        with c2:
+                            if st.button("Edit Summary", use_container_width=True):
+                                st.session_state[edit_key] = True
+                                st.rerun()
+                        with c3:
+                            if st.button("Remove Image Context", use_container_width=True):
+                                st.session_state._pending_payload = {"event_type": "REMOVE_SESSION_CONTEXT"}
+                                st.session_state[edit_key] = False
+                                st.rerun()
+                                
+                    else:
+                        # Edit View
+                        default_edit = f"Image: {img_data.get('filename')}\nSummary: {img_data.get('high_level_description')}"
+                        if img_data.get('visible_elements'):
+                            default_edit += f"\nElements: {', '.join(img_data.get('visible_elements'))}"
+                        edited_text = st.text_area("Edit the plain text summary:", value=default_edit, height=150)
+                        
+                        c1, c2 = st.columns([1, 1])
+                        with c1:
+                            if st.button("Save & Approve", type="primary", use_container_width=True):
+                                st.session_state._pending_payload = {
+                                    "event_type": "SUBMIT_SESSION_CONTEXT", 
+                                    "content": edited_text, 
+                                    "is_edited": True
+                                }
+                                st.session_state[edit_key] = False
+                                st.rerun()
+                        with c2:
+                            if st.button("Cancel Edit", use_container_width=True):
+                                st.session_state[edit_key] = False
+                                st.rerun()
+                                
+                                
+            # STATE 2: Active Session Context View & Text Entry
+            else:
+                if sv.get("session_context_status") == "active":
+                    with st.container(border=True):
+                        st.markdown("🖼️ **Active Image Context**")
+                        st.caption("A reference image summary is currently active for this session.")
+                        with st.expander("View active summary", expanded=False):
+                            st.text(sv.get("active_context_text", ""))
+                            if st.button("Remove Context", key="remove_active"):
+                                st.session_state._pending_payload = {"event_type": "REMOVE_SESSION_CONTEXT"}
+                                st.rerun()
+                                
+                if sv.get("input_disabled"):
+                    user_input = st.chat_input("Session has ended.", disabled=True)
+                else:
+                    placeholder = (
+                        "Reply, correct, or clarify…"
+                        if active_ref else "Type your answer and press Enter…"
+                    )
+                    user_input = st.chat_input(placeholder)
+                    
+            # Safe submit rule checking
+            has_text_input = bool(user_input and user_input.strip())
+            # In our workflow, has_uploaded_files triggers reruns natively via file_uploader before reaching here,
+            # so this submit gate handles purely text and UI bounds safely.
+            if has_text_input:
                 placeholders = _find_placeholders(user_input)
                 if placeholders:
                     st.warning(
@@ -1103,6 +1230,19 @@ with _inp_col:
                         st.session_state.active_reference = None  # consume reference
                     else:
                         payload = {"event_type": "ANSWER", "content": user_input}
+                        
+                    import logging, re
+                    metrics_logger = logging.getLogger("orchestrator_metrics")
+                    contains_prior_chat = bool(re.search(r"(?i)\buser:.*\bassistant:", user_input)) if user_input else False
+                    metrics_logger.info("composer_submit_payload_debug", extra={
+                        "event_type": "composer_submit_payload_debug",
+                        "turn_id": sv.get("run_id", "unknown") if sv else "unknown",
+                        "latest_user_input_length": len(user_input),
+                        "contains_prior_chat_markers": contains_prior_chat,
+                        "reply_context_present": bool(active_ref),
+                        "upload_text_length": 0
+                    })
+                        
                     # Store and rerun — processed above the composer row on next render
                     st.session_state._pending_payload = payload
                     st.session_state._pending_user_msg = user_input
@@ -1112,18 +1252,65 @@ with _inp_col:
 
     else:
         # Landing: first message initialises the graph (D-M2)
-        user_input = st.chat_input("Describe what you're building…")
-        if user_input and user_input.strip():
-            try:
-                graph.invoke(
-                    _build_initial_state(list(st.session_state.image_context_buffer)),
-                    _config(),
+        if st.session_state.upload_mode:
+            with st.container(border=True):
+                c1, c2 = st.columns([10, 1])
+                with c1:
+                    st.markdown("**Attach an Image**")
+                with c2:
+                    if st.button("✕", key="cancel_upload_landing", use_container_width=True):
+                        st.session_state.upload_mode = False
+                        st.rerun()
+                
+                uploaded_img = st.file_uploader(
+                    "Share a screenshot or diagram to help describe what you're building.",
+                    type=["png", "jpg", "jpeg", "webp"],
+                    key="image_uploader_landing",
+                    label_visibility="collapsed",
                 )
-            except Exception as exc:
-                st.error(f"Could not start session: {exc}")
-                st.stop()
-            st.session_state.graph_started = True
-            st.session_state.image_context_buffer = []
-            st.session_state._pending_payload = user_input
-            st.session_state._pending_user_msg = user_input
-            st.rerun()
+                if uploaded_img is not None:
+                    img_key = f"_img_processed_{uploaded_img.name}_{uploaded_img.size}"
+                    if img_key not in st.session_state:
+                        st.session_state[img_key] = True
+                        mime = uploaded_img.type or "image/png"
+                        payload = {
+                            "event_type": "FILE_UPLOAD",
+                            "uploaded_files": [{
+                                "file_id": f"file_{uuid.uuid4().hex[:8]}",
+                                "filename": uploaded_img.name,
+                                "size_bytes": uploaded_img.size,
+                                "mime_type": mime,
+                                "bytes": uploaded_img.read()
+                            }]
+                        }
+                        
+                        try:
+                            graph.invoke(
+                                _build_initial_state(list(st.session_state.image_context_buffer)),
+                                _config(),
+                            )
+                        except Exception as exc:
+                            st.error(f"Could not start session: {exc}")
+                            st.stop()
+                            
+                        st.session_state.graph_started = True
+                        st.session_state.image_context_buffer = []
+                        st.session_state.upload_mode = False
+                        st.session_state._pending_payload = payload
+                        st.rerun()
+        else:
+            user_input = st.chat_input("Describe what you're building…")
+            if user_input and user_input.strip():
+                try:
+                    graph.invoke(
+                        _build_initial_state(list(st.session_state.image_context_buffer)),
+                        _config(),
+                    )
+                except Exception as exc:
+                    st.error(f"Could not start session: {exc}")
+                    st.stop()
+                st.session_state.graph_started = True
+                st.session_state.image_context_buffer = []
+                st.session_state._pending_payload = user_input
+                st.session_state._pending_user_msg = user_input
+                st.rerun()

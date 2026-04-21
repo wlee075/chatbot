@@ -277,6 +277,7 @@ def _enforce_visibility(return_dict: dict, prompt_text: str, section_title: str,
     hist = return_dict.get("chat_history", [])
     msg_dict = {
         "role": "assistant",
+        "msg_id": f"msg_{str(uuid.uuid4())[:8]}",
         "type": event_type,
         "section": section_title,
         "section_index": section_index,
@@ -434,7 +435,7 @@ def load_context_node(state: PRDState) -> dict:
     )
     return {
         "chat_history": [
-            {"role": "assistant", "type": "system", "content": welcome}
+            {"role": "assistant", "msg_id": f"msg_{str(uuid.uuid4())[:8]}", "type": "system", "content": welcome}
         ]
     }
 
@@ -1232,17 +1233,21 @@ def await_first_message_node(state: PRDState) -> dict:
     becomes the project description. No welcome is emitted here.
     Sets context_doc so detect_framing_node can classify what was said.
     """
-    first_message: str = interrupt({"type": "waiting_for_first_message"})
+    first_message = interrupt({"type": "waiting_for_first_message"})
     if isinstance(first_message, dict):
-        first_message = first_message.get("content", "")
-    text = first_message.strip()
+        text = first_message.get("content", "").strip()
+        uploaded_files = first_message.get("uploaded_files", [])
+    else:
+        text = str(first_message).strip()
+        uploaded_files = []
     user_msg = _build_user_message_dict(text)
     semantics = user_msg.get("semantics", {})
     concept_history_update = _sync_concept_history(state, semantics) if semantics else {}
     return {
         "context_doc": text,
         "chat_history": [user_msg],
-        "concept_history": concept_history_update
+        "concept_history": concept_history_update,
+        "uploaded_files": uploaded_files
     }
 
 
@@ -1385,22 +1390,54 @@ def await_discovery_answer_node(state: PRDState) -> dict:
     discovery context when section elicitation begins.
     Adds msg_id and display_time for provenance tracking.
     """
-    answer: str = interrupt({
+    resume_value = interrupt({
         "type": "waiting_for_discovery_answer",
         "discovery_turn_count": state.get("discovery_turn_count", 0),
     })
-    if isinstance(answer, dict):
-        answer = answer.get("content", "")
+    if isinstance(resume_value, dict):
+        answer = resume_value.get("content", "")
+        uploaded_files = resume_value.get("uploaded_files", [])
+        pending_event = resume_value
+    else:
+        answer = str(resume_value)
+        uploaded_files = []
+        pending_event = {"event_type": "ANSWER", "content": answer}
+        
+    event_type = pending_event.get("event_type", "ANSWER")
+    
+    # T1/T2: Do not append structured UI events as standalone conversational context turns
+    if event_type in ("SUBMIT_SESSION_CONTEXT", "REMOVE_SESSION_CONTEXT", "REVERT_SESSION_CONTEXT", "FILE_UPLOAD"):
+        return {
+            "uploaded_files": uploaded_files,
+            "pending_event": pending_event
+        }
+        
     answer = answer.strip()
     existing = state.get("context_doc", "").strip()
-    new_context = f"{existing}\n\n{answer}" if existing else answer
+    
+    attached_ctx = state.get("active_context_text", "")
+    is_active_ctx = state.get("session_context_status") == "active"
+    
+    if is_active_ctx and attached_ctx:
+        new_context = f"{existing}\n\n[Attached visual context: {attached_ctx}]\n{answer}" if existing else f"[Attached visual context: {attached_ctx}]\n{answer}"
+    else:
+        new_context = f"{existing}\n\n{answer}" if existing else answer
+        
     user_msg = _build_user_message_dict(answer)
     semantics = user_msg.get("semantics", {})
     concept_history_update = _sync_concept_history(state, semantics) if semantics else {}
+    
+    if is_active_ctx and attached_ctx:
+        user_msg["attached_image_context"] = attached_ctx
+    
     return {
         "context_doc": new_context,
         "chat_history": [user_msg],
         "concept_history": concept_history_update,
+        "uploaded_files": uploaded_files,
+        "pending_event": pending_event,
+        "session_context_status": "",
+        "active_context_text": "",
         "response_type": ""
     }
 
@@ -1530,11 +1567,23 @@ def generate_questions_node(state: PRDState) -> dict:
     prd_so_far = _format_prd_so_far(state.get("prd_sections", {}))
     prd_block = ELICITOR_PRD_BLOCK.format(prd_so_far=prd_so_far) if prd_so_far else ""
 
-    context_block = (
-        ELICITOR_CONTEXT_BLOCK.format(context_doc=state["context_doc"])
-        if state.get("context_doc")
-        else ""
-    )
+    context_block = ""
+    if state.get("context_doc"):
+        context_block += ELICITOR_CONTEXT_BLOCK.format(context_doc=state["context_doc"])
+        
+    chat_hist = state.get("chat_history", [])
+    bound_image_ctx = None
+    for msg in reversed(chat_hist):
+        if msg.get("role") == "user":
+            if msg.get("attached_image_context"):
+                bound_image_ctx = msg.get("attached_image_context")
+            break
+
+    if bound_image_ctx:
+        context_block += "\n\n=== VERIFIED VISUAL CONTEXT ===\n"
+        context_block += "The user has attached images for this question. Use this confirmed multi-modal analysis to inform your follow-up questions:\n"
+        context_block += bound_image_ctx
+        context_block += "\n===============================\n"
 
     if iteration > 0 and state.get("reflection"):
         raw_gaps = state.get("requirement_gaps", "")
@@ -2203,22 +2252,44 @@ def await_answer_node(state: PRDState) -> dict:
     # Accept structured dict payload or plain string (backward compat)
     if isinstance(resume_value, dict):
         user_text = resume_value.get("content", "")
-        pending_event = {k: v for k, v in resume_value.items()}
+        uploaded_files = resume_value.get("uploaded_files", [])
+        pending_event = {k: v for k, v in resume_value.items() if k != "uploaded_files"}
         if "event_type" not in pending_event:
             pending_event["event_type"] = "ANSWER"
     else:
         user_text = str(resume_value)
+        uploaded_files = []
         pending_event = {"event_type": "ANSWER", "content": user_text}
 
     # End of turn instrumentation
     flush_turn_summary(state)
 
-    user_msg = _build_user_message_dict(user_text)
+    event_type = pending_event.get("event_type", "ANSWER")
+    
+    # T1/T2: Do not append structured UI events as standalone conversational context turns
+    if event_type in ("SUBMIT_SESSION_CONTEXT", "REMOVE_SESSION_CONTEXT", "REVERT_SESSION_CONTEXT", "FILE_UPLOAD"):
+        return {
+            "uploaded_files": uploaded_files,
+            "pending_event": pending_event
+        }
+
+    answer = user_text.strip()
+    existing = state.get("context_doc", "").strip()
+    
+    attached_ctx = state.get("active_context_text", "")
+    is_active_ctx = state.get("session_context_status") == "active"
+    
+    if is_active_ctx and attached_ctx:
+        new_context = f"{existing}\n\n[Attached visual context: {attached_ctx}]\n{answer}" if existing else f"[Attached visual context: {attached_ctx}]\n{answer}"
+    else:
+        new_context = f"{existing}\n\n{answer}" if existing else answer
+        
+    user_msg = _build_user_message_dict(answer)
     semantics = user_msg.get("semantics", {})
     concept_history_update = _sync_concept_history(state, semantics) if semantics else {}
-
-    # End of turn instrumentation
-    flush_turn_summary(state)
+    
+    if is_active_ctx and attached_ctx:
+        user_msg["attached_image_context"] = attached_ctx
 
     reply_id = ""
     reply_text = ""
@@ -2234,10 +2305,25 @@ def await_answer_node(state: PRDState) -> dict:
         
         # 2. Strict msg_id lookup
         found_text = ""
-        for msg in state.get("chat_history", []):
+        chat_history = state.get("chat_history", [])
+        for msg in chat_history:
             if msg.get("msg_id") == reply_id:
                 found_text = msg.get("content", "")
                 break
+                
+        # 3. Legacy Migrator (Fallback Index Matching)
+        if not found_text and reply_id.startswith("msg_"):
+            try:
+                idx = int(reply_id.split("_")[1])
+                if 0 <= idx < len(chat_history):
+                    candidate = chat_history[idx]
+                    ui_preview = pending_event.get("target_content", "")
+                    
+                    if candidate.get("role") == "assistant" and (not ui_preview or ui_preview in candidate.get("content", "")):
+                        found_text = candidate.get("content", "")
+                        logger.warning(f"Legacy msg_id array fallback used for {reply_id}", extra={"event_type": "legacy_msg_id_array_fallback_used", "msg_id": reply_id})
+            except Exception:
+                pass
                 
         if found_text:
             reply_text = found_text
@@ -2249,12 +2335,15 @@ def await_answer_node(state: PRDState) -> dict:
             reply_text = ""
 
     return {
+        "context_doc": new_context,
         "raw_answer_buffer": user_text.strip(),
         "answer_confirmation_status": "PENDING",
         "pending_interrupt_type": "question",
         "pending_event": pending_event,
         "chat_history": [user_msg],
         "concept_history": concept_history_update,
+        "session_context_status": "",
+        "active_context_text": "",
         "reply_context_message_id": reply_id,
         "reply_context_message_text": reply_text,
         "reply_context_interpretation": {
@@ -2473,6 +2562,7 @@ def handle_tagged_event_node(state: PRDState) -> dict:
         "chat_history": [
             {
                 "role": "assistant",
+                "msg_id": f"msg_{str(uuid.uuid4())[:8]}",
                 "type": "tagged_event",
                 "event_type": event_type,
                 "section": section.title,
@@ -2640,15 +2730,27 @@ def classify_intent_fast_path(ans_lower: str) -> str | None:
     return None
 
 def should_escalate_to_model(ans_lower: str, question: str) -> bool:
-    if len(ans_lower.split()) < 15 and ans_lower.endswith('?'):
+    words = ans_lower.split()
+    
+    # If the user writes a massive essay, it's almost certainly a direct answer or detailed context.
+    # Do not escalate to the LLM intent classifier just because it contains stray words like 'wait' or 'no'.
+    if len(words) > 40:
+        return False
+        
+    if len(words) < 15 and ans_lower.endswith('?'):
         return True
-    if re.search(r'\b(why|stop|again|already|literally|actually|no\b|wait|incorrect|disagree|both|combination|all|neither)\b', ans_lower):
-        return True
-    if ans_lower in ['idk', 'maybe', 'not sure', 'whatever']:
-        return True
+        
+    # Only trigger on single conversational flow-control words if the message is relatively short
+    if len(words) < 20:
+        if re.search(r'\b(why|stop|again|already|literally|actually|no\b|wait|incorrect|disagree|both|combination|all|neither)\b', ans_lower):
+            return True
+        if ans_lower in ['idk', 'maybe', 'not sure', 'whatever']:
+            return True
+            
     clarification_pattern = re.compile(r'^(what do you mean|what is|how does it|i don\'t understand|tell me more about|could you explain|what kind of|which kind of)', re.IGNORECASE)
     if clarification_pattern.search(ans_lower):
         return True
+        
     return False
 
 
@@ -2723,6 +2825,7 @@ def await_confirmation_node(state: PRDState) -> dict:
                 }]
                 chat_extras = [{
                     "role": "assistant",
+                    "msg_id": f"msg_{str(uuid.uuid4())[:8]}",
                     "type": "contradiction_flag",
                     "content": (
                         f"\u26a0\ufe0f **Heads up \u2014 this might conflict with something you said earlier.**\n\n"
@@ -2819,6 +2922,7 @@ def await_confirmation_node(state: PRDState) -> dict:
                 {"role": "user", "content": user_response},
                 {
                     "role": "assistant",
+                    "msg_id": f"msg_{str(uuid.uuid4())[:8]}",
                     "type": "reask",
                     "section": section.title,
                     "content": reask_msg,
@@ -3240,6 +3344,7 @@ def detect_impact_node(state: PRDState) -> dict:
         }]
         result["chat_history"] = [{
             "role": "assistant",
+            "msg_id": f"msg_{str(uuid.uuid4())[:8]}",
             "type": "contradiction_flag",
             "contradiction_evidence": {
                 "conflicting_message_id": contradiction_desc["conflicting_message_id"],
@@ -3515,6 +3620,7 @@ def draft_node(state: PRDState) -> dict:
     chat_entries: list[dict] = [
         {
             "role": "assistant",
+            "msg_id": f"msg_{str(uuid.uuid4())[:8]}",
             "type": "draft",
             "section": section.title,
             "content": primary_draft,
@@ -3528,6 +3634,7 @@ def draft_node(state: PRDState) -> dict:
         )
         chat_entries.append({
             "role": "assistant",
+            "msg_id": f"msg_{str(uuid.uuid4())[:8]}",
             "type": "section_update_feed",
             "section": section.title,
             "content": f"Also updated: {updated_labels}",
@@ -3879,6 +3986,7 @@ def reflect_node(state: PRDState) -> dict:
         "chat_history": [
             {
                 "role": "assistant",
+                "msg_id": f"msg_{str(uuid.uuid4())[:8]}",
                 "type": "reflect",
                 "section": section.title,
                 "verdict": verdict,
@@ -3998,11 +4106,45 @@ def advance_section_node(state: PRDState) -> dict:
         "chat_history": [
             {
                 "role": "assistant",
+                "msg_id": f"msg_{str(uuid.uuid4())[:8]}",
                 "type": "advance",
                 "section": section.title,
                 "content": msg,
             }
         ],
+    }
+
+# ── Node: terminal_session ───────────────────────────────────────────────────
+
+def terminal_session_node(state: PRDState) -> dict:
+    """
+    Terminates the session cleanly when retry limits are reached instead of 
+    repeating loops. Disables input and marks draft availability.
+    """
+    ctx = _log_ctx(state, "terminal_session_node")
+    log_event(
+        **ctx, level="INFO", event_type="session_termination",
+        message="Graceful Session Termination explicitly triggered due to retry limits."
+    )
+
+    msg = "Unable to get enough information because key details were still missing. Session has ended."
+
+    return {
+        "session_status": "ended_retry_limit",
+        "session_end_reason": "insufficient_information",
+        "session_end_message": msg,
+        "input_disabled": True,
+        "draft_available": bool(state.get("prd_sections")),
+        "draft_download_available": bool(state.get("prd_sections")),
+        "response_type": "system",
+        "chat_history": [
+            {
+                "role": "assistant",
+                "msg_id": f"msg_{str(uuid.uuid4())[:8]}",
+                "type": "system",
+                "content": msg,
+            }
+        ]
     }
 
 
@@ -4053,6 +4195,7 @@ def finalize_node(state: PRDState) -> dict:
         "chat_history": [
             {
                 "role": "assistant",
+                "msg_id": f"msg_{str(uuid.uuid4())[:8]}",
                 "type": "complete",
                 "content": (
                     "🎉 **Your PRD is complete!** All sections have been reviewed "
@@ -4153,14 +4296,14 @@ def answer_clarification_node(state: PRDState) -> dict:
             reply_content = "I'm having trouble providing a clarification right now. Could you rephrase your question?"
         log_event(**ctx, level="ERROR", event_type="llm_error", message=str(e))
 
-    chat_history = list(state.get("chat_history", []))
-    chat_history.append({
+    new_message = {
         "role": "assistant",
+        "msg_id": f"msg_{str(uuid.uuid4())[:8]}",
         "type": "clarification_answer",
         "content": reply_content,
         "run_id": state.get("run_id", ""),
         "section": get_section_by_index(state.get("section_index", 0)).title
-    })
+    }
 
     log_event(**ctx, level="INFO", event_type="node_end", message="answer_clarification finished")
     
@@ -4176,7 +4319,7 @@ def answer_clarification_node(state: PRDState) -> dict:
     )
 
     return {
-        "chat_history": chat_history,
+        "chat_history": [new_message],
         "reply_intent": "CLARIFIED", # terminal outcome for this branch
         "current_questions": reply_content,
         "question_status": target_status,
