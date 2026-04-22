@@ -116,7 +116,7 @@ def route_after_discovery(state: PRDState) -> str:
     if event_type == "TERMINATE_SESSION":
         return "terminal_session"
     if event_type in ("SUBMIT_SESSION_CONTEXT", "REMOVE_SESSION_CONTEXT", "REVERT_SESSION_CONTEXT"):
-        return "await_discovery_answer"
+        return "handle_tagged_event"
         
     if state.get("uploaded_files"):
         return "file_upload_intake"
@@ -147,7 +147,7 @@ def route_after_first_message(state: PRDState) -> str:
     if event_type == "TERMINATE_SESSION":
         return "terminal_session"
     if event_type in ("SUBMIT_SESSION_CONTEXT", "REMOVE_SESSION_CONTEXT", "REVERT_SESSION_CONTEXT"):
-        return "await_first_message"
+        return "handle_tagged_event"
         
     if state.get("uploaded_files"):
         return "file_upload_intake"
@@ -172,7 +172,7 @@ def route_after_answer(state: PRDState) -> str:
     if event_type == "TERMINATE_SESSION":
         return "terminal_session"
     if event_type in ("SUBMIT_SESSION_CONTEXT", "REMOVE_SESSION_CONTEXT", "REVERT_SESSION_CONTEXT"):
-        return "await_answer"
+        return "handle_tagged_event"
         
     if state.get("uploaded_files"):
         return "file_upload_intake"
@@ -273,13 +273,6 @@ def route_after_session_context_node(state: PRDState) -> str:
         return "detect_framing"
         
     elif state.get("pending_event"):
-        # If the payload has absolutely empty text (pure image submission), bypass native text classifiers
-        content_str = state.get("pending_event", {}).get("content", "")
-        if not content_str.strip():
-            if state.get("discovery_turn_count", 0) >= 2 or state.get("framing_mode") == "clear" or state.get("phase") == "elicitation":
-                return "generate_questions"
-            return "discovery_questions"
         return "numeric_validation"
-        return "generate_questions"
     return "discovery_questions"
 

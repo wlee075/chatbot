@@ -273,12 +273,114 @@ def option_resolution_node(state: PRDState) -> dict:
             return {"resolved_option_id": matched_option, "matched_option": matched_option}
     return {}
 
+def multimodal_answer_materialization_node(state: PRDState) -> dict:
+    """1c. Multimodal Answer Materialization Node"""
+    ctx = _log_ctx(state, "multimodal_answer_materialization")
+    log_event(**ctx, level="INFO", event_type="node_start", message="multimodal_answer_materialization started")
+    
+    raw_answer = state.get("raw_answer_buffer", "")
+    uploaded_files = state.get("pending_event", {}).get("uploaded_files", [])
+    
+    if not uploaded_files:
+        return {
+            "effective_answer_for_commit": raw_answer,
+            "answer_provenance": "user_text",
+            "materialization_status": "user_text_passthrough",
+            "matched_context_id": None,
+            "materialization_conflict": False,
+            "materialization_conflict_reason": None
+        }
+        
+    if len(uploaded_files) > 1:
+        log_event(**ctx, level="WARNING", event_type="unsupported_multi_file", message="Multiple files not supported for direct materialization. Degrading to user text.")
+        return {
+            "effective_answer_for_commit": raw_answer,
+            "answer_provenance": "user_text",
+            "materialization_status": "multi_file_unsupported",
+            "matched_context_id": None,
+            "materialization_conflict": False,
+            "materialization_conflict_reason": None
+        }
+        
+    target_file_id = uploaded_files[0].get("file_id")
+    bg_contexts = state.get("background_generated_contexts", [])
+    matching_ctx = next((c for c in bg_contexts if c.get("image_file_id") == target_file_id), None)
+    
+    if not matching_ctx or not matching_ctx.get("generated_summary"):
+        log_event(**ctx, level="WARNING", event_type="image_missing_context", message=f"No summary found for file_id {target_file_id}. Degrading to user text.")
+        return {
+            "effective_answer_for_commit": raw_answer,
+            "answer_provenance": "user_text",
+            "materialization_status": "image_missing",
+            "matched_context_id": None if not matching_ctx else matching_ctx.get("context_id"),
+            "materialization_conflict": False,
+            "materialization_conflict_reason": None
+        }
+        
+    summary = matching_ctx.get("generated_summary")
+    
+    conflict = False
+    conflict_reason = None
+    
+    if raw_answer.strip():
+        llm = _get_llm()
+        try:
+            schema = {
+                "name": "ConflictCheck",
+                "description": "Output schema for conflict check",
+                "type": "object",
+                "properties": {
+                    "material_conflict": {"type": "boolean"},
+                    "reason": {"type": "string"}
+                },
+                "required": ["material_conflict", "reason"]
+            }
+            sys_msg = (
+                "You adjudicate if there is a material conflict between a user's literal text and an automated image description.\n"
+                "A material conflict exists if they suggest different workflows, classify the image oppositely, or imply contradictory answers.\n"
+                "Reply with exactly JSON holding `material_conflict` (bool) and `reason` (str)."
+            )
+            user_msg = f"User Text:\n{raw_answer}\n\nImage Vision Summary:\n{summary}\n\nDo they fundamentally conflict?"
+            
+            structured_llm = llm.with_structured_output(schema)
+            res = structured_llm.invoke([
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg}
+            ])
+            conflict = res.get("material_conflict", False) if isinstance(res, dict) else False
+            conflict_reason = res.get("reason", "") if isinstance(res, dict) else ""
+            log_event(**ctx, level="INFO", event_type="image_text_conflict_evaluated", conflict=conflict, reason=conflict_reason)
+        except Exception as e:
+            log_event(**ctx, level="ERROR", event_type="conflict_check_failed", message=str(e))
+            conflict = False
+            conflict_reason = None
+
+    if conflict:
+        return {
+            "effective_answer_for_commit": raw_answer,
+            "answer_provenance": "user_text",
+            "materialization_status": "image_bound",
+            "matched_context_id": matching_ctx.get("context_id"),
+            "materialization_conflict": True,
+            "materialization_conflict_reason": conflict_reason,
+            "reply_intent": "UNCLEAR_META"
+        }
+
+    return {
+        "effective_answer_for_commit": f"<image_derived_context>\n{summary}\n</image_derived_context>",
+        "answer_provenance": "image_derived",
+        "materialization_status": "image_bound",
+        "matched_context_id": matching_ctx.get("context_id"),
+        "materialization_conflict": False,
+        "materialization_conflict_reason": None
+    }
+
 def semantic_assessor_node(state: PRDState) -> dict:
     """2. Semantic Assessor Node"""
     ctx = _log_ctx(state, "semantic_assessor")
     log_event(**ctx, level="INFO", event_type="node_start", message="semantic_assessor started")
 
-    raw_answer = state.get("raw_answer_buffer", "").strip()
+    raw_answer = state.get("effective_answer_for_commit", state.get("raw_answer_buffer", "")).strip()
     
     # TC3: Unconditionally read from the FULL active_semantic_target object.
     active_target = state.get("active_semantic_target", {})
@@ -524,10 +626,22 @@ def truth_commit_node(state: PRDState) -> dict:
             "type": "system",
             "content": "I see a conflict with what we discussed earlier. Let me verify.",
         }]}
+        
+    if state.get("materialization_conflict", False):
+        log_event(
+            **ctx, level="INFO", event_type="commit_truth_blocked_by_materialization",
+            reason="image and text explicitly conflict",
+            message="Commit truth blocked due to materialization conflict"
+        )
+        return {"chat_history": [{
+            "role": "assistant",
+            "type": "system",
+            "content": "Before I save that, I need to make sure I understand correctly since the image and text seem different.",
+        }]}
 
     section = get_section_by_index(state.get("section_index", 0))
     iteration = state.get("iteration", 0)
-    raw_answer = state.get("raw_answer_buffer", "").strip()
+    raw_answer = state.get("effective_answer_for_commit", state.get("raw_answer_buffer", "")).strip()
     interpreted = state.get("interpreted_answer", raw_answer)
     resolved_subparts = state.get("resolved_subparts", [])
     snippets_by_subpart = state.get("snippets_by_subpart", {})
@@ -583,6 +697,7 @@ def truth_commit_node(state: PRDState) -> dict:
             "version": current_version,
             "resolution_source": resolution_source,
             "parent_question_id": state.get("parent_question_id", ""),
+            "answer_provenance": state.get("answer_provenance", "user_text"),
         }
     }
 

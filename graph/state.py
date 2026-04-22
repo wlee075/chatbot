@@ -366,6 +366,12 @@ class PRDState(TypedDict):
     # Answers are provisional until explicitly confirmed by the user.
     # confirmed_qa_store must only receive CONFIRMED values.
     raw_answer_buffer: str       # latest unconfirmed raw user response
+    effective_answer_for_commit: str      # commit-ready representation (raw or image-derived)
+    answer_provenance: Literal["user_text", "image_derived"] 
+    materialization_status: Literal["user_text_passthrough", "image_bound", "image_missing", "multi_file_unsupported", ""]
+    matched_context_id: str | None
+    materialization_conflict: bool
+    materialization_conflict_reason: str | None
     current_question_object: QuestionObject  # structured question from Elicitor
     document_summaries: dict[str, str]  # dict mapping semantic group to text
     

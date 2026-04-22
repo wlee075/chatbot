@@ -1233,9 +1233,15 @@ def _extract_submit_payload(resume_value: dict | str) -> tuple[str, list, dict]:
     Returns (user_text, uploaded_files, pending_event).
     """
     if isinstance(resume_value, dict):
-        user_text = resume_value.get("content", "")
-        uploaded_files = resume_value.get("uploaded_files", [])
-        pending_event = {k: v for k, v in resume_value.items() if k != "uploaded_files"}
+        if "user_input" in resume_value and "pending_event" in resume_value:
+            user_text = resume_value["user_input"].get("text", "")
+            uploaded_files = resume_value["user_input"].get("files", [])
+            pending_event = resume_value["pending_event"]
+        else:
+            user_text = resume_value.get("content", "")
+            uploaded_files = resume_value.get("uploaded_files", [])
+            pending_event = {k: v for k, v in resume_value.items() if k != "uploaded_files"}
+            
         if "event_type" not in pending_event:
             pending_event["event_type"] = "ANSWER"
     else:
@@ -2110,6 +2116,22 @@ def generate_questions_node(state: "PRDState") -> dict:
     t0 = time.monotonic()
     ctx["_t0"] = t0
     
+    if state.get("materialization_conflict", False):
+        reason = state.get("materialization_conflict_reason", "")
+        reason_str = f" ({reason})" if reason else ""
+        q = f"Your text and the uploaded image seem to suggest different things{reason_str}. Could you clarify which one is correct?"
+        log_event(**ctx, level="INFO", event_type="asking_conflict_clarification", message="Generating clarification question for image/text conflict", text=q)
+        return {
+            "current_questions": q,
+            "current_question_object": {"question_id": "conflict_q", "question_text": q, "subparts": []},
+            "raw_answer_buffer": "",
+            "materialization_conflict": False,
+            "materialization_conflict_reason": None,
+            "pending_numeric_clarification": False,
+            "repair_question_id": "",
+            "phase": state.get("phase", "elicitation")
+        }
+
     log_event(
         **ctx, level="INFO", event_type="question_generation_decision",
         message="Logging generation decision parameters",
@@ -2342,7 +2364,7 @@ def await_answer_node(state: PRDState) -> dict:
                     candidate = chat_history[idx]
                     ui_preview = pending_event.get("target_content", "")
                     
-                    if candidate.get("role") == "assistant" and (not ui_preview or ui_preview in candidate.get("content", "")):
+                    if candidate.get("role") in ("assistant", "user") and (not ui_preview or ui_preview in candidate.get("content", "")):
                         found_text = candidate.get("content", "")
                         logger.warning(f"Legacy msg_id array fallback used for {reply_id}", extra={"event_type": "legacy_msg_id_array_fallback_used", "msg_id": reply_id})
             except Exception:
@@ -2356,6 +2378,10 @@ def await_answer_node(state: PRDState) -> dict:
             # Safe Fallback: do not accept a leaked chunk if lookup fails
             reply_id = ""
             reply_text = ""
+
+    if reply_text:
+        user_msg["reply_to_message_id"] = reply_id
+        user_msg["reply_to_content_snippet"] = reply_text
 
     return {
         "context_doc": new_context,
@@ -2399,6 +2425,52 @@ def handle_tagged_event_node(state: PRDState) -> dict:
     target_content = event.get("target_content", "")
     new_content = event.get("content", "").strip()
 
+    if event_type == "SUBMIT_SESSION_CONTEXT":
+        context_id = event.get("context_id")
+        bg_contexts = state.get("background_generated_contexts", [])
+        target = next((c for c in bg_contexts if c.get("context_id") == context_id), None)
+        if target:
+            import datetime
+            target_copy = dict(target)
+            target_copy["edited_summary"] = new_content
+            target_copy["updated_at"] = datetime.datetime.now().isoformat()
+            chat_msg = (
+                "**Image Context Updated** ✏️\n\n"
+                f"The image semantics have been manually specified: _{new_content[:160]}{'…' if len(new_content) > 160 else ''}_"
+            )
+            return {
+                "background_generated_contexts": [target_copy],
+                "pending_event": {},
+                "chat_history": [{
+                    "event_type": "SUBMIT_SESSION_CONTEXT",
+                    "role": "system",
+                    "type": "system",
+                    "content": chat_msg,
+                }]
+            }
+        return {"pending_event": {}}
+
+    elif event_type == "REMOVE_SESSION_CONTEXT":
+        context_id = event.get("context_id")
+        bg_contexts = state.get("background_generated_contexts", [])
+        target = next((c for c in bg_contexts if c.get("context_id") == context_id), None)
+        if target:
+            import datetime
+            target_copy = dict(target)
+            target_copy["is_active"] = False
+            target_copy["updated_at"] = datetime.datetime.now().isoformat()
+            chat_msg = "**Image Context Removed** 🗑️\n\nThe image has been marked inactive and will no longer guide future reasoning."
+            return {
+                "background_generated_contexts": [target_copy],
+                "pending_event": {},
+                "chat_history": [{
+                    "event_type": "REMOVE_SESSION_CONTEXT",
+                    "role": "system",
+                    "type": "system",
+                    "content": chat_msg,
+                }]
+            }
+        return {"pending_event": {}}
     section = get_section_by_index(state["section_index"])
     chat_history = state.get("chat_history", [])
 
@@ -3212,7 +3284,7 @@ def detect_impact_node(state: PRDState) -> dict:
     iteration = state.get("iteration", 0)
 
     # raw_answer_buffer is preserved in state during this pass
-    raw_answer = state.get("raw_answer_buffer", "").strip()
+    raw_answer = state.get("effective_answer_for_commit", state.get("raw_answer_buffer", "")).strip()
 
     def _run_primary() -> tuple[list[str], dict[str, float]]:
         if not candidates:

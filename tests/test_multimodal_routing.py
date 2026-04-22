@@ -47,6 +47,18 @@ def test_no_keyerror_for_detect_framing_branch_after_multimodal_processing():
         "discovery_questions": "discovery_questions"
     }
     
-    state = PRDState={"framing_mode": None, "image_description_status": "described"}
+    state = PRDState({"framing_mode": None, "image_description_status": "described"})
     # This proves that `detect_framing` is considered valid.
     assert "detect_framing" in valid_multimodal_edges
+
+def test_image_only_submit_routes_to_numeric_validation_after_session_context():
+    """Verify image-only submits route into normal answer processing path."""
+    state = PRDState({
+        "framing_mode": "clear",
+        "pending_event": {
+            "event_type": "ANSWER",
+            "content": ""
+        }
+    })
+    res = route_after_session_context_node(state)
+    assert res == "numeric_validation", f"Expected numeric_validation, got {res}"

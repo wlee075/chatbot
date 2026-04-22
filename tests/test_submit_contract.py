@@ -65,3 +65,21 @@ def test_empty_content_with_uploaded_files_is_valid():
     assert payload is not None
     assert payload["content"] == ""
     assert payload["uploaded_files"] == [mock_file]
+
+def test_image_only_reply_preserves_active_reference():
+    """Verify that an image-only submission correctly preserves target message context."""
+    mock_file = {"filename": "doc.pdf"}
+    active_ref = {
+        "event_type": "CORRECT_MESSAGE",
+        "target_message_id": "msg_abc123",
+        "target_content": "Please verify this.",
+        "source_message_role": "assistant"
+    }
+    
+    payload = build_submit_payload("", mock_file, active_ref=active_ref)
+    
+    assert payload is not None
+    assert payload["event_type"] == "CORRECT_MESSAGE"
+    assert payload["target_message_id"] == "msg_abc123"
+    assert "Please verify this." in payload["target_content"]
+    assert payload["uploaded_files"] == [mock_file]

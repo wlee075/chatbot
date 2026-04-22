@@ -63,6 +63,17 @@ def _get_graph_state():
     except Exception:
         return None
 
+def _get_display_image_summary(raw_block: str, ctx_hist: dict | None = None) -> str:
+    if ctx_hist and ctx_hist.get("edited_summary"):
+        return ctx_hist["edited_summary"]
+    if not raw_block:
+        return ""
+    import re
+    m = re.search(r'\[what_is_going_on\]\s*(.*?)(?=\n\n\[entities\]|\Z)', raw_block, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return raw_block.strip()
+
 
 # ── Gemini Vision helper (D-M3) ───────────────────────────────────────────────
 _VISION_PROMPT = (
@@ -712,80 +723,81 @@ if st.session_state.graph_started:
     )
     current_section_title = _display_section_title(current_section_title)
 
-    # Sticky wrapper — container gives us a stVerticalBlock we can attach
-    # position:sticky to via the .prd-sticky-bar marker + :has() selector.
-    with st.container():
-        st.markdown(
-            """
-            <style>
-            div[data-testid="stVerticalBlock"]:has(> div[data-testid="stMarkdown"] .prd-sticky-bar) {
-                position: sticky !important;
-                top: 0 !important;
-                z-index: 999 !important;
-                background: var(--background-color, white) !important;
-                padding-bottom: 4px;
-            }
-            </style>
-            <div class="prd-sticky-bar" style="display:none"></div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        _badge_cols = st.columns(len(PRD_SECTIONS), gap="small")
-        for _bi, _sec in enumerate(PRD_SECTIONS):
-            with _badge_cols[_bi]:
-                _score_entry = section_scores_map.get(_sec.id, {})
-                _completeness = _score_entry.get("completeness", -1.0)
-                _has_draft = _sec.id in prd_sections_done
-                _recently_updated = _sec.id in last_updates
-
-                if _sec.id == current_section_id:
-                    _badge = "🟡"
-                    _help = "Current section"
-                elif _score_entry.get("verdict") == "PASS":
-                    _badge = "✅"
-                    _help = f"Done · score {_completeness:.0%}" if _completeness >= 0 else "Done"
-                elif _has_draft and _recently_updated:
-                    _badge = "🔄"
-                    _help = f"Updated this turn"
-                elif _has_draft:
-                    _score_label = f" · {_completeness:.0%}" if _completeness >= 0 else ""
-                    _badge = "📝"
-                    _help = f"Drafted{_score_label}"
-                else:
-                    _badge = "○"
-                    _help = "Not started"
-
-                if _has_draft or _sec.id == current_section_id:
-                    if st.button(
-                        _badge,
-                        key=f"prdbadge_{_sec.id}",
-                        help=f"{_display_section_title(_sec.title)} — {_help}",
-                        use_container_width=True,
-                    ):
-                        st.session_state[f"_preview_open_{_sec.id}"] = not st.session_state.get(
-                            f"_preview_open_{_sec.id}", False
-                        )
-                        st.rerun()
-                else:
-                    st.markdown(f"<div style='text-align:center;color:#aaa'>{_badge}</div>", unsafe_allow_html=True)
-
-        # Active section name shown beneath the badge row
-        if current_section_title:
-            st.caption(f"**{current_section_title}**")
-
-    # Section preview expanders (open/closed state per section, toggled by badges)
-    for _sec in PRD_SECTIONS:
-        if st.session_state.get(f"_preview_open_{_sec.id}"):
-            _draft_text = prd_sections_done.get(_sec.id, "")
-            if _draft_text:
-                with st.expander(f"📄 {_display_section_title(_sec.title)}", expanded=True):
-                    st.markdown(_present_content(_draft_text, {}, {}), unsafe_allow_html=True)
-                    if st.button("Close", key=f"_close_preview_{_sec.id}"):
-                        st.session_state[f"_preview_open_{_sec.id}"] = False
-                        st.rerun()
-
-    st.divider()
+    if st.session_state.get("debug_show_internal_progress", False):
+        # Sticky wrapper — container gives us a stVerticalBlock we can attach
+        # position:sticky to via the .prd-sticky-bar marker + :has() selector.
+        with st.container():
+            st.markdown(
+                """
+                <style>
+                div[data-testid="stVerticalBlock"]:has(> div[data-testid="stMarkdown"] .prd-sticky-bar) {
+                    position: sticky !important;
+                    top: 0 !important;
+                    z-index: 999 !important;
+                    background: var(--background-color, white) !important;
+                    padding-bottom: 4px;
+                }
+                </style>
+                <div class="prd-sticky-bar" style="display:none"></div>
+                """,
+                unsafe_allow_html=True,
+            )
+    
+            _badge_cols = st.columns(len(PRD_SECTIONS), gap="small")
+            for _bi, _sec in enumerate(PRD_SECTIONS):
+                with _badge_cols[_bi]:
+                    _score_entry = section_scores_map.get(_sec.id, {})
+                    _completeness = _score_entry.get("completeness", -1.0)
+                    _has_draft = _sec.id in prd_sections_done
+                    _recently_updated = _sec.id in last_updates
+    
+                    if _sec.id == current_section_id:
+                        _badge = "🟡"
+                        _help = "Current section"
+                    elif _score_entry.get("verdict") == "PASS":
+                        _badge = "✅"
+                        _help = f"Done · score {_completeness:.0%}" if _completeness >= 0 else "Done"
+                    elif _has_draft and _recently_updated:
+                        _badge = "🔄"
+                        _help = f"Updated this turn"
+                    elif _has_draft:
+                        _score_label = f" · {_completeness:.0%}" if _completeness >= 0 else ""
+                        _badge = "📝"
+                        _help = f"Drafted{_score_label}"
+                    else:
+                        _badge = "○"
+                        _help = "Not started"
+    
+                    if _has_draft or _sec.id == current_section_id:
+                        if st.button(
+                            _badge,
+                            key=f"prdbadge_{_sec.id}",
+                            help=f"{_display_section_title(_sec.title)} — {_help}",
+                            use_container_width=True,
+                        ):
+                            st.session_state[f"_preview_open_{_sec.id}"] = not st.session_state.get(
+                                f"_preview_open_{_sec.id}", False
+                            )
+                            st.rerun()
+                    else:
+                        st.markdown(f"<div style='text-align:center;color:#aaa'>{_badge}</div>", unsafe_allow_html=True)
+    
+            # Active section name shown beneath the badge row
+            if current_section_title:
+                st.caption(f"**{current_section_title}**")
+    
+        # Section preview expanders (open/closed state per section, toggled by badges)
+        for _sec in PRD_SECTIONS:
+            if st.session_state.get(f"_preview_open_{_sec.id}"):
+                _draft_text = prd_sections_done.get(_sec.id, "")
+                if _draft_text:
+                    with st.expander(f"📄 {_display_section_title(_sec.title)}", expanded=True):
+                        st.markdown(_present_content(_draft_text, {}, {}), unsafe_allow_html=True)
+                        if st.button("Close", key=f"_close_preview_{_sec.id}"):
+                            st.session_state[f"_preview_open_{_sec.id}"] = False
+                            st.rerun()
+    
+        st.divider()
 
 # ── Landing heading (D-M1): visible only before session starts ─────────────────
 if not st.session_state.graph_started:
@@ -836,15 +848,29 @@ if st.session_state.graph_started:
             msg_id = f"msg_{user_msg['_idx']}"
             st.markdown(f'<div id="{msg_id}"></div>', unsafe_allow_html=True)
             with st.chat_message("user"):
+                reply_snippet = user_msg.get("reply_to_content_snippet")
+                if reply_snippet:
+                    preview = (reply_snippet[:80] + "...") if len(reply_snippet) > 80 else reply_snippet
+                    st.caption(f"Replying to: \"_{preview}_\"")
                 st.markdown(content)
                 
-                # Render bound image context if this turn had original attachments
-                attached_ctx = user_msg.get("attached_image_context")
-                if attached_ctx:
-                    with st.expander("🖼️ Attached Image Context", expanded=False):
-                        st.markdown(attached_ctx)
+                # Strictly render the Attached Image Context only if this specific message originated it (ignore global session leaks)
+                msg_id_val = user_msg.get("msg_id")
+                bg_ctx_hists = [c for c in sv.get("background_generated_contexts", []) if c.get("source_turn_id") == msg_id_val]
+                
+                for bg_ctx_hist in bg_ctx_hists:
+                    is_removed = not bg_ctx_hist.get("is_active", True)
+                    label = "🖼️ Attached Image Context (Removed by User)" if is_removed else "🖼️ Attached Image Context"
+                    
+                    with st.expander(label, expanded=False):
+                        eff_summary = _get_display_image_summary(bg_ctx_hist.get("generated_summary", ""), bg_ctx_hist)
+                        if is_removed:
+                            st.warning("Removed from active context. The agent will no longer use this image data.")
+                            st.markdown(f"~~{eff_summary}~~")
+                        else:
+                            st.markdown(eff_summary)
                         
-                _render_message_actions(msg_id, content, "user", user_msg.get("type", ""))
+                _render_message_actions(user_msg.get("msg_id") or msg_id, content, "user", user_msg.get("type", ""))
 
         # 2. Render Single Terminal Intents for Assistant
         assistant_msgs = turn["assistant"]
@@ -969,7 +995,7 @@ if st.session_state.graph_started:
                         st.caption(f"_{helper_copy}_")
 
                     if msg_type not in ("clarification_answer", "numeric_validation_error"):
-                        _render_message_actions(msg_id, content, "assistant", msg_type)
+                        _render_message_actions(msg.get("msg_id") or msg_id, content, "assistant", msg_type)
                     
                 elif msg_type == "draft":
                     if sv.get("response_type") in ("clarification_answer", "numeric_validation_error"):
@@ -1096,222 +1122,135 @@ if st.session_state.graph_started and st.session_state.get("active_reference"):
             st.session_state.active_reference = None
             st.rerun()
 
-if "upload_mode" not in st.session_state:
-    st.session_state.upload_mode = False
-
-# ── Composer row: [📎 Add image | text input] ─────────────────────────────────
-_img_col, _inp_col = st.columns([1, 13], gap="small")
-
-with _img_col:
-    with st.popover("📎", use_container_width=True):
-        uploaded_img = st.file_uploader(
-            "Share a screenshot or diagram to help describe what you're building.",
-            type=["png", "jpg", "jpeg", "webp"],
-            key="image_uploader",
-            label_visibility="collapsed",
-        )
-        if uploaded_img is not None:
-            img_key = f"_img_processed_{uploaded_img.name}_{uploaded_img.size}"
-            if img_key not in st.session_state:
-                st.session_state[img_key] = True
-                mime = uploaded_img.type or "image/png"
-                st.session_state._stashed_upload = {
-                    "file_id": f"file_{uuid.uuid4().hex[:8]}",
-                    "filename": uploaded_img.name,
-                    "size_bytes": uploaded_img.size,
-                    "mime_type": mime,
-                    "bytes": uploaded_img.read()
-                }
-                st.rerun()
-
-with _inp_col:
+if True:
     if st.session_state.graph_started:
         # Active session: answer questions or show completion state
         if is_waiting:
             user_input = None
             
-            # Show tray of background contexts
-            bg_contexts = [c for c in sv.get("background_generated_contexts", []) if c.get("is_active")]
-            if bg_contexts:
-                with st.container(border=True):
-                    st.markdown("🖼️ **Active Image Contexts**")
-                    st.caption("You can edit the image context to guide the agent better.")
-                    for ctx in bg_contexts:
-                        edit_key = f"edit_img_{ctx['context_id']}"
-                        c1, c2 = st.columns([9, 1])
-                        with c1:
-                            st.caption(f"File: {ctx.get('image_file_id', 'unknown')}")
-                        with c2:
-                            if st.button("Edit", key=f"btn_{ctx['context_id']}", use_container_width=True):
-                                st.session_state[edit_key] = not st.session_state.get(edit_key, False)
-                                st.rerun()
-                        
-                        if st.session_state.get(edit_key, False):
-                            eff_summary = ctx.get("edited_summary") or ctx.get("generated_summary", "")
-                            new_txt = st.text_area("Edit semantic context for agent:", value=eff_summary, key=f"area_{ctx['context_id']}")
-                            c3, c4 = st.columns([1,1])
-                            if c3.button("Save", key=f"save_{ctx['context_id']}", type="primary", use_container_width=True):
-                                st.session_state._pending_payload = {
-                                    "event_type": "SUBMIT_SESSION_CONTEXT",
-                                    "context_id": ctx["context_id"],
-                                    "content": new_txt
-                                }
-                                st.session_state[edit_key] = False
-                                st.rerun()
-                            if c4.button("Remove", key=f"rem_{ctx['context_id']}", use_container_width=True):
-                                st.session_state._pending_payload = {
-                                    "event_type": "REMOVE_SESSION_CONTEXT",
-                                    "context_id": ctx["context_id"]
-                                }
-                                st.session_state[edit_key] = False
-                                st.rerun()
-                                
-            if sv.get("input_disabled"):
-                user_input = st.chat_input("Session has ended.", disabled=True)
-            else:
-                if st.session_state.get("_stashed_upload"):
-                    with st.container(border=True):
-                        c1, c2 = st.columns([9, 1])
-                        file_dict = st.session_state._stashed_upload
-                        with c1:
-                            st.info(f"📎 Attached: {file_dict['filename']}")
-                        with c2:
-                            if st.button("✕", key="clear_upload_btn", use_container_width=True):
-                                del st.session_state._stashed_upload
-                                st.rerun()
-                        if st.button("Send Image Without Text", use_container_width=True):
-                            payload = _build_submit_payload(
-                                user_input="", 
-                                stashed_upload=st.session_state._stashed_upload
-                            )
-                            if payload:
-                                del st.session_state._stashed_upload
-                                st.session_state._pending_payload = payload
-                                st.session_state._pending_user_msg = "[Image Uploaded]"
-                                st.rerun()
-                placeholder = (
-                    "Reply, correct, or clarify…"
-                    if active_ref else "Type your answer and press Enter…"
-                )
-                user_input = st.chat_input(placeholder)
+            # Ensure no committed image summaries are floated near the composer. Unsent files are previewed natively by st.chat_input.
+            placeholder = (
+                "Reply, correct, or clarify…"
+                if active_ref else "Type your answer and press Enter…"
+            )
+            user_input_obj = st.chat_input(placeholder, accept_file=True, file_type=["png", "jpg", "jpeg", "webp"])
                 
-        # Safe submit rule checking
-        has_text_input = bool(user_input and user_input.strip())
-        
-        if has_text_input:
-            placeholders = _find_placeholders(user_input)
-            if placeholders:
-                st.warning(
-                    "Your answer contains placeholder values (X, Y, Z) — "
-                    "please use real numbers.\n\n"
-                    + "\n".join(f"- `{s}`" for s in placeholders)
-                )
-            else:
-                # Build structured payload
-                active_ref = st.session_state.get("active_reference")
-                if active_ref:
-                    target_content_str = active_ref.get("target_content", "")
-                    # Truncate to purely act as a preview/debug string. Never meant for semantic interpretation.
-                    truncated_preview = target_content_str[:100] + ("..." if len(target_content_str) > 100 else "")
-                    payload = {
-                        "event_type": active_ref["event_type"],
-                        "content": user_input,
-                        "target_message_id": active_ref["target_message_id"],
-                        "target_content": truncated_preview,
-                        "source_message_role": active_ref.get("source_message_role", ""),
-                        "ui_action_label": active_ref.get("label", ""),
-                    }
-                    st.session_state.active_reference = None  # consume reference
-                else:
-                    payload = {"event_type": "ANSWER", "content": user_input}
-                    
-                if st.session_state.get("_stashed_upload"):
-                    payload["uploaded_files"] = [st.session_state._stashed_upload]
-                    del st.session_state._stashed_upload
-                    
-                import logging, re
-                metrics_logger = logging.getLogger("orchestrator_metrics")
-                contains_prior_chat = bool(re.search(r"(?i)\buser:.*\bassistant:", user_input)) if user_input else False
-                metrics_logger.info("composer_submit_payload_debug", extra={
-                    "event_type": "composer_submit_payload_debug",
-                    "turn_id": sv.get("run_id", "unknown") if sv else "unknown",
-                    "latest_user_input_length": len(user_input),
-                    "contains_prior_chat_markers": contains_prior_chat,
-                    "reply_context_present": bool(active_ref),
-                    "upload_text_length": 0
-                })
-                    
-                # Store and rerun — processed above the composer row on next render
-                st.session_state._pending_payload = payload
-                st.session_state._pending_user_msg = user_input
-                st.rerun()
         elif sv.get("is_complete", False):
             st.chat_input("Session complete — download your PRD above.", disabled=True)
+            user_input_obj = None
+        elif sv.get("input_disabled", False):
+            st.chat_input("Session has ended.", disabled=True)
+            user_input_obj = None
+        else:
+            user_input_obj = None
+            
+        if user_input_obj is not None:
+            # Handle the dict-like or string object
+            user_input = getattr(user_input_obj, "text", "") if hasattr(user_input_obj, "text") else (user_input_obj if isinstance(user_input_obj, str) else "")
+            uploaded_files_list = []
+            
+            if isinstance(user_input_obj, dict):
+                files = user_input_obj.get("files", [])
+                user_input = user_input_obj.get("text", "")
+            else:
+                files = getattr(user_input_obj, "files", []) if hasattr(user_input_obj, "files") else []
+                
+            if files:
+                import uuid
+                uploaded_img = files[0]
+                mime = uploaded_img.type or "image/png"
+                uploaded_files_list.append({
+                    "file_id": f"file_{uuid.uuid4().hex[:8]}",
+                    "filename": uploaded_img.name,
+                    "size_bytes": uploaded_img.size,
+                    "mime_type": mime,
+                    "bytes": uploaded_img.read()
+                })
+                
+            # Safe submit rule checking
+            has_text_input = bool(user_input and user_input.strip())
+            has_files = bool(uploaded_files_list)
+            
+            if has_text_input or has_files:
+                placeholders = _find_placeholders(user_input) if has_text_input else []
+                if placeholders:
+                    st.warning(
+                        "Your answer contains placeholder values (X, Y, Z) — "
+                        "please use real numbers.\n\n"
+                        + "\n".join(f"- `{s}`" for s in placeholders)
+                    )
+                else:
+                    # Build structured payload
+                    active_ref = st.session_state.get("active_reference")
+                    if active_ref:
+                        target_content_str = active_ref.get("target_content", "")
+                        # Truncate to purely act as a preview/debug string. Never meant for semantic interpretation.
+                        truncated_preview = target_content_str[:100] + ("..." if len(target_content_str) > 100 else "")
+                        payload = {
+                            "event_type": active_ref["event_type"],
+                            "content": user_input,
+                            "target_message_id": active_ref["target_message_id"],
+                            "target_content": truncated_preview,
+                            "source_message_role": active_ref.get("source_message_role", ""),
+                            "ui_action_label": active_ref.get("label", ""),
+                        }
+                        st.session_state.active_reference = None  # consume reference
+                    else:
+                        content_val = user_input if has_text_input else "[Image Uploaded]"
+                        payload = {"event_type": "ANSWER", "content": content_val}
+                        
+                    if uploaded_files_list:
+                        payload["uploaded_files"] = uploaded_files_list
+                        
+                    import logging, re
+                    metrics_logger = logging.getLogger("orchestrator_metrics")
+                    contains_prior_chat = bool(re.search(r"(?i)\buser:.*\bassistant:", user_input)) if user_input else False
+                    metrics_logger.info("composer_submit_payload_debug", extra={
+                        "event_type": "composer_submit_payload_debug",
+                        "turn_id": sv.get("run_id", "unknown") if sv else "unknown",
+                        "latest_user_input_length": len(user_input),
+                        "contains_prior_chat_markers": contains_prior_chat,
+                        "reply_context_present": bool(active_ref),
+                        "upload_text_length": 0
+                    })
+                        
+                    # Store and rerun — processed above the composer row on next render
+                    st.session_state._pending_payload = payload
+                    st.session_state._pending_user_msg = user_input
+                    st.rerun()
 
     else:
         # Landing: first message initialises the graph (D-M2)
-        if st.session_state.upload_mode:
-            with st.container(border=True):
-                c1, c2 = st.columns([10, 1])
-                with c1:
-                    st.markdown("**Attach an Image**")
-                with c2:
-                    if st.button("✕", key="cancel_upload_landing", use_container_width=True):
-                        st.session_state.upload_mode = False
-                        st.rerun()
-                
-                uploaded_img = st.file_uploader(
-                    "Share a screenshot or diagram to help describe what you're building.",
-                    type=["png", "jpg", "jpeg", "webp"],
-                    key="image_uploader_landing",
-                    label_visibility="collapsed",
-                )
-                if uploaded_img is not None:
-                    img_key = f"_img_processed_{uploaded_img.name}_{uploaded_img.size}"
-                    if img_key not in st.session_state:
-                        st.session_state[img_key] = True
-                        mime = uploaded_img.type or "image/png"
-                        st.session_state._stashed_upload = {
-                            "file_id": f"file_{uuid.uuid4().hex[:8]}",
-                            "filename": uploaded_img.name,
-                            "size_bytes": uploaded_img.size,
-                            "mime_type": mime,
-                            "bytes": uploaded_img.read()
-                        }
-                        st.session_state.upload_mode = False
-                        st.rerun()
+        user_input_obj = st.chat_input("What are you building?", accept_file=True, file_type=["png", "jpg", "jpeg", "webp"])
+        
+        user_input = getattr(user_input_obj, "text", "") if hasattr(user_input_obj, "text") else (user_input_obj if isinstance(user_input_obj, str) else "")
+        uploaded_files_list = []
+        if isinstance(user_input_obj, dict):
+            files = user_input_obj.get("files", [])
+            user_input = user_input_obj.get("text", "")
         else:
-            if st.session_state.get("_stashed_upload"):
-                with st.container(border=True):
-                    c1, c2 = st.columns([9, 1])
-                    file_dict = st.session_state._stashed_upload
-                    with c1:
-                        st.info(f"📎 Attached: {file_dict['filename']}")
-                    with c2:
-                        if st.button("✕", key="clear_upload_landing_btn", use_container_width=True):
-                            del st.session_state._stashed_upload
-                            st.rerun()
-                    if st.button("Send Image Without Text", use_container_width=True):
-                        try:
-                            graph.invoke(_build_initial_state(list(st.session_state.image_context_buffer)), _config())
-                        except Exception as exc:
-                            st.error(f"Could not start session: {exc}")
-                            st.stop()
-                        st.session_state.graph_started = True
-                        st.session_state.image_context_buffer = []
-                        
-                        payload = _build_submit_payload("", st.session_state._stashed_upload)
-                        if payload:
-                            st.session_state._pending_payload = payload
-                            st.session_state._pending_user_msg = "[Image Uploaded]"
-                            del st.session_state._stashed_upload
-                            st.rerun()
-                        
-            user_input = st.chat_input("Describe what you're building…")
+            files = getattr(user_input_obj, "files", []) if hasattr(user_input_obj, "files") else []
             
-            # Safe submit rule checking for landing component
-            stashed_upload = st.session_state.get("_stashed_upload")
-            payload = _build_submit_payload(user_input if user_input else "", stashed_upload)
+        if files:
+            import uuid
+            uploaded_img = files[0]
+            mime = uploaded_img.type or "image/png"
+            stashed_upload = {
+                "file_id": f"file_{uuid.uuid4().hex[:8]}",
+                "filename": uploaded_img.name,
+                "size_bytes": uploaded_img.size,
+                "mime_type": mime,
+                "bytes": uploaded_img.read()
+            }
+        else:
+            stashed_upload = None
+
+        has_text_input = bool(user_input and user_input.strip())
+        has_files = bool(stashed_upload)
+        
+        if has_text_input or has_files:
+            content_val = user_input if has_text_input else "[Image Uploaded]"
+            payload = _build_submit_payload(user_input, stashed_upload)
             
             if payload:
                 try:
@@ -1324,10 +1263,7 @@ with _inp_col:
                     st.stop()
                 st.session_state.graph_started = True
                 st.session_state.image_context_buffer = []
-
-                if stashed_upload:
-                    del st.session_state._stashed_upload
-                    
+                
                 st.session_state._pending_payload = payload
-                st.session_state._pending_user_msg = user_input if (user_input and user_input.strip()) else "[Image Uploaded]"
+                st.session_state._pending_user_msg = content_val
                 st.rerun()

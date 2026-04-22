@@ -19,6 +19,7 @@ from graph.nodes import (
     terminal_session_node,
 )
 from graph.split_nodes import (
+    multimodal_answer_materialization_node,
     numeric_validation_node,
     intent_classifier_node,
     target_context_selector_node,
@@ -97,6 +98,7 @@ def build_graph(checkpointer: MemorySaver | None = None):
     builder.add_node("numeric_validation", numeric_validation_node)
     builder.add_node("intent_classifier", intent_classifier_node)
     builder.add_node("target_context_selector", target_context_selector_node)
+    builder.add_node("multimodal_answer_materialization", multimodal_answer_materialization_node)
     builder.add_node("clarification_router", clarification_router_node)
     builder.add_node("repair_mode", repair_mode_node)
     builder.add_node("option_resolution", option_resolution_node)
@@ -133,6 +135,7 @@ def build_graph(checkpointer: MemorySaver | None = None):
             "file_upload_intake": "file_upload_intake",
             "image_description_session_context": "image_description_session_context",
             "terminal_session": "terminal_session",
+            "handle_tagged_event": "handle_tagged_event",
         }
     )
 
@@ -157,6 +160,7 @@ def build_graph(checkpointer: MemorySaver | None = None):
             "image_description_session_context": "image_description_session_context",
             "terminal_session": "terminal_session",
             "await_discovery_answer": "await_discovery_answer",
+            "handle_tagged_event": "handle_tagged_event",
         },
     )
 
@@ -238,7 +242,8 @@ def build_graph(checkpointer: MemorySaver | None = None):
     
     # Intent split routing
     builder.add_edge("intent_classifier", "target_context_selector")
-    builder.add_edge("target_context_selector", "clarification_router")
+    builder.add_edge("target_context_selector", "multimodal_answer_materialization")
+    builder.add_edge("multimodal_answer_materialization", "clarification_router")
     
     builder.add_conditional_edges(
         "clarification_router",

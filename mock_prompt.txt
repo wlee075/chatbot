@@ -1,0 +1,1 @@
+Please quickly patch the image-only submit crash. I added some if statements in app.py to handle empty target buffers.
