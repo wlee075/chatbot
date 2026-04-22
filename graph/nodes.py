@@ -1227,6 +1227,23 @@ def _segment_text_with_provenance(reply_content: str, referenced_concept_keys: l
         
     return segments
 
+def _extract_submit_payload(resume_value: dict | str) -> tuple[str, list, dict]:
+    """
+    Central helper for wait nodes to digest resume payloads identically.
+    Returns (user_text, uploaded_files, pending_event).
+    """
+    if isinstance(resume_value, dict):
+        user_text = resume_value.get("content", "")
+        uploaded_files = resume_value.get("uploaded_files", [])
+        pending_event = {k: v for k, v in resume_value.items() if k != "uploaded_files"}
+        if "event_type" not in pending_event:
+            pending_event["event_type"] = "ANSWER"
+    else:
+        user_text = str(resume_value) if resume_value is not None else ""
+        uploaded_files = []
+        pending_event = {"event_type": "ANSWER", "content": user_text}
+    return user_text, uploaded_files, pending_event
+
 def await_first_message_node(state: PRDState) -> dict:
     """
     D-M2 — Fires interrupt() immediately so the user's very first typed message
@@ -1234,20 +1251,26 @@ def await_first_message_node(state: PRDState) -> dict:
     Sets context_doc so detect_framing_node can classify what was said.
     """
     first_message = interrupt({"type": "waiting_for_first_message"})
-    if isinstance(first_message, dict):
-        text = first_message.get("content", "").strip()
-        uploaded_files = first_message.get("uploaded_files", [])
-    else:
-        text = str(first_message).strip()
-        uploaded_files = []
+    text, uploaded_files, pending_event = _extract_submit_payload(first_message)
+    text = text.strip()
+
+    event_type = pending_event.get("event_type", "ANSWER")
+    if event_type in ("SUBMIT_SESSION_CONTEXT", "REMOVE_SESSION_CONTEXT", "REVERT_SESSION_CONTEXT"):
+        return {
+            "uploaded_files": uploaded_files,
+            "pending_event": pending_event
+        }
+
     user_msg = _build_user_message_dict(text)
     semantics = user_msg.get("semantics", {})
     concept_history_update = _sync_concept_history(state, semantics) if semantics else {}
+    
     return {
         "context_doc": text,
         "chat_history": [user_msg],
         "concept_history": concept_history_update,
-        "uploaded_files": uploaded_files
+        "uploaded_files": uploaded_files,
+        "pending_event": pending_event
     }
 
 
@@ -1276,6 +1299,14 @@ def detect_framing_node(state: PRDState) -> dict:
     ctx = _log_ctx(state, "detect_framing_node")
     t0 = time.monotonic()
     context_doc = state.get("context_doc", "").strip()
+    
+    # Image-only bypass
+    if not context_doc and state.get("uploaded_files"):
+        log_event(
+            **ctx, level="INFO", event_type="framing_fallback_image_only",
+            message="Bypassing framing classifier for image-only submission"
+        )
+        return {"framing_mode": "clear", "phase": "elicitation"}
 
     log_event(
         **ctx, level="INFO", event_type="node_start",
@@ -1305,11 +1336,40 @@ def detect_framing_node(state: PRDState) -> dict:
     return {"framing_mode": framing_mode, "phase": phase}
 
 
+def _build_visual_context_block(state: dict) -> str:
+    """Standardizes the visual context injection block with proactive synthesis instructions."""
+    bg_contexts = state.get("background_generated_contexts", [])
+    active_bg_contexts = [ctx for ctx in bg_contexts if ctx.get("is_active")]
+    active_bg_contexts.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    top_contexts = active_bg_contexts[:3]
+    
+    if not top_contexts:
+        return ""
+        
+    block = "\n\n=== VERIFIED VISUAL CONTEXT ===\n"
+    block += (
+        "The user uploaded visual context. You must employ proactive but bounded synthesis:\n"
+        "1. Proactive Connection: Actively connect the image to their text goal immediately. Do not wait for them to ask.\n"
+        "2. Bounded Inference: Do not over-commit. If the connection is weak, use tentative language ('This appears to be...', 'Assuming this relates to...').\n"
+        "3. Synthesis, Not Description: Do not merely restate the image details. Briefly interpret its relevance to the problem.\n"
+        "4. Exact Question Limit: Your response must be highly concise and culminate in EXACTLY ONE sharply scoped question.\n\n"
+        "Available Semantic Contexts:\n"
+    )
+    for ctx in top_contexts:
+        filename = ctx.get("image_file_id", "unknown")
+        eff_summary = ctx.get("edited_summary") or ctx.get("generated_summary", "")
+        # Hardcap to prevent context blowing out entirely
+        eff_summary = eff_summary[:800] 
+        block += f"---\nFile: {filename}\nSummary: {eff_summary}\n"
+    block += "===============================\n"
+    return block
+
+
 # ── Node: discovery_questions ─────────────────────────────────────────────────
 
 _DISCOVERY_SYSTEM = (
     "You are a friendly product management coach helping someone clarify what they want to build.\n\n"
-    "What they've said so far:\n{context_doc}\n\n"
+    "What they've said so far:\n{context_doc}\n{visual_context_block}\n\n"
     "Conversation Semantic State:\n{conversation_understanding}\n\n"
     "Situation: {framing_label}\n"
     "This is clarifying question set {turn_label}.\n\n"
@@ -1356,6 +1416,7 @@ def discovery_questions_node(state: PRDState) -> dict:
         llm,
         [HumanMessage(content=_DISCOVERY_SYSTEM.format(
             context_doc=context_doc,
+            visual_context_block=_build_visual_context_block(state),
             conversation_understanding=json.dumps(bridge_output, indent=2, default=str),
             framing_label=framing_label,
             turn_label=turn_label,
@@ -1394,19 +1455,12 @@ def await_discovery_answer_node(state: PRDState) -> dict:
         "type": "waiting_for_discovery_answer",
         "discovery_turn_count": state.get("discovery_turn_count", 0),
     })
-    if isinstance(resume_value, dict):
-        answer = resume_value.get("content", "")
-        uploaded_files = resume_value.get("uploaded_files", [])
-        pending_event = resume_value
-    else:
-        answer = str(resume_value)
-        uploaded_files = []
-        pending_event = {"event_type": "ANSWER", "content": answer}
+    answer, uploaded_files, pending_event = _extract_submit_payload(resume_value)
         
     event_type = pending_event.get("event_type", "ANSWER")
     
     # T1/T2: Do not append structured UI events as standalone conversational context turns
-    if event_type in ("SUBMIT_SESSION_CONTEXT", "REMOVE_SESSION_CONTEXT", "REVERT_SESSION_CONTEXT", "FILE_UPLOAD"):
+    if event_type in ("SUBMIT_SESSION_CONTEXT", "REMOVE_SESSION_CONTEXT", "REVERT_SESSION_CONTEXT"):
         return {
             "uploaded_files": uploaded_files,
             "pending_event": pending_event
@@ -1415,20 +1469,16 @@ def await_discovery_answer_node(state: PRDState) -> dict:
     answer = answer.strip()
     existing = state.get("context_doc", "").strip()
     
-    attached_ctx = state.get("active_context_text", "")
-    is_active_ctx = state.get("session_context_status") == "active"
-    
-    if is_active_ctx and attached_ctx:
-        new_context = f"{existing}\n\n[Attached visual context: {attached_ctx}]\n{answer}" if existing else f"[Attached visual context: {attached_ctx}]\n{answer}"
-    else:
-        new_context = f"{existing}\n\n{answer}" if existing else answer
-        
     user_msg = _build_user_message_dict(answer)
     semantics = user_msg.get("semantics", {})
     concept_history_update = _sync_concept_history(state, semantics) if semantics else {}
     
-    if is_active_ctx and attached_ctx:
-        user_msg["attached_image_context"] = attached_ctx
+    visual_context = _build_visual_context_block(state)
+    if visual_context:
+        new_context = f"{existing}\n\n{visual_context}\n{answer}" if existing else f"{visual_context}\n{answer}"
+        user_msg["attached_image_context"] = visual_context
+    else:
+        new_context = f"{existing}\n\n{answer}" if existing else answer
     
     return {
         "context_doc": new_context,
@@ -1436,38 +1486,19 @@ def await_discovery_answer_node(state: PRDState) -> dict:
         "concept_history": concept_history_update,
         "uploaded_files": uploaded_files,
         "pending_event": pending_event,
-        "session_context_status": "",
-        "active_context_text": "",
         "response_type": ""
     }
 
 
 # ── Node: generate_questions ──────────────────────────────────────────────────
 
-def generate_questions_node(state: PRDState) -> dict:
-    """
-    Elicitor — generates targeted questions for the current PRD section.
-    Questions are added to chat_history so the PM sees them immediately.
-    """
-    ctx = _log_ctx(state, "generate_questions_node")
-    t0 = time.monotonic()
-    
-    log_event(
-        **ctx, level="INFO", event_type="question_generation_decision",
-        message="Logging generation decision parameters",
-        active_blocker_before=state.get("remaining_subparts", [""])[0] if state.get("remaining_subparts") else "",
-        remaining_blockers_before=state.get("remaining_subparts", []),
-        conflict_records=state.get("conflict_records", []),
-        question_mode="repair" if state.get("pending_numeric_clarification") else "normal",
-        why_question_generation_was_used="Routed explicitly to generation path",
-        why_clarification_answer_was_not_used="Not classified as DIRECT_CLARIFICATION_QUESTION"
-    )
-    
+
+def _maybe_emit_numeric_repair_prompt(state: "PRDState", section, ctx: dict) -> dict | None:
     if state.get("pending_numeric_clarification"):
         repair_prompt = "I may have misunderstood that value. Did you mean 30 minutes per day, 3 hours per day, or something else?"
         log_event(**ctx, level="INFO", event_type="repair_prompt_emitted", message="Emitted deterministic repair prompt.")
         
-        section = get_section_by_index(state["section_index"])
+        import uuid
         return _enforce_visibility({
             "current_questions": repair_prompt,
             "question_status": "OPEN",
@@ -1475,11 +1506,9 @@ def generate_questions_node(state: PRDState) -> dict:
             "parent_question_id": state.get("active_question_id", ""),
             "repair_question_id": str(uuid.uuid4()),
         }, repair_prompt, section.title if section else "Unknown", state["section_index"], state.get("iteration", 0), event_type="elicit")
+    return None
 
-    section = get_section_by_index(state["section_index"])
-    bridge_output = build_conversation_understanding_output(state)
-    
-    # ── Deterministic Conflict Gating ──
+def _maybe_emit_conflict_resolution_question(state: "PRDState", bridge_output: dict, section, ctx: dict) -> dict | None:
     if bridge_output.get("conflicted_concepts"):
         conflict = bridge_output["conflicted_concepts"][0]
         deterministic_q = f"I'm hearing mixed details about '{conflict.get('surface', conflict.get('concept_key', 'this'))}'. Could you clarify the current workflow for this?"
@@ -1488,6 +1517,7 @@ def generate_questions_node(state: PRDState) -> dict:
                   message="Short-circuited LLM generation due to semantic conflict", 
                   conflict_target=conflict.get("concept_key"))
         
+        import uuid
         current_question_object = {
             "question_id": str(uuid.uuid4()),
             "question_text": deterministic_q,
@@ -1508,17 +1538,16 @@ def generate_questions_node(state: PRDState) -> dict:
             "recent_questions": state.get("recent_questions", []) + [deterministic_q],
             "repair_instruction": "",
         }, deterministic_q, section.title if section else "Unknown", state["section_index"], state.get("iteration", 0), event_type="elicit")
-    
-    # ── Deterministic Branch Short-Circuit (F1/M1/M2) ──
+    return None
+
+def _maybe_emit_resolved_branch_question(state: "PRDState", section, ctx: dict) -> dict | None:
     if state.get("question_status") == "ANSWERED":
         resolved_opt = state.get("resolved_option_id", "")
         if resolved_opt:
             remaining = state.get("remaining_subparts", [])
-            # F2: Highest priority unresolved blocker
             target_subpart = remaining[0] if remaining else "overall details"
             target_lower = target_subpart.lower()
             
-            # F1/M1: Curated branch/blocker-specific templates
             if any(k in target_lower for k in ("metric", "success", "measure")):
                 deterministic_q = f"How will we measure success specifically for the {resolved_opt}?"
             elif any(k in target_lower for k in ("manual", "bottleneck", "error", "pain")):
@@ -1534,12 +1563,12 @@ def generate_questions_node(state: PRDState) -> dict:
                       message="Short-circuited LLM generation for resolved branch", 
                       resolved_option=resolved_opt)
             
-            # M4: Log prevention metric
             log_event(
                 thread_id=state.get("thread_id", ""), run_id=state.get("run_id", ""), node_name="generate_questions_node",
                 event_type="metric_llm_prevention", metric_name="branch_short_circuit", metric_value=1
             )
             
+            import uuid
             current_question_object = {
                 "question_id": str(uuid.uuid4()),
                 "question_text": deterministic_q,
@@ -1560,30 +1589,18 @@ def generate_questions_node(state: PRDState) -> dict:
                 "recent_questions": state.get("recent_questions", []) + [deterministic_q],
                 "repair_instruction": "",
             }, deterministic_q, section.title if section else "Unknown", state["section_index"], state.get("iteration", 0), event_type="elicit")
-    iteration = state.get("iteration", 0)
-    llm = _get_llm()
+    return None
 
-    # ── Build each named block separately ────────────────────────────────────
+def _build_elicitor_prompt_context(state: "PRDState", section, bridge_output: dict) -> str:
+    iteration = state.get("iteration", 0)
     prd_so_far = _format_prd_so_far(state.get("prd_sections", {}))
     prd_block = ELICITOR_PRD_BLOCK.format(prd_so_far=prd_so_far) if prd_so_far else ""
 
     context_block = ""
     if state.get("context_doc"):
         context_block += ELICITOR_CONTEXT_BLOCK.format(context_doc=state["context_doc"])
-        
-    chat_hist = state.get("chat_history", [])
-    bound_image_ctx = None
-    for msg in reversed(chat_hist):
-        if msg.get("role") == "user":
-            if msg.get("attached_image_context"):
-                bound_image_ctx = msg.get("attached_image_context")
-            break
-
-    if bound_image_ctx:
-        context_block += "\n\n=== VERIFIED VISUAL CONTEXT ===\n"
-        context_block += "The user has attached images for this question. Use this confirmed multi-modal analysis to inform your follow-up questions:\n"
-        context_block += bound_image_ctx
-        context_block += "\n===============================\n"
+    
+    context_block += _build_visual_context_block(state)
 
     if iteration > 0 and state.get("reflection"):
         raw_gaps = state.get("requirement_gaps", "")
@@ -1600,7 +1617,6 @@ def generate_questions_node(state: PRDState) -> dict:
     else:
         iteration_block = ""
 
-    # First-turn block: only on the very first question for this section
     qa_store = state.get("confirmed_qa_store", {})
     section_has_answers = any(
         v.get("section_id") == section.id for v in qa_store.values()
@@ -1618,10 +1634,12 @@ def generate_questions_node(state: PRDState) -> dict:
 
     if repair_instruction in ("DUPLICATE_SUPPRESSED", "REPETITION_COMPLAINT"):
         if remaining_subparts:
-            if remaining_subparts[0] == "workflow_sequence_missing":
-                remaining_subparts = ["mapping_logic_missing"] + [s for s in remaining_subparts if s != "mapping_logic_missing"]
-            elif remaining_subparts[0] == "mapping_logic_missing":
-                remaining_subparts = ["destination_handling_missing"] + [s for s in remaining_subparts if s != "destination_handling_missing"]
+            temp_remaining = list(remaining_subparts)
+            if temp_remaining[0] == "workflow_sequence_missing":
+                temp_remaining = ["mapping_logic_missing"] + [s for s in temp_remaining if s != "mapping_logic_missing"]
+            elif temp_remaining[0] == "mapping_logic_missing":
+                temp_remaining = ["destination_handling_missing"] + [s for s in temp_remaining if s != "destination_handling_missing"]
+            remaining_subparts = temp_remaining
         
         first_turn_block += f"\n\nCRITICAL: User indicated frustration over repetition. Explicitly acknowledge context, and ensure this query is syntactically distinct. You MUST ask about a different narrower subpart: {remaining_subparts[0] if remaining_subparts else 'unknown'}."
     elif repair_instruction == "REPHRASE_REQUIRED":
@@ -1659,107 +1677,105 @@ def generate_questions_node(state: PRDState) -> dict:
         language_rules_block=LANGUAGE_RULES_BLOCK,
         numeric_grounding_block=NUMERIC_GROUNDING_BLOCK,
     )
-    # Backend tone enclosure to prevent evaluator language bypass
     system_prompt += "\n\nCRITICAL UX RULE: Do not use internal reviewer terms like 'contradictory', 'ambiguous', 'blocker', 'rubric', 'missing components'. Explain what details you need using plain English. Ask EXACTLY ONE question."
+    return system_prompt
 
-    recent_q_history = state.get("recent_questions", [])
+def _invoke_structured_question_generator(system_prompt: str, section, state: "PRDState") -> tuple[dict | str, float]:
+    import time
+    llm = _get_llm()
     
-    for attempt in range(3):
-        response = llm_invoke(
-            llm.with_structured_output(
-                {
-                    "name": "QuestionSchema",
-                    "description": "Structure of the next logical question to ask.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "question_id": {"type": "string"},
-                            "user_facing_gap_reason": {"type": "string"},
-                            "single_next_question": {"type": "string"},
-                            "subparts": {"type": "array", "items": {"type": "string"}},
-                            "question_type": {"type": "string", "enum": ["OPEN_ENDED", "BINARY_CLARIFICATION"]},
-                            "options": {"type": "array", "items": {"type": "string"}},
-                        },
-                        "required": ["question_id", "user_facing_gap_reason", "single_next_question", "subparts"],
+    t0 = time.monotonic()
+    response = llm_invoke(
+        llm.with_structured_output(
+            {
+                "name": "QuestionSchema",
+                "description": "Structure of the next logical question to ask.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question_id": {"type": "string"},
+                        "user_facing_gap_reason": {"type": "string"},
+                        "single_next_question": {"type": "string"},
+                        "subparts": {"type": "array", "items": {"type": "string"}},
+                        "question_type": {"type": "string", "enum": ["OPEN_ENDED", "BINARY_CLARIFICATION"]},
+                        "options": {"type": "array", "items": {"type": "string"}},
                     },
-                }
-            ),
-            [
-                SystemMessage(content=system_prompt),
-                HumanMessage(
-                    content=f"Generate questions for the '{section.title}' section."
-                ),
-            ],
-            state=state, node_name="generate_questions_node", purpose="structured_question_generation"
-        )
-        
-        # Semantic Repeat Trap
-        new_q_text = response.get("single_next_question", "") if isinstance(response, dict) else str(response)
-        is_semantic_repeat = False
-        
-        if recent_q_history and new_q_text:
-            nlp = _get_nlp()
-            if nlp:
-                doc_n = nlp(new_q_text.lower())
-                doc_o = nlp(recent_q_history[-1].lower())
-                # Isolate core nouns/verbs stripped of stopwords
-                lemmas_n = {t.lemma_ for t in doc_n if t.pos_ in ("NOUN", "VERB", "ADJ") and not t.is_stop}
-                lemmas_o = {t.lemma_ for t in doc_o if t.pos_ in ("NOUN", "VERB", "ADJ") and not t.is_stop}
-                
-                # Broad overlap definition for backend gating
-                if lemmas_n and lemmas_o:
-                    overlap_ratio = len(lemmas_n & lemmas_o) / max(len(lemmas_n), 1)
-                    if overlap_ratio > 0.65:
-                        from utils.adjudicator import invoke_llm_adjudicator
-                        decision = invoke_llm_adjudicator(
-                            task_type="semantic_repeat",
-                            context_data={
-                                "previous_question": recent_q_history[-1],
-                                "candidate_next_question": new_q_text,
-                                "run_id": state.get("run_id"),
-                                "thread_id": state.get("thread_id")
-                            },
-                            llm=_get_llm()
-                        )
-                        # If low confidence or explicitly identical, we reject
-                        if decision is None or decision.decision_result:
-                            is_semantic_repeat = True
-                            log_event(
-                                thread_id=state.get("thread_id", ""), run_id=state.get("run_id", ""), node_name="generate_questions_node",
-                                level="WARNING", event_type="repeat_guard_decision",
-                                message="Caught semantic repeat",
-                                candidate_question=new_q_text,
-                                is_repeat=True,
-                                repeat_reason=decision.reason if decision else "identical lemma coverage",
-                                target_blocker_id=state.get("remaining_subparts", [""])[0] if state.get("remaining_subparts") else ""
-                            )
-        
-        if not is_semantic_repeat:
-            break
-            
-        if attempt == 2:
-            # P3 hard blocker stop
-            fallback_blocker = remaining_subparts[0] if remaining_subparts else "clarification"
-            if fallback_blocker == "workflow_sequence_missing":
-                safe_text = "I want to make sure I don't ask you for the same information twice. What exactly happens right before the Excel mapping?"
-            elif fallback_blocker == "mapping_logic_missing":
-                safe_text = "To avoid repeating myself: could you clarify exactly which fields from the email get matched?"
-            else:
-                safe_text = "I want to make sure I don't ask you for the same information twice. Could you clarify the missing piece?"
-                
-            response = {
-                "question_id": f"hard_block_{int(time.monotonic())}",
-                "single_next_question": safe_text,
-                "user_facing_gap_reason": "",
-                "subparts": [fallback_blocker],
-                "question_type": "OPEN_ENDED",
-                "options": []
+                    "required": ["question_id", "user_facing_gap_reason", "single_next_question", "subparts"],
+                },
             }
-            break
-            
-        system_prompt += f"\n\nCRITICAL ERROR: DO NOT ASK '{new_q_text}'. You just asked a semantically identical question. You MUST narrow the focus to a specific missing domain detail implementation."
+        ),
+        [
+            SystemMessage(content=system_prompt),
+            HumanMessage(
+                content=f"Generate questions for the '{section.title}' section."
+            ),
+        ],
+        state=state, node_name="generate_questions_node", purpose="structured_question_generation"
+    )
+    return response, (time.monotonic() - t0)
 
-    # --- CONTAINMENT FIX: If the LLM structured parser failed and returned a string ---
+def _apply_repeat_guard(response: dict | str, recent_q_history: list[str], state: "PRDState", ctx: dict) -> tuple[bool, str, dict]:
+    new_q_text = response.get("single_next_question", "") if isinstance(response, dict) else str(response)
+    is_semantic_repeat = False
+    decision_reason = "identical lemma coverage"
+    
+    if recent_q_history and new_q_text:
+        nlp = _get_nlp()
+        if nlp:
+            doc_n = nlp(new_q_text.lower())
+            doc_o = nlp(recent_q_history[-1].lower())
+            lemmas_n = {t.lemma_ for t in doc_n if t.pos_ in ("NOUN", "VERB", "ADJ") and not t.is_stop}
+            lemmas_o = {t.lemma_ for t in doc_o if t.pos_ in ("NOUN", "VERB", "ADJ") and not t.is_stop}
+            
+            if lemmas_n and lemmas_o:
+                overlap_ratio = len(lemmas_n & lemmas_o) / max(len(lemmas_n), 1)
+                if overlap_ratio > 0.65:
+                    from utils.adjudicator import invoke_llm_adjudicator
+                    decision = invoke_llm_adjudicator(
+                        task_type="semantic_repeat",
+                        context_data={
+                            "previous_question": recent_q_history[-1],
+                            "candidate_next_question": new_q_text,
+                            "run_id": state.get("run_id"),
+                            "thread_id": state.get("thread_id")
+                        },
+                        llm=_get_llm()
+                    )
+                    if decision is None or decision.decision_result:
+                        is_semantic_repeat = True
+                        decision_reason = decision.reason if decision else decision_reason
+                        log_event(
+                            thread_id=state.get("thread_id", ""), run_id=state.get("run_id", ""), node_name="generate_questions_node",
+                            level="WARNING", event_type="repeat_guard_decision",
+                            message="Caught semantic repeat",
+                            candidate_question=new_q_text,
+                            is_repeat=True,
+                            repeat_reason=decision_reason,
+                            target_blocker_id=state.get("remaining_subparts", [""])[0] if state.get("remaining_subparts") else ""
+                        )
+    return is_semantic_repeat, new_q_text, {"reason": decision_reason}
+
+def _fallback_for_hard_blocker(remaining_subparts: list[str]) -> dict:
+    import time
+    fallback_blocker = remaining_subparts[0] if remaining_subparts else "clarification"
+    if fallback_blocker == "workflow_sequence_missing":
+        safe_text = "I want to make sure I don't ask you for the same information twice. What exactly happens right before the Excel mapping?"
+    elif fallback_blocker == "mapping_logic_missing":
+        safe_text = "To avoid repeating myself: could you clarify exactly which fields from the email get matched?"
+    else:
+        safe_text = "I want to make sure I don't ask you for the same information twice. Could you clarify the missing piece?"
+        
+    return {
+        "question_id": f"hard_block_{int(time.monotonic())}",
+        "single_next_question": safe_text,
+        "user_facing_gap_reason": "",
+        "subparts": [fallback_blocker],
+        "question_type": "OPEN_ENDED",
+        "options": []
+    }
+
+def _normalize_generated_question(response: dict | str, state: "PRDState", ctx: dict) -> tuple[dict, str]:
+    import time
     extraction_status = "success"
     if isinstance(response, str):
         extraction_status = "fallback"
@@ -1776,7 +1792,6 @@ def generate_questions_node(state: PRDState) -> dict:
             last_q_text = recent[-1]
             
         gap_reason = state.get("user_facing_gap_reason", "")
-        # M3: Only force overwrite when fallback output is an exact or semantic repeat
         preserved_options = []
         preserved_type = "OPEN_ENDED"
         if last_q_text and (last_q_text.lower() in fallback_msg.lower() or fallback_msg.lower() in last_q_text.lower()):
@@ -1800,6 +1815,7 @@ def generate_questions_node(state: PRDState) -> dict:
         response = {
             "question_id": "fallback_error",
             "single_next_question": "Could you tell me a little more about what you're trying to achieve?",
+            "user_facing_gap_reason": "",
             "subparts": ["clarification"],
             "question_type": "OPEN_ENDED",
             "options": [],
@@ -1812,13 +1828,10 @@ def generate_questions_node(state: PRDState) -> dict:
         extraction_status=extraction_status
     )
     
-    # ── Phase 2 Backend Enforcements ──
     raw_next_q = response.get("single_next_question", "Could you provide a few more details on this?")
     raw_gap_reason = state.get("user_facing_gap_reason", response.get("user_facing_gap_reason", ""))
-    
     raw_ans_lower = state.get("raw_answer_buffer", "").lower()
     
-    # Workflow Detection to prevent generic elaboration prompts
     if "->" in raw_ans_lower or "step" in raw_ans_lower or "workflow" in raw_ans_lower or "first" in raw_ans_lower or "map" in raw_ans_lower:
         if "elaborate" in raw_next_q.lower() or "more detail" in raw_next_q.lower():
             if "map" in raw_ans_lower or "match" in raw_ans_lower:
@@ -1830,17 +1843,21 @@ def generate_questions_node(state: PRDState) -> dict:
             else:
                 raw_next_q = "Who performs this process today?"
     
-    # Plain English constraint: Scrub internal evaluative jargon
+    import re
     jargon = re.compile(r'\b(contradictory|ambiguous|rubric|missing components|implementation blocker|review process|overall score)\b', re.IGNORECASE)
     raw_next_q = jargon.sub('unclear', raw_next_q)
     raw_gap_reason = jargon.sub('unclear', raw_gap_reason)
     
-    # One-question limit enforcement: Break at first question mark followed by another question or bullet
     if '?' in raw_next_q:
         parts = raw_next_q.split('?')
         if len(parts) > 2:
             raw_next_q = parts[0].strip() + '?'
+            
+    response["single_next_question"] = raw_next_q
+    return response, raw_gap_reason
 
+def _construct_final_question_text(response: dict, raw_gap_reason: str, state: "PRDState") -> str:
+    raw_next_q = response.get("single_next_question", "")
     if raw_gap_reason:
         questions = f"{raw_gap_reason.strip().rstrip('.')}.\n\n{raw_next_q}"
     else:
@@ -1853,16 +1870,6 @@ def generate_questions_node(state: PRDState) -> dict:
     if acknowledged_context.endswith("."):
         acknowledged_context = acknowledged_context[:-1]
 
-    gap_taxonomy_map = {
-        "unclear_trigger": "I understand the steps. What event or condition actually kicks this off?",
-        "unclear_output": "I understand the process. What final output should this step produce?",
-        "unclear_role": "I understand what needs to happen. Who exactly is responsible for doing this?",
-        "unclear_rule": "I understand the process. What specific logic or rule dictates how this should be handled?",
-        "missing_owner": "I understand the process. What I still need to know is the team. Who owns this?",
-        "missing_fields": "You described the workflow. Which fields are you manually matching in Excel today?"
-    }
-
-    # R2: compress if repeats entire sentence
     if len(acknowledged_context.split()) > 15:
         acknowledged_context = "the process"
 
@@ -1874,27 +1881,9 @@ def generate_questions_node(state: PRDState) -> dict:
     else:
         combined = f"{raw_next_q}"
         
-    # Check for entity overlap
     raw_ans = state.get("raw_answer_buffer", "").lower()
-    has_overlap = False
-    if len(raw_ans) > 2:
-        try:
-            import nltk
-            from nltk.stem import SnowballStemmer
-            stemmer = SnowballStemmer("english")
-            words1 = [stemmer.stem(re.sub(r'[^\w\s]', '', w)) for w in acknowledged_context.lower().split() if len(re.sub(r'[^\w\s]', '', w)) > 3]
-            words2 = [stemmer.stem(re.sub(r'[^\w\s]', '', w)) for w in raw_ans.split() if len(re.sub(r'[^\w\s]', '', w)) > 3]
-            for w in words1:
-                if w in words2:
-                    has_overlap = True
-                    break
-        except Exception:
-            has_overlap = True
-
     if response.get("question_type", "OPEN_ENDED") == "OPEN_ENDED":
         questions = combined
-        
-        # Override specific cases because this branch was corrupted by git checkout
         if "Can you give" in raw_next_q and "an example" in raw_next_q:
              if "How much does it cost?" in raw_next_q: 
                   questions = "I understand the current process. How much does it cost?"
@@ -1909,13 +1898,10 @@ def generate_questions_node(state: PRDState) -> dict:
     else:
         questions = raw_next_q
             
-    if extraction_status != "success":
-        questions = raw_next_q
+    return _sanitize_user_facing_question(questions)
 
-    questions = _sanitize_user_facing_question(questions)
-    
-    # ── Deterministic Question Suppression (P0) ──
-    # Ensure we don't ask for things already in the canonical store.
+def _suppress_resolved_subparts(response: dict, raw_gap_reason: str, state: "PRDState", section, ctx: dict) -> tuple[str, list[str]]:
+    qa_store = state.get("confirmed_qa_store", {})
     resolved_in_store = []
     for k, v in qa_store.items():
         if v.get("section_id") == section.id and not v.get("contradiction_flagged"):
@@ -1925,7 +1911,10 @@ def generate_questions_node(state: PRDState) -> dict:
     raw_subparts = response.get("subparts", [])
     filtered_subparts = [sp for sp in raw_subparts if sp not in resolved_set]
     
-    # Post-LLM Guard: If all subparts are resolved, suppress the question.
+    questions = _construct_final_question_text(response, raw_gap_reason, state)
+    raw_next_q = response.get("single_next_question", "")
+    iteration = state.get("iteration", 0)
+    
     if raw_subparts and not filtered_subparts:
         log_suppression_decision(
             thread_id=state.get("thread_id", ""),
@@ -1936,7 +1925,6 @@ def generate_questions_node(state: PRDState) -> dict:
             reason=f"All subparts {raw_subparts} already resolved in store."
         )
         
-        # F3: Suppression observability
         log_event(
             **ctx, level="INFO", event_type="suppression_observability",
             message="Fully suppressed candidate question",
@@ -1946,7 +1934,6 @@ def generate_questions_node(state: PRDState) -> dict:
             final_question="I have all the details I need for this section. Let's move on."
         )
         
-        # Advance if we have nothing left to ask
         if iteration > 0:
             questions = "I have all the details I need for this section. Let's move on."
             filtered_subparts = []
@@ -1960,8 +1947,6 @@ def generate_questions_node(state: PRDState) -> dict:
             decision="PARTIAL_SUPPRESSION",
             reason=f"Suppressed duplicate subparts: {suppressed}"
         )
-        
-        # F3: Suppression observability
         log_event(
             **ctx, level="INFO", event_type="suppression_observability",
             message="Partially suppressed candidate question",
@@ -1970,32 +1955,20 @@ def generate_questions_node(state: PRDState) -> dict:
             suppressed_subparts=suppressed,
             final_question=raw_next_q
         )
+        
+    return questions, filtered_subparts
 
+def _apply_duplicate_question_guard(response: dict, questions: str, filtered_subparts: list[str], raw_gap_reason: str, state: "PRDState", section, ctx: dict) -> tuple[dict, str]:
+    raw_next_q = response.get("single_next_question", "")
     recent_questions = state.get("recent_questions", [])
-
-    current_question_object = {
-        "question_id": response.get("question_id", ""),
-        "question_text": raw_next_q,
-        "subparts": filtered_subparts,
-    }
-    
-    # ── Top-Priority Visible Question Log (L0) ──
-    log_event(
-        **ctx, level="INFO", event_type="visible_question_selected",
-        message="Selected top priority visible question",
-        selected_blocker_id=filtered_subparts[0] if filtered_subparts else "",
-        selected_question_text=raw_next_q,
-        suppressed_question_count=len(raw_subparts) - len(filtered_subparts)
-    )
-    
-    # M1 & M4: Unconditional Check for Duplicate Question Guard
     last_q_id = state.get("active_question_id", "")
     new_q_id = response.get("question_id", "")
     new_raw_q_lower = raw_next_q.lower()
     is_duplicate = False
     matched_prior = ""
-    
-    # 1. Check against recent_questions unconditionally
+    qa_store = state.get("confirmed_qa_store", {})
+    raw_subparts = response.get("subparts", [])
+
     if not new_q_id.startswith("hard_block_"):
         for prior_q in recent_questions:
             prior_q_lower = prior_q.lower()
@@ -2003,8 +1976,7 @@ def generate_questions_node(state: PRDState) -> dict:
                 is_duplicate = True
                 matched_prior = prior_q
                 break
-            
-    # 2. Check against canonical qa_store for fully ANSWERED questions
+                
     if not is_duplicate:
         for k, v in qa_store.items():
             if v.get("section_id") == section.id and not v.get("contradiction_flagged"):
@@ -2014,12 +1986,25 @@ def generate_questions_node(state: PRDState) -> dict:
                 text_match = len(stored_q) > 10 and (stored_q in new_raw_q_lower or new_raw_q_lower in stored_q)
                 semantic_match = bool(set(store_subparts) & set(raw_subparts))
                 
-                # M1: Scope to exact text match or shared subpart family
                 if text_match or semantic_match:
                     is_duplicate = True
                     matched_prior = v.get("questions", "")
                     break
-                
+                    
+    current_question_object = {
+        "question_id": response.get("question_id", ""),
+        "question_text": raw_next_q,
+        "subparts": filtered_subparts,
+    }
+    
+    log_event(
+        **ctx, level="INFO", event_type="visible_question_selected",
+        message="Selected top priority visible question",
+        selected_blocker_id=filtered_subparts[0] if filtered_subparts else "",
+        selected_question_text=raw_next_q,
+        suppressed_question_count=len(raw_subparts) - len(filtered_subparts)
+    )
+
     if is_duplicate:
         log_event(
             **ctx, level="INFO", event_type="duplicate_question_blocked",
@@ -2029,33 +2014,39 @@ def generate_questions_node(state: PRDState) -> dict:
             new_question_text=raw_next_q,
             comparison_mode="CANONICAL_RAW_TEXT_ROLLING_WINDOW"
         )
-        # Duplicate question guard fired!
         raw_next_q = "Can you give me a specific example of how this process works in practice today?"
-        # Regenerate the wrapped questions using the new suppressed next question
         if raw_gap_reason:
             questions = f"{raw_gap_reason.strip().rstrip('.')}.\n\n{raw_next_q}"
         else:
             questions = raw_next_q
         questions = _sanitize_user_facing_question(questions)
         current_question_object["question_text"] = raw_next_q
-        if isinstance(response, dict):
-            response["question_type"] = "OPEN_ENDED"
-            response["options"] = []
-            response["content_segments"] = [{"text": questions, "provenance": None}]
+        
+        response["question_type"] = "OPEN_ENDED"
+        response["options"] = []
+        response["content_segments"] = [{"text": questions, "provenance": None}]
+        response["single_next_question"] = raw_next_q
 
-    # Intercept fallback hallucinations where the model concatenates a question AND the exit string
     if "I have all the details I need for this section." in questions:
         if len(questions.strip()) > 60:
             questions = questions.replace("I have all the details I need for this section. Let's move on.", "").strip()
         else:
             filtered_subparts = []
+            current_question_object["subparts"] = filtered_subparts
 
+    return current_question_object, questions
+
+def _package_generated_question_result(response: dict, questions: str, current_question_object: dict, state: "PRDState", section, ctx: dict, system_prompt: str) -> dict:
+    import time
+    qa_store = state.get("confirmed_qa_store", {})
     triage = state.get("triage_decision", "")
     gaps_count = len([l for l in state.get("requirement_gaps", "").splitlines() if l.strip()])
     question_count = len([
         l for l in questions.splitlines()
         if l.strip() and (l.strip()[0:1].isdigit() or l.strip()[0:1] in ("-", "•", "*"))
     ])
+    iteration = state.get("iteration", 0)
+    
     log_event(
         **ctx, level="INFO", event_type="node_start",
         message="generate_questions_node started",
@@ -2075,21 +2066,21 @@ def generate_questions_node(state: PRDState) -> dict:
         triage="RECOVERY" if "RECOVERY MODE" in triage else "NORMAL",
         gaps_count=gaps_count, question_count=question_count, output_len=len(questions),
     )
+    
     log_event(**ctx, level="DEBUG", event_type="elicitor_prompt",
               message="Elicitor system prompt", system_prompt=system_prompt)
     log_event(**ctx, level="DEBUG", event_type="elicitor_raw_output",
               message="Elicitor raw LLM response", raw_output=questions)
-    duration_ms = int((time.monotonic() - t0) * 1000)
+              
+    duration_ms = int((time.monotonic() - ctx.get("_t0", time.monotonic())) * 1000)
     log_event(
         **ctx, level="INFO", event_type="node_end",
         message="generate_questions_node finished",
         duration_ms=duration_ms, question_count=question_count,
     )
 
-    # ── Provenance segmentation: wire _segment_text_with_provenance ──
     referenced_keys = response.get("referenced_concept_keys", []) if isinstance(response, dict) else []
     if not referenced_keys:
-        # Auto-detect: find all concept keys in the qa_store that belong to the current section
         for ck, fact in qa_store.items():
             if fact.get("section_id") == section.id and not fact.get("contradiction_flagged"):
                 referenced_keys.append(ck)
@@ -2102,29 +2093,67 @@ def generate_questions_node(state: PRDState) -> dict:
         "current_question_object": current_question_object,
         "remaining_subparts": current_question_object["subparts"],
         
-        # Phase 1: Overwrite state tracking for new question
         "active_question_id": response.get("question_id", ""),
         "active_question_type": response.get("question_type", "OPEN_ENDED"),
         "active_question_options": response.get("options", []),
         "question_status": "OPEN",
         "resolved_option_id": "",
         "answered_at": "",
-        "recent_questions": [current_question_object["question_text"]],
+        "recent_questions": state.get("recent_questions", []) + [current_question_object["question_text"]],
         
         "repair_instruction": "",
-    }, questions, section.title, state["section_index"], iteration, event_type="elicit")
+    }, questions, section.title if section else "Unknown", state["section_index"], state.get("iteration", 0), event_type="elicit")
 
+def generate_questions_node(state: "PRDState") -> dict:
+    import time
+    ctx = _log_ctx(state, "generate_questions_node")
+    t0 = time.monotonic()
+    ctx["_t0"] = t0
+    
+    log_event(
+        **ctx, level="INFO", event_type="question_generation_decision",
+        message="Logging generation decision parameters",
+        active_blocker_before=state.get("remaining_subparts", [""])[0] if state.get("remaining_subparts") else "",
+        remaining_blockers_before=state.get("remaining_subparts", []),
+        conflict_records=state.get("conflict_records", []),
+        question_mode="repair" if state.get("pending_numeric_clarification") else "normal",
+        why_question_generation_was_used="Routed explicitly to generation path",
+        why_clarification_answer_was_not_used="Not classified as DIRECT_CLARIFICATION_QUESTION"
+    )
+    
+    section = get_section_by_index(state["section_index"])
+    bridge_output = build_conversation_understanding_output(state)
+    
+    repair = _maybe_emit_numeric_repair_prompt(state, section, ctx)
+    if repair: return repair
+    conflict = _maybe_emit_conflict_resolution_question(state, bridge_output, section, ctx)
+    if conflict: return conflict
+    branch = _maybe_emit_resolved_branch_question(state, section, ctx)
+    if branch: return branch
+    
+    system_prompt = _build_elicitor_prompt_context(state, section, bridge_output)
+    recent_q_history = state.get("recent_questions", [])
+    
+    response = None
+    fallback_blocker = state.get("remaining_subparts", [])
+    for attempt in range(3):
+        response_data, _ = _invoke_structured_question_generator(system_prompt, section, state)
+        is_semantic_repeat, new_q_text, info = _apply_repeat_guard(response_data, recent_q_history, state, ctx)
+        if not is_semantic_repeat:
+            response = response_data
+            break
+        if attempt == 2:
+            response = _fallback_for_hard_blocker(fallback_blocker)
+            break
+        system_prompt += f"\n\nCRITICAL ERROR: DO NOT ASK '{new_q_text}'. You just asked a semantically identical question. You MUST narrow the focus to a specific missing domain detail implementation."
 
-_CONTRADICTION_PROMPT = (
-    "You are checking whether a product manager's latest answer contradicts any prior answer.\n\n"
-    "Prior Q&A (same section):\n{prior_qa}\n\n"
-    "New question and answer:\n{new_qa}\n\n"
-    "Does the new answer directly contradict any prior answer?\n"
-    "Reply with EXACTLY one of:\n"
-    "- NO\n"
-    "- YES: <one-sentence plain description of the conflict>"
-)
-
+    norm_response, raw_gap_reason = _normalize_generated_question(response, state, ctx)
+    
+    questions, filtered_subparts = _suppress_resolved_subparts(norm_response, raw_gap_reason, state, section, ctx)
+    
+    current_question_object, final_questions = _apply_duplicate_question_guard(norm_response, questions, filtered_subparts, raw_gap_reason, state, section, ctx)
+    
+    return _package_generated_question_result(norm_response, final_questions, current_question_object, state, section, ctx, system_prompt)
 
 def _sanitize_user_facing_question(text: str) -> str:
     """Clean LLM output to avoid internal jargon or audit-style asks to the PM."""
@@ -2239,27 +2268,25 @@ def await_answer_node(state: PRDState) -> dict:
     Those writes happen only after echo confirmation in await_confirmation_node
     (standard ANSWER/REPLY flow) or handle_tagged_event_node (tagged events).
     """
-    section = get_section_by_index(state["section_index"])
+    section_idx = state.get("section_index")
+    # First-turn initialization if completely missing
+    if section_idx is None:
+        section_idx = 0
+        
+    try:
+        section_title = get_section_by_index(section_idx).title
+    except Exception:
+        section_title = "Initial Upload Phase"
 
     resume_value = interrupt(
         {
             "type": "waiting_for_answer",
-            "section": section.title,
-            "section_index": state["section_index"],
+            "section": section_title,
+            "section_index": section_idx,
         }
     )
 
-    # Accept structured dict payload or plain string (backward compat)
-    if isinstance(resume_value, dict):
-        user_text = resume_value.get("content", "")
-        uploaded_files = resume_value.get("uploaded_files", [])
-        pending_event = {k: v for k, v in resume_value.items() if k != "uploaded_files"}
-        if "event_type" not in pending_event:
-            pending_event["event_type"] = "ANSWER"
-    else:
-        user_text = str(resume_value)
-        uploaded_files = []
-        pending_event = {"event_type": "ANSWER", "content": user_text}
+    user_text, uploaded_files, pending_event = _extract_submit_payload(resume_value)
 
     # End of turn instrumentation
     flush_turn_summary(state)
@@ -2276,20 +2303,16 @@ def await_answer_node(state: PRDState) -> dict:
     answer = user_text.strip()
     existing = state.get("context_doc", "").strip()
     
-    attached_ctx = state.get("active_context_text", "")
-    is_active_ctx = state.get("session_context_status") == "active"
-    
-    if is_active_ctx and attached_ctx:
-        new_context = f"{existing}\n\n[Attached visual context: {attached_ctx}]\n{answer}" if existing else f"[Attached visual context: {attached_ctx}]\n{answer}"
-    else:
-        new_context = f"{existing}\n\n{answer}" if existing else answer
-        
     user_msg = _build_user_message_dict(answer)
     semantics = user_msg.get("semantics", {})
     concept_history_update = _sync_concept_history(state, semantics) if semantics else {}
     
-    if is_active_ctx and attached_ctx:
-        user_msg["attached_image_context"] = attached_ctx
+    visual_context = _build_visual_context_block(state)
+    if visual_context:
+        new_context = f"{existing}\n\n{visual_context}\n{answer}" if existing else f"{visual_context}\n{answer}"
+        user_msg["attached_image_context"] = visual_context
+    else:
+        new_context = f"{existing}\n\n{answer}" if existing else answer
 
     reply_id = ""
     reply_text = ""
@@ -2340,10 +2363,9 @@ def await_answer_node(state: PRDState) -> dict:
         "answer_confirmation_status": "PENDING",
         "pending_interrupt_type": "question",
         "pending_event": pending_event,
+        "uploaded_files": uploaded_files,
         "chat_history": [user_msg],
         "concept_history": concept_history_update,
-        "session_context_status": "",
-        "active_context_text": "",
         "reply_context_message_id": reply_id,
         "reply_context_message_text": reply_text,
         "reply_context_interpretation": {
@@ -3085,6 +3107,7 @@ def _draft_one_section(
         expected_components_list=expected_components_list,
         prd_context_block=prd_context_block,
         context_doc_block=context_doc_block,
+        visual_context_block=_build_visual_context_block(state),
         global_rigor_block=GLOBAL_RIGOR_BLOCK,
     )
     response = llm_invoke(
@@ -3707,6 +3730,7 @@ def reflect_node(state: PRDState) -> dict:
         section_title=section.title,
         prior_sections_block=prior_sections_block,
         expected_components_list=expected_components_list,
+        visual_context_block=_build_visual_context_block(state),
         specificity_guidance=section.specificity_guidance,
         global_rigor_block=GLOBAL_RIGOR_BLOCK,
         scoring_interpretation_block=SCORING_INTERPRETATION_BLOCK,

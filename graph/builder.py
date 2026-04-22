@@ -43,6 +43,7 @@ from graph.routing import (
     route_after_draft,
     route_after_advance,
     route_after_answer,
+    route_after_first_message,
     route_after_numeric_validation,
     route_after_discovery,
     route_after_intent,
@@ -123,7 +124,17 @@ def build_graph(checkpointer: MemorySaver | None = None):
 
     # ── Edges ─────────────────────────────────────────────────────────────────
     builder.add_edge(START, "await_first_message")
-    builder.add_edge("await_first_message", "detect_framing")
+    
+    builder.add_conditional_edges(
+        "await_first_message",
+        route_after_first_message,
+        {
+            "detect_framing": "detect_framing",
+            "file_upload_intake": "file_upload_intake",
+            "image_description_session_context": "image_description_session_context",
+            "terminal_session": "terminal_session",
+        }
+    )
 
     builder.add_conditional_edges(
         "detect_framing",
@@ -145,6 +156,7 @@ def build_graph(checkpointer: MemorySaver | None = None):
             "file_upload_intake": "file_upload_intake",
             "image_description_session_context": "image_description_session_context",
             "terminal_session": "terminal_session",
+            "await_discovery_answer": "await_discovery_answer",
         },
     )
 
@@ -162,6 +174,7 @@ def build_graph(checkpointer: MemorySaver | None = None):
             "file_upload_intake": "file_upload_intake",
             "image_description_session_context": "image_description_session_context",
             "terminal_session": "terminal_session",
+            "await_answer": "await_answer",
         },
     )
     
@@ -183,6 +196,7 @@ def build_graph(checkpointer: MemorySaver | None = None):
         route_after_multimodal_call,
         {
             "image_description_session_context": "image_description_session_context",
+            "detect_framing": "detect_framing",
             "generate_questions": "generate_questions",
             "discovery_questions": "discovery_questions"
         }
@@ -193,8 +207,11 @@ def build_graph(checkpointer: MemorySaver | None = None):
         route_after_session_context_node,
         {
             "await_answer": "await_answer",
+            "await_first_message": "await_first_message",
+            "await_discovery_answer": "await_discovery_answer",
             "handle_tagged_event": "handle_tagged_event",
             "numeric_validation": "numeric_validation",
+            "detect_framing": "detect_framing",
             "generate_questions": "generate_questions",
             "discovery_questions": "discovery_questions"
         }

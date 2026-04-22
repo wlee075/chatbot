@@ -622,6 +622,8 @@ Section under review: "{section_title}"
 
 {prior_sections_block}
 
+{visual_context_block}
+
 {global_rigor_block}
 
 ━━ RUBRIC ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

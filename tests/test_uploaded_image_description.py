@@ -1,7 +1,20 @@
 import pytest
 from graph.state import PRDState
 from graph.split_nodes import uploaded_image_description_node
-from graph.routing import route_after_image_description
+from graph.routing import route_after_multimodal_call
+from unittest.mock import patch, MagicMock
+
+@pytest.fixture(autouse=True)
+def mock_multimodal_api():
+    class DummyObs:
+        high_level_description = "A sketch."
+        distinct_visible_elements = ["button", "text"]
+        unreadable_or_uncertain_areas = ["maybe desk"]
+
+    with patch('graph.split_nodes._get_llm') as mock_get_llm:
+        mock_response = DummyObs()
+        mock_get_llm.return_value.with_structured_output.return_value.invoke.return_value = mock_response
+        yield mock_get_llm
 
 def test_only_jpg_and_png_are_described():
     state = PRDState(accepted_files=[
@@ -109,7 +122,7 @@ def test_downstream_does_not_see_pdfs():
 
 def test_route_intercept_resume_generates():
     state = PRDState(phase="elicitation")
-    assert route_after_image_description(state) == "generate_questions"
-    state2 = PRDState(pending_event={"event_type": "TAG_MESSAGE_AS_TRUTH"})
-    assert route_after_image_description(state2) == "handle_tagged_event"
+    assert route_after_multimodal_call(state) == "detect_framing"
+    state2 = PRDState(phase="elicitation", framing_mode="chat", pending_event={"event_type": "TAG_MESSAGE_AS_TRUTH"})
+    assert route_after_multimodal_call(state2) == "handle_tagged_event"
     

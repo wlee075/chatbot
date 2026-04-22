@@ -88,6 +88,11 @@ def intent_classifier_node(state: PRDState) -> dict:
         if m.get("role") == "assistant":
             last_assistant = m.get("content", "")
             break
+            
+    # IM1/IM3: Image-only bypass
+    if not raw_answer and state.get("uploaded_files"):
+        log_event(**ctx, level="INFO", event_type="intent_fallback_image_only", message="Bypassing intent classifier for image-only submission")
+        return {"reply_intent": "ANSWER"}
 
     log_event(
         **ctx, level="INFO", event_type="intent_classifier_input", message="Capturing classifier inputs",
@@ -1003,47 +1008,35 @@ def uploaded_image_description_node(state: PRDState) -> dict:
     }
 
 def image_description_session_context_node(state: PRDState) -> dict:
-    """Converts described images into a structured editable session context draft."""
+    """Converts described images into structured, non-blocking BackgroundContext objects."""
+    import uuid
+    from datetime import datetime, timezone
+    
     ctx = _log_ctx(state, "image_description_session_context")
     log_event(**ctx, level="INFO", event_type="node_start", message="image_description_session_context started")
     
-    # Check if a UI event is pending (Submit or Revert from the popup)
-    pending = state.get("pending_event", {})
-    if pending.get("event_type") == "SUBMIT_SESSION_CONTEXT":
-        log_event(**ctx, level="INFO", event_type="session_context_activated", message="User submitted session context")
-        return {
-            "session_context_status": "active",
-            "active_context_text": pending.get("content", ""),
-            "context_source": "user_edited" if pending.get("is_edited") else "generated",
-            "popup_required": False,
-            "pending_event": {} # Clear pending event
-        }
-    elif pending.get("event_type") == "REMOVE_SESSION_CONTEXT":
-        log_event(**ctx, level="INFO", event_type="session_context_removed", message="User removed session context")
-        return {
-            "session_context_status": "removed",
-            "active_context_text": "",
-            "popup_required": False,
-            "pending_event": {} # Clear pending event
-        }
-
     status = state.get("image_description_status", "")
     described_images = state.get("described_images", [])
 
     if status != "described" or not described_images:
         log_event(**ctx, level="INFO", event_type="session_context_skipped", message="Skipped context generation due to invalid status")
-        return {"session_context_status": "failed", "popup_required": False}
+        return {}
 
-    draft_blocks = []
+    # Identify the user turn that triggered this context
+    chat_history = state.get("chat_history", [])
+    user_msgs = [msg for msg in chat_history if msg.get("role") == "user"]
+    source_turn_id = user_msgs[-1].get("msg_id") if user_msgs else str(uuid.uuid4())
+    
+    background_contexts = []
+    
     try:
+        now = datetime.now(timezone.utc).isoformat()
+        
         for img in described_images:
             if img.get("image_description_status") == "failed":
                 continue
                 
             block = [
-                "[image]",
-                img.get("filename") or "unknown",
-                "",
                 "[what_is_going_on]",
                 img.get("high_level_description") or "",
                 "",
@@ -1058,15 +1051,6 @@ def image_description_session_context_node(state: PRDState) -> dict:
                 
             block.extend([
                 "",
-                "[visible_text]",
-                "- Unverified content",
-                "",
-                "[layout_and_structure]",
-                "Unknown spatial arrangement.",
-                "",
-                "[key_details]",
-                "- Visible elements mapped",
-                "",
                 "[uncertainties]"
             ])
             
@@ -1076,20 +1060,25 @@ def image_description_session_context_node(state: PRDState) -> dict:
             if not uncerts:
                 block.append("- No explicit uncertainties logged")
                 
-            draft_blocks.append("\n".join(block))
+            generated_summary = "\n".join(block)
+            
+            bg_ctx = {
+                "context_id": str(uuid.uuid4()),
+                "image_file_id": img.get("file_id", "unknown"),
+                "source_turn_id": source_turn_id,
+                "created_at": now,
+                "updated_at": now,
+                "generated_summary": generated_summary,
+                "edited_summary": None,
+                "is_active": True
+            }
+            background_contexts.append(bg_ctx)
 
-        generated_text = "\n\n---\n\n".join(draft_blocks)
+        log_event(**ctx, level="INFO", event_type="session_context_generated", message=f"Generated {len(background_contexts)} background contexts")
         
-        log_event(**ctx, level="INFO", event_type="session_context_generated", message="Successfully generated reviewable draft")
         return {
-            "session_context_status": "pending_user_review",
-            "context_source": "generated",
-            "generated_context_text": generated_text,
-            "popup_required": True
+            "background_generated_contexts": background_contexts
         }
     except Exception as e:
         log_event(**ctx, level="ERROR", event_type="session_context_error", message=str(e))
-        return {
-            "session_context_status": "failed",
-            "popup_required": False
-        }
+        return {}

@@ -116,7 +116,7 @@ def route_after_discovery(state: PRDState) -> str:
     if event_type == "TERMINATE_SESSION":
         return "terminal_session"
     if event_type in ("SUBMIT_SESSION_CONTEXT", "REMOVE_SESSION_CONTEXT", "REVERT_SESSION_CONTEXT"):
-        return "image_description_session_context"
+        return "await_discovery_answer"
         
     if state.get("uploaded_files"):
         return "file_upload_intake"
@@ -124,6 +124,7 @@ def route_after_discovery(state: PRDState) -> str:
     if state.get("discovery_turn_count", 0) >= 2 or state.get("framing_mode") == "clear":
         return "generate_questions"
     return "discovery_questions"
+
 
 
 def route_after_confirmation(state: PRDState) -> str:
@@ -135,6 +136,23 @@ def route_after_confirmation(state: PRDState) -> str:
     if state.get("answer_confirmation_status") == "CONFIRMED":
         return "draft"
     return "await_answer"
+
+
+def route_after_first_message(state: PRDState) -> str:
+    """
+    Routes from await_first_message based on intercepted structural payloads, 
+    otherwise default advances to detect_framing for the user's primary conversational turn execution.
+    """
+    event_type = state.get("pending_event", {}).get("event_type", "ANSWER")
+    if event_type == "TERMINATE_SESSION":
+        return "terminal_session"
+    if event_type in ("SUBMIT_SESSION_CONTEXT", "REMOVE_SESSION_CONTEXT", "REVERT_SESSION_CONTEXT"):
+        return "await_first_message"
+        
+    if state.get("uploaded_files"):
+        return "file_upload_intake"
+        
+    return "detect_framing"
 
 
 def route_after_numeric_validation(state: PRDState) -> str:
@@ -154,7 +172,7 @@ def route_after_answer(state: PRDState) -> str:
     if event_type == "TERMINATE_SESSION":
         return "terminal_session"
     if event_type in ("SUBMIT_SESSION_CONTEXT", "REMOVE_SESSION_CONTEXT", "REVERT_SESSION_CONTEXT"):
-        return "image_description_session_context"
+        return "await_answer"
         
     if state.get("uploaded_files"):
         return "file_upload_intake"
@@ -235,27 +253,33 @@ def route_after_multimodal_call(state: PRDState) -> str:
     """
     if state.get("image_description_status") == "described":
         return "image_description_session_context"
+        
     # Provide a fallback if multimodal fails completely
+    if not state.get("framing_mode"):
+        return "detect_framing"
     return "generate_questions" if state.get("discovery_turn_count", 0) >= 2 else "discovery_questions"
 
 def route_after_session_context_node(state: PRDState) -> str:
     """
     Called strictly after image_description_session_context_node finishes.
-    If it just generated a draft, we surface it to the user via await_answer.
-    If the user just submitted or removed it, we MUST return to await_answer
-    to halt the graph again and NOT advance the chat state!
+    This replaces the old halting review flow! Background generated contexts
+    are appended inline, so we instantly resume parsing the conversational payload.
     """
-    ctx_status = state.get("session_context_status", "")
-    if ctx_status in ("pending_user_review", "active", "removed"):
-        return "await_answer"
-        
-    # If it failed to draft entirely, resume standard flow:
     if state.get("pending_event") and state.get("pending_event", {}).get("event_type", "") in ("TAG_MESSAGE_AS_TRUTH", "CORRECT_MESSAGE"):
         return "handle_tagged_event"
-    elif state.get("pending_event"):
-        return "numeric_validation"
         
-    if state.get("discovery_turn_count", 0) >= 2 or state.get("framing_mode") == "clear" or state.get("phase") == "elicitation":
+    # If no framing_mode exists, this is the very first turn. Go to detect_framing.
+    if not state.get("framing_mode"):
+        return "detect_framing"
+        
+    elif state.get("pending_event"):
+        # If the payload has absolutely empty text (pure image submission), bypass native text classifiers
+        content_str = state.get("pending_event", {}).get("content", "")
+        if not content_str.strip():
+            if state.get("discovery_turn_count", 0) >= 2 or state.get("framing_mode") == "clear" or state.get("phase") == "elicitation":
+                return "generate_questions"
+            return "discovery_questions"
+        return "numeric_validation"
         return "generate_questions"
     return "discovery_questions"
 

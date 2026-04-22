@@ -151,6 +151,26 @@ class UploadedFileParams(TypedDict):
     mime_type: str
     size_bytes: int
 
+class BackgroundContext(TypedDict):
+    context_id: str             # Stable unique ID (uuid)
+    image_file_id: str          # ID of the original uploaded file for thumbnail mapping
+    source_turn_id: str         # Binds to the msg_id of the user turn containing the upload
+    created_at: str             # ISO timestamp
+    updated_at: str             # ISO timestamp
+    generated_summary: str      # Pure machine-generated text
+    edited_summary: str | None  # Optional user override
+    is_active: bool             # Status flag for prompt injection
+
+def _merge_background_contexts(existing: list[BackgroundContext] | None, new: list[BackgroundContext] | None) -> list[BackgroundContext]:
+    existing = existing or []
+    new = new or []
+    if not existing:
+        return new
+    result = {item["context_id"]: item for item in existing}
+    for item in new:
+        result[item["context_id"]] = item
+    return list(result.values())
+
 class AcceptedFile(TypedDict):
     """Normalized accepted file format."""
     file_id: str
@@ -362,11 +382,7 @@ class PRDState(TypedDict):
     needs_followup: bool
 
     # ── Image Description Session Context State ──
-    session_context_status: Literal["pending_user_review", "active", "removed", "failed", ""]
-    context_source: Literal["generated", "user_edited", ""]
-    generated_context_text: str
-    active_context_text: str
-    popup_required: bool
+    background_generated_contexts: Annotated[list[BackgroundContext], _merge_background_contexts]
 
     # ── Elicitation ──clarification loop tracking ───────────────────────────────────
     active_question_id: str
