@@ -402,6 +402,206 @@ def _build_executive_summary(summaries: list, state: dict) -> str:
     return deterministic
 
 
+# ── PDF section preflight formatter ─────────────────────────────────────────
+
+
+import re as _re
+import unicodedata as _unicodedata
+
+
+_SUSPICIOUS_TOKENS = _re.compile(r"\?[a-z]|\?\s|  |\?\?|\"[^\"]{0,60}\"|\[\w")
+
+
+def _clean_report_section_text(text: object, section_title: str = "") -> str:
+    """Preflight formatter applied to EVERY section before PDF rendering.
+
+    Pipeline:
+      1. Coerce to str / handle None / list inputs
+      2. Unicode-normalise (NFC) to canonicalise combining chars
+      3. Normalise smart quotes → ASCII equivalents (prevents latin-1 ? artifacts)
+      4. Repair corrupted apostrophes: letter?s → letter's, letter?t → letter't …
+      5. Collapse double spaces; strip orphan whitespace
+      6. Numeric range normalization: "2 - 3" → "2–3"
+      7. Bullet consistency (one style: "-")
+      8. Empty / weak section guard
+      9. Suspicious-token validation log (does not raise)
+    """
+    import sys
+
+    # ── 1. Coerce ─────────────────────────────────────────────────────────────
+    if not isinstance(text, str):
+        if isinstance(text, list):
+            text = "\n".join(str(item) for item in text if item)
+        else:
+            text = str(text or "")
+
+    # ── 2. Unicode NFC normalisation ──────────────────────────────────────────
+    text = _unicodedata.normalize("NFC", text)
+
+    # ── 3. Smart quote / apostrophe normalisation (before latin-1 encoding!) ──
+    REPLACEMENTS = [
+        ("\u2018", "'"),   # LEFT SINGLE QUOTATION MARK
+        ("\u2019", "'"),   # RIGHT SINGLE QUOTATION MARK  ← the main apostrophe culprit
+        ("\u201c", '"'),   # LEFT DOUBLE QUOTATION MARK
+        ("\u201d", '"'),   # RIGHT DOUBLE QUOTATION MARK
+        ("\u2032", "'"),   # PRIME
+        ("\u00b4", "'"),   # ACUTE ACCENT
+        ("\u0060", "'"),   # GRAVE ACCENT
+        ("\u2014", " - "), # EM DASH
+        ("\u2013", "-"),   # EN DASH (keep compact in prose)
+        ("\u2022", "-"),   # BULLET
+        ("\u2026", "..."), # ELLIPSIS
+        ("\u00a0", " "),   # NON-BREAKING SPACE
+    ]
+    for char, replacement in REPLACEMENTS:
+        text = text.replace(char, replacement)
+
+    # ── 4b. Strip internal metadata tokens ───────────────────────────────────
+    # [SOURCE: concept_key=...], [NEEDS CLARIFICATION: ...], and any other
+    # bracket-tagged internal markers must not appear in stakeholder documents.
+    text = _re.sub(r"\[SOURCE:[^\]]*\]", "", text)
+    text = _re.sub(r"\[NEEDS CLARIFICATION:[^\]]*\]", "", text, flags=_re.IGNORECASE)
+    # Generalised: remove any [INTERNAL_TAG: ...] style brackets (all-caps tag, colon)
+    text = _re.sub(r"\[[A-Z_]{3,}:[^\]]{0,200}\]", "", text)
+    # Remove any residual raw internal markers that might slip through
+    text = _re.sub(r"\[Needs more data.*?\]", "", text, flags=_re.IGNORECASE)
+
+    # Pattern: letter immediately followed by '?' then a lowercase letter
+    # e.g. "week?s" → "week's", "doesn?t" → "doesn't"
+    text = _re.sub(r"(?<=[a-zA-Z])\?(?=[a-z])", "'", text)
+
+    # ── 5. Whitespace cleanup ─────────────────────────────────────────────────
+    lines = []
+    for line in text.splitlines():
+        line = _re.sub(r" {2,}", " ", line)   # collapse multiple spaces
+        line = line.strip()
+        lines.append(line)
+    text = "\n".join(lines)
+    # Collapse 3+ blank lines to double blank
+    text = _re.sub(r"\n{3,}", "\n\n", text)
+    text = text.strip()
+
+    # ── 6. Numeric range normalization ────────────────────────────────────────
+    # "2 - 3 weeks" → "2-3 weeks"  (ASCII hyphen, no surrounding spaces)
+    text = _re.sub(r"(\d)\s+-\s+(\d)", r"\1-\2", text)
+    # "2-3 weeks" is fine; leave em-dash ranges alone (already converted above)
+
+    # ── 7. Bullet consistency ────────────────────────────────────────────────
+    # Normalise various bullet markers to "-"
+    text = _re.sub(r"^[\u2022\u2023\u25e6\u2043\u2219\*]\s+", "- ", text, flags=_re.MULTILINE)
+
+    # ── 8. Empty / weak section guard ────────────────────────────────────────
+    FALLBACK = "Needs more data to refine this section."
+    stripped = text.strip()
+    if not stripped:
+        return FALLBACK
+    word_count = len(stripped.split())
+    if word_count < 4:
+        return FALLBACK
+
+    # ── 9. Suspicious-token validation log ───────────────────────────────────
+    matches = _SUSPICIOUS_TOKENS.findall(text)
+    if matches:
+        print(
+            f"[pdf-preflight] section={section_title!r}: suspicious tokens found: {matches[:5]}",
+            file=sys.stderr,
+        )
+
+    return text
+
+
+def _group_stakeholder_prose(prose: str) -> str:
+    """Re-format raw stakeholder prose from line-per-action to one card per person.
+
+    Algorithm
+    ---------
+    1. Parse each non-empty line: try to extract person name, role, and action text.
+    2. Group entries by normalized name (case-insensitive).
+    3. Merge each person's actions into a 1-3 sentence executive summary.
+    4. Emit: "Name \u2014 Role\\n<merged summary>"
+
+    Falls back to original prose when no person names are detected.
+    """
+    import re as _re
+    from collections import OrderedDict
+
+    lines = [l.strip().lstrip("-\u2022*").strip() for l in prose.splitlines() if l.strip()]
+    if not lines:
+        return prose
+
+    # Patterns (tried in order):
+    #   name  = "Name (Role): action"
+    #   name2 = "Name — Role: action"  [separator AND colon]
+    #   name3 = "Name: action"          [colon, no separator]
+    #   name4 = "Name — action."        [separator, NO colon: whole rest is action]
+    _NAME_PAT = _re.compile(
+        r"^(?P<name>[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)"
+        r"(?:\s*[\(\[])(?P<role1>[^\)\]]+)[\)\]]"
+        r"(?:\s*[:,]\s*(?P<act1>.*))?$"
+        r"|"
+        r"^(?P<name2>[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)"
+        r"(?:\s*(?:\u2014|-|\u2013|,)\s*)"
+        r"(?P<role2>[^:\n]+?)"
+        r":\s*(?P<act2>.+)$"
+        r"|"
+        r"^(?P<name3>[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)"
+        r":\s*(?P<act3>.+)$"
+        r"|"
+        r"^(?P<name4>[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)"
+        r"(?:\s*(?:\u2014|-|\u2013|,)\s*)"
+        r"(?P<act4>.+)$",
+    )
+
+    entries: list = []
+    for line in lines:
+        m = _NAME_PAT.match(line)
+        if m:
+            name = (
+                m.group("name") or m.group("name2") or
+                m.group("name3") or m.group("name4") or ""
+            ).strip()
+            role = (m.group("role1") or m.group("role2") or "").strip().rstrip(":")
+            action = (
+                m.group("act1") or m.group("act2") or
+                m.group("act3") or m.group("act4") or ""
+            ).strip()
+            entries.append({"name": name, "role": role, "action": action or line})
+        else:
+            entries.append({"name": "", "role": "", "action": line})
+
+    groups: OrderedDict = OrderedDict()
+    for e in entries:
+        key = e["name"].lower() if e["name"] else "_misc"
+        if key not in groups:
+            groups[key] = {"name": e["name"] or "", "roles": [], "actions": []}
+        g = groups[key]
+        if e["role"] and e["role"] not in g["roles"]:
+            g["roles"].append(e["role"])
+        if e["action"] and e["action"] not in g["actions"]:
+            g["actions"].append(e["action"])
+
+    named = {k: v for k, v in groups.items() if k != "_misc"}
+    if not named:
+        return prose
+
+    UNKNOWN_ROLE = "Stakeholder"
+    blocks: list = []
+    for _key, g in named.items():
+        person = g["name"]
+        role = " / ".join(r for r in g["roles"] if r) or UNKNOWN_ROLE
+        actions = [a.rstrip(".") for a in g["actions"] if a][:3]
+        summary = (". ".join(actions) + ".") if actions else f"{person} is a key stakeholder."
+        summary = _re.sub(r"\.\s*\.", ".", summary)
+        summary = _re.sub(r"\s{2,}", " ", summary).strip()
+        blocks.append(f"{person} \u2014 {role}\n{summary}")
+
+    misc = groups.get("_misc")
+    if misc and misc["actions"]:
+        blocks.append(" ".join(misc["actions"]))
+
+    return "\n\n".join(blocks)
+
+
 def _render_pdf(
     report_title: str,
     generated_at: str,
@@ -456,18 +656,19 @@ def _render_pdf(
         pdf._ts = generated_at
         pdf.add_page()
 
-        # ── Title block (use cell() not multi_cell to prevent overflow) ──
+        # ── Title block: single clean header ──────────────────────────────
+        # Show ONE prominent title (the project/report name), never duplicate it.
         pdf.set_font("Helvetica", "B", 16)
         pdf.set_text_color(30, 30, 30)
-        safe_report_title = _safe(report_title)[:80]
-        pdf.cell(0, 10, "Requirements Summary Report", new_x="LMARGIN", new_y="NEXT", align="L")
-        pdf.set_font("Helvetica", "", 10)
-        pdf.set_text_color(80, 80, 80)
-        pdf.cell(0, 7, safe_report_title, new_x="LMARGIN", new_y="NEXT", align="L")
+        title_text = _safe(report_title)[:80] if report_title.strip() else "Requirements Summary Report"
+        pdf.cell(0, 10, title_text, new_x="LMARGIN", new_y="NEXT", align="L")
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(120, 120, 120)
+        pdf.cell(0, 5, "Data Science Requirements Report", new_x="LMARGIN", new_y="NEXT", align="L")
         pdf.set_font("Helvetica", "I", 9)
-        pdf.set_text_color(130, 130, 130)
-        pdf.cell(0, 6, f"Generated: {generated_at}", new_x="LMARGIN", new_y="NEXT", align="L")
-        pdf.ln(6)
+        pdf.set_text_color(150, 150, 150)
+        pdf.cell(0, 5, f"Generated: {generated_at}", new_x="LMARGIN", new_y="NEXT", align="L")
+        pdf.ln(8)
 
         # Helper: always reset x before multi_cell to avoid corruption after cell() calls
         def _mc(h: float, text: str) -> None:
@@ -480,8 +681,12 @@ def _render_pdf(
         _mc(8, "Executive Summary")
         pdf.set_font("Helvetica", "", 10)
         pdf.set_text_color(50, 50, 50)
-        _exec_text = _safe(executive_summary) if isinstance(executive_summary, str) else "No structured requirements captured yet."
-        _mc(6, _exec_text or "No structured requirements captured yet.")
+        _exec_text = _clean_report_section_text(
+            executive_summary if isinstance(executive_summary, str) else "",
+            section_title="Executive Summary",
+        )
+        _exec_text = _safe(_exec_text) or "No structured requirements captured yet."
+        _mc(6, _exec_text)
         pdf.ln(6)
 
         # ── Requirements by section ──
@@ -495,64 +700,80 @@ def _render_pdf(
         if not _safe_summaries:
             pdf.set_font("Helvetica", "I", 10)
             pdf.set_text_color(100, 100, 100)
-            _mc(6, "No completed sections yet. Continue answering prompts to build the report.")
+            _mc(6, "No completed sections yet. Continue the information gathering session to build this report.")
         else:
             for s in _safe_summaries:
                 status = s.get("status", "empty" if s.get("is_empty", True) else "complete")
+                section_title = s.get("title", "")
+                raw_prose = s.get("prose") or ""
 
-                # ── Section title ──────────────────────────────────────────
+                # ── Section heading ───────────────────────────────────────
                 pdf.set_font("Helvetica", "B", 11)
                 pdf.set_text_color(40, 40, 40)
-                _mc(7, _safe(s.get("title", "")))
+                _mc(7, _safe(section_title))
                 pdf.set_font("Helvetica", "", 10)
+                pdf.set_text_color(50, 50, 50)
 
                 if status == "complete":
-                    # Polished prose — render as-is
-                    pdf.set_text_color(50, 50, 50)
-                    _mc(6, _safe(s.get("prose", "")))
+                    # ── S2: Complete ─ polished prose only ────────────────
+                    if s.get("id") == "key_stakeholders":
+                        grouped = _group_stakeholder_prose(raw_prose)
+                        _clean = _clean_report_section_text(grouped, section_title=section_title)
+                    else:
+                        _clean = _clean_report_section_text(raw_prose, section_title=section_title)
+                    # Render: stakeholder cards get a mini-header per block
+                    if s.get("id") == "key_stakeholders":
+                        for card in _clean.split("\n\n"):
+                            lines_c = [l.strip() for l in card.splitlines() if l.strip()]
+                            if lines_c:
+                                pdf.set_font("Helvetica", "B", 10)
+                                _mc(6, _safe(lines_c[0]))  # "Name — Role" header
+                                pdf.set_font("Helvetica", "", 10)
+                                for body_line in lines_c[1:]:
+                                    _mc(6, _safe(body_line))
+                                pdf.ln(2)
+                    else:
+                        _mc(6, _safe(_clean))
 
                 elif status == "partial":
-                    # Professional draft state: structured partial summary
-                    pdf.set_text_color(70, 100, 140)
-                    _mc(5, "Status: In progress")
-                    pdf.set_text_color(50, 50, 50)
-                    pdf.ln(1)
-
-                    # What we know so far
-                    pdf.set_font("Helvetica", "B", 10)
-                    _mc(5, "What we know so far:")
-                    pdf.set_font("Helvetica", "", 10)
-                    prose = (s.get("prose") or "").strip()
-                    if prose:
-                        for line in prose.splitlines():
-                            line = line.strip()
-                            if line:
-                                bullet = line if line.startswith("-") else f"- {line}"
-                                _mc(5, _safe(bullet))
+                    # ── S3: Partial ─ summary + graceful needs-more note ──
+                    if s.get("id") == "key_stakeholders":
+                        grouped = _group_stakeholder_prose(raw_prose)
+                        _clean = _clean_report_section_text(grouped, section_title=section_title)
                     else:
-                        _mc(5, "- No clear facts captured yet for this section.")
-
-                    # Still needed
-                    still_needed = s.get("still_needed") or []
-                    if still_needed:
-                        pdf.ln(1)
-                        pdf.set_font("Helvetica", "B", 10)
-                        _mc(5, "Still needed:")
-                        pdf.set_font("Helvetica", "", 10)
-                        pdf.set_text_color(160, 80, 0)
-                        for item in still_needed[:5]:  # cap at 5 to avoid overflow
-                            _mc(5, _safe(f"- {item}"))
-                        pdf.set_text_color(50, 50, 50)
+                        _clean = _clean_report_section_text(raw_prose, section_title=section_title)
+                    if _clean and _clean != "Needs more data to refine this section.":
+                        if s.get("id") == "key_stakeholders":
+                            for card in _clean.split("\n\n"):
+                                lines_c = [l.strip() for l in card.splitlines() if l.strip()]
+                                if lines_c:
+                                    pdf.set_font("Helvetica", "B", 10)
+                                    _mc(6, _safe(lines_c[0]))
+                                    pdf.set_font("Helvetica", "", 10)
+                                    for body_line in lines_c[1:]:
+                                        _mc(6, _safe(body_line))
+                                    pdf.ln(2)
+                        else:
+                            for line in _clean.splitlines():
+                                line = line.strip().lstrip("- ").strip()
+                                if line:
+                                    _mc(6, _safe(line))
+                    # Small, quiet needs-more note (no internal-workbench language)
+                    pdf.set_font("Helvetica", "I", 9)
+                    pdf.set_text_color(130, 130, 130)
+                    _mc(5, "Some details are still being gathered for this section.")
+                    pdf.set_font("Helvetica", "", 10)
+                    pdf.set_text_color(50, 50, 50)
 
                 else:
-                    # Empty — no trustworthy content yet
-                    pdf.set_text_color(120, 120, 120)
-                    _mc(5, "Status: Needs more data")
-                    pdf.set_text_color(160, 80, 0)
-                    _mc(6, "[Needs more data to fill]")
+                    # ── S4: Empty ─ clean fallback, nothing else ──────────
+                    pdf.set_text_color(140, 140, 140)
+                    pdf.set_font("Helvetica", "I", 10)
+                    _mc(6, "Needs more data to fill.")
+                    pdf.set_font("Helvetica", "", 10)
                     pdf.set_text_color(50, 50, 50)
 
-                pdf.ln(4)
+                pdf.ln(5)
 
         # ── Open Questions ──
         pdf.set_font("Helvetica", "B", 13)

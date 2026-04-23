@@ -15,7 +15,7 @@ from langgraph.types import Command
 from config.sections import PRD_SECTIONS
 from graph.builder import build_graph
 from prompts.templates import DEFAULT_MAX_SECTION_ITERATIONS
-from utils.progress_rail import compute_progress_data
+from utils.progress_rail import compute_progress_data, get_pdf_download_state
 import warnings
 
 # Suppress Checkpointer unregistered type warnings for previous Enum states inside old SQLite streams
@@ -26,7 +26,8 @@ load_dotenv()
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="PRD Builder",
+    page_title="Data Science Information Gathering",
+
     page_icon="📋",
     layout="wide",
 )
@@ -240,181 +241,131 @@ def _display_section_title(raw: str) -> str:
     return raw
 
 
-# ── Sticky right-side progress rail ───────────────────────────────────────────
+# ── Compact timeline bar (above the input box) ──────────────────────────────
 
-def _render_progress_rail(sv: dict) -> None:
-    """Compute progress data and inject a CSS-fixed right-side progress rail.
+def _render_timeline_bar(sv: dict) -> None:
+    """Inject a compact horizontal section-timeline bar just above the composer.
 
-    Uses position:fixed so it floats independently of scroll position without
-    restructuring the Streamlit column layout. A right-margin is added to the
-    main block-container so content is not obscured.
+    Four visually distinct segment states:
+      complete  → solid green fill (done)
+      current   → indigo ring + glow (working on this now)
+      partial   → amber half-tone fill (answers captured, not finished)
+      pending   → muted dark (untouched)
+
+    Header: 'Current Section: <name>' (workspace language, not wizard steps).
     """
     import html as _html
-    data = compute_progress_data(sv, PRD_SECTIONS)
-    pct         = data["pct"]
-    current     = _html.escape(data["current_title"])
-    checklist   = data["checklist"]
-    still_needed = data["still_needed"]
+    data      = compute_progress_data(sv, PRD_SECTIONS)
+    pct       = data["pct"]
+    current   = _html.escape(data["current_title"])
+    completed = data["completed"]
+    segments  = data["checklist"]   # [{id, title, status}]
 
-    # ── Checklist rows ────────────────────────────────────────────────────────
-    rows_html = ""
-    for row in checklist:
-        title = _html.escape(row["title"])
-        if row["status"] == "complete":
-            rows_html += (
-                f'<div class="prd-rail-row prd-rail-done">'
-                f'<span class="prd-rail-icon">✓</span> {title}</div>'
-            )
-        elif row["status"] == "current":
-            rows_html += (
-                f'<div class="prd-rail-row prd-rail-cur">'
-                f'<span class="prd-rail-icon">→</span> <strong>{title}</strong></div>'
-            )
+    pills = ""
+    for seg in segments:
+        title = _html.escape(seg["title"])
+        if seg["status"] == "complete":
+            pills += f'<div class="tl-pill tl-done" title="{title}"></div>'
+        elif seg["status"] == "current":
+            pills += f'<div class="tl-pill tl-cur-pip" title="{title}"></div>'
+        elif seg["status"] == "partial":
+            pills += f'<div class="tl-pill tl-partial" title="{title}"></div>'
         else:
-            rows_html += (
-                f'<div class="prd-rail-row prd-rail-pending">'
-                f'<span class="prd-rail-icon">·</span> {title}</div>'
-            )
+            pills += f'<div class="tl-pill tl-future" title="{title}"></div>'
 
-    # ── Still-needed block ────────────────────────────────────────────────────
-    missing_html = ""
-    if still_needed:
-        items = "".join(
-            f'<div class="prd-rail-missing-item">• {_html.escape(i)}</div>'
-            for i in still_needed
-        )
-        missing_html = (
-            '<div class="prd-rail-missing">'
-            '<div class="prd-rail-missing-hdr">Still needed</div>'
-            + items +
-            '</div>'
-        )
+    # Percentage color tone signals achievement level
+    if pct == 0:
+        pct_color = "#6b7280"   # muted — just starting
+    elif pct >= 80:
+        pct_color = "#22c55e"   # green — strong momentum
+    else:
+        pct_color = "#9ca3af"   # neutral
 
-    bar_width = max(0, min(100, pct))  # clamp
-
-    panel = f"""
+    bar = f"""
 <style>
-/* rail panel */
-.prd-rail {{
-    position: fixed;
-    right: 1rem;
-    top: 3.5rem;
-    width: 210px;
-    background: #12121c;
-    border: 1px solid #2d2d44;
-    border-radius: 10px;
-    padding: 14px 14px 12px;
-    z-index: 9000;
-    box-shadow: 0 4px 20px rgba(0,0,0,.45);
+.tl-wrap {{
     font-family: system-ui, -apple-system, sans-serif;
-    max-height: calc(100vh - 6rem);
-    overflow-y: auto;
-    scrollbar-width: none;
+    margin: 6px 0 4px;
+    user-select: none;
 }}
-.prd-rail::-webkit-scrollbar {{ display: none; }}
-/* progress area */
-.prd-rail-hdr {{
-    font-size: 10px;
-    font-weight: 700;
-    color: #6b7280;
-    letter-spacing: .07em;
-    text-transform: uppercase;
-    margin-bottom: 7px;
-}}
-.prd-rail-bar-bg {{
-    background: #1f2937;
-    border-radius: 4px;
-    height: 6px;
-    margin-bottom: 4px;
-}}
-.prd-rail-bar-fill {{
-    background: linear-gradient(90deg,#6366f1,#22d3ee);
-    height: 6px;
-    border-radius: 4px;
-    transition: width .4s ease;
-    width: {bar_width}%;
-}}
-.prd-rail-pct {{
-    font-size: 11px;
-    color: #d1d5db;
-    margin-bottom: 10px;
-}}
-/* current badge */
-.prd-rail-badge {{
-    font-size: 11px;
-    color: #a5b4fc;
-    font-weight: 700;
-    background: #1e1b4b;
-    border-radius: 6px;
-    padding: 4px 8px;
-    margin-bottom: 10px;
-    display: block;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}}
-/* checklist */
-.prd-rail-divider {{
-    border-top: 1px solid #2d2d44;
-    margin-bottom: 7px;
-}}
-.prd-rail-row {{
-    font-size: 11px;
-    padding: 2px 0;
+.tl-header {{
     display: flex;
-    align-items: center;
-    gap: 5px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 5px;
 }}
-.prd-rail-icon {{ flex-shrink: 0; }}
-.prd-rail-done   {{ color: #22c55e; }}
-.prd-rail-cur    {{ color: #a5b4fc; }}
-.prd-rail-pending {{ color: #4b5563; }}
-/* still needed */
-.prd-rail-missing {{
-    margin-top: 10px;
-    border-top: 1px solid #2d2d44;
-    padding-top: 8px;
-}}
-.prd-rail-missing-hdr {{
-    font-size: 10px;
+.tl-section-label {{
+    font-size: 12px;
+    color: #e2e8f0;
     font-weight: 700;
+}}
+.tl-section-prefix {{
+    font-size: 12px;
     color: #6b7280;
-    letter-spacing: .06em;
-    text-transform: uppercase;
-    margin-bottom: 4px;
+    font-weight: 400;
 }}
-.prd-rail-missing-item {{
-    font-size: 10px;
-    color: #f59e0b;
-    padding: 1px 0;
-    white-space: normal;
-    line-height: 1.4;
+.tl-status-label {{
+    font-size: 11px;
+    color: {pct_color};
+    font-weight: 500;
 }}
-/* push main content left so rail does not cover text */
-section[data-testid="stMain"] > div > div.block-container {{
-    padding-right: 230px !important;
+.tl-bar {{
+    display: flex;
+    gap: 2px;
+    align-items: center;
+    height: 8px;
+    margin-bottom: 5px;
 }}
-@media (max-width: 800px) {{
-    .prd-rail {{ display: none; }}
-    section[data-testid="stMain"] > div > div.block-container {{
-        padding-right: 1rem !important;
-    }}
+.tl-pill {{
+    flex: 1;
+    border-radius: 999px;
+    height: 100%;
+}}
+.tl-done {{
+    background: #22c55e;
+}}
+.tl-cur-pip {{
+    background: transparent;
+    border: 2px solid #6366f1;
+    box-shadow: 0 0 5px rgba(99,102,241,.55);
+    animation: tl-pulse 2s ease-in-out infinite;
+}}
+@keyframes tl-pulse {{
+    0%, 100% {{ box-shadow: 0 0 4px rgba(99,102,241,.4); }}
+    50%       {{ box-shadow: 0 0 9px rgba(99,102,241,.8); }}
+}}
+.tl-partial {{
+    background: rgba(251,191,36,.45);
+}}
+.tl-future {{
+    background: #1f2937;
+}}
+.tl-cur-label {{
+    font-size: 11px;
+    color: #6b7280;
+    font-weight: 400;
+    font-style: italic;
+}}
+@media (max-width: 640px) {{
+    .tl-section-label {{ font-size: 10px; }}
+    .tl-cur-label     {{ display: none; }}
 }}
 </style>
-<div class="prd-rail">
-  <div class="prd-rail-hdr">PRD Progress</div>
-  <div class="prd-rail-bar-bg"><div class="prd-rail-bar-fill"></div></div>
-  <div class="prd-rail-pct">{pct}% complete &nbsp; ({data['completed']} of {data['total']})</div>
-  <span class="prd-rail-badge" title="{current}">→ {current}</span>
-  <div class="prd-rail-divider"></div>
-  {rows_html}
-  {missing_html}
+<div class="tl-wrap">
+  <div class="tl-header">
+    <span class="tl-section-label">
+      <span class="tl-section-prefix">Current Section: </span>{current}
+    </span>
+    <span class="tl-status-label">{pct}% complete</span>
+  </div>
+  <div class="tl-bar">{pills}</div>
+  <div class="tl-cur-label">Sections can be completed in any order</div>
 </div>
 """
-    st.markdown(panel, unsafe_allow_html=True)
+    st.markdown(bar, unsafe_allow_html=True)
+
+
+
 
 
 def _build_source_message_lookup(chat_history: list[dict], store: dict) -> dict[str, str]:
@@ -698,17 +649,42 @@ _STATUS_CARD_CSS = """
 .prd-status-card .status-done {
     color: #888;
 }
+.prd-status-card .status-current .spin {
+    display: inline-block;
+    animation: prd-spin 1.1s linear infinite;
+}
+@keyframes prd-spin {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+}
 </style>
 """
+
+# Escalating thinking-state helper text (used before first node fires)
+_THINKING_STAGES: list[tuple[float, str]] = [
+    (0.0,  "Thinking..."),
+    (3.0,  "Still working..."),
+    (8.0,  "This is taking longer than usual..."),
+    (15.0, "Complex request detected — almost there."),
+]
 
 def _build_status_card(completed: list[str], current: str) -> str:
     """Render the status card HTML from completed steps + running step."""
     lines = [_STATUS_CARD_CSS, '<div class="prd-status-card">']
     for step in completed[-3:]:  # show at most 3 completed steps
         lines.append(f'<span class="status-done">✓ {step}</span><br>')
-    lines.append(f'<span class="status-current">⟳ {current}</span>')
+    lines.append(f'<span class="status-current"><span class="spin">⟳</span> {current}</span>')
     lines.append("</div>")
     return "\n".join(lines)
+
+
+def _thinking_text(elapsed: float) -> str:
+    """Return the appropriate thinking-stage label for elapsed seconds."""
+    label = _THINKING_STAGES[0][1]
+    for threshold, text in _THINKING_STAGES:
+        if elapsed >= threshold:
+            label = text
+    return label
 
 # Human-readable chip labels for each UI action event type
 _REFERENCE_LABELS: dict[str, str] = {
@@ -769,6 +745,14 @@ def _stream_graph_resume(payload: dict | str) -> None:
         status_slot = st.empty()
         stream_slot = st.empty()
 
+    # ── Seed spinner immediately (before first node fires) ────────────────────
+    # This covers the dead-zone between submit and the first graph node.
+    status_slot.markdown(
+        _build_status_card([], _thinking_text(0.0)),
+        unsafe_allow_html=True,
+    )
+    _first_node_fired = False
+
     def _label_for(node: str) -> str:
         first, repeat = _NODE_STATUS.get(node, (None, None))
         if first is None:
@@ -785,6 +769,7 @@ def _stream_graph_resume(payload: dict | str) -> None:
             node = metadata.get("langgraph_node", "")
 
             if node and node != last_node:
+                _first_node_fired = True
                 now = time.monotonic()
                 if last_node:
                     node_durations_ms[last_node] = node_durations_ms.get(last_node, 0) + int((now - node_started_at) * 1000)
@@ -817,6 +802,17 @@ def _stream_graph_resume(payload: dict | str) -> None:
                 if isinstance(chunk, AIMessageChunk) and chunk.content:
                     stream_text += chunk.content
                     stream_slot.markdown(stream_text + " ▌")
+
+            # ── Escalating thinking text (no node yet) ───────────────────────
+            # Update spinner label on every chunk if we haven't received a
+            # named node yet — covers LangGraph startup latency edge cases.
+            if not _first_node_fired:
+                elapsed = time.monotonic() - t0
+                thinking = _thinking_text(elapsed)
+                status_slot.markdown(
+                    _build_status_card([], thinking),
+                    unsafe_allow_html=True,
+                )
 
     except Exception as exc:
         status_slot.empty()
@@ -854,44 +850,96 @@ def _stream_graph_resume(payload: dict | str) -> None:
 gstate = _get_graph_state() if st.session_state.graph_started else None
 sv: dict = gstate.values if gstate else {}
 
-# ── Sticky right-rail (rendered once per rerun, position:fixed floats over UI) ─
-if st.session_state.graph_started and sv:
-    _render_progress_rail(sv)
+# ── Sticky right-rail REMOVED — timeline is rendered above the composer instead ──────
 
-# ── Top bar (D-M1): visible only when session is active ───────────────────────
+# ── Top bar (D-M1): visible only when session is active ═════════════════
 if st.session_state.graph_started:
-    col_title, _sp, col_end, col_new, col_dl = st.columns([4, 1, 1, 1, 1])
+    # Shared toolbar CSS ─────────────────────────────────────────────────
+    st.markdown("""
+<style>
+/* ── shared button reset ── */
+.tb-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    height: 34px;
+    min-width: 80px;
+    padding: 0 14px;
+    border-radius: 7px;
+    font-size: 13px;
+    font-weight: 600;
+    font-family: system-ui, -apple-system, sans-serif;
+    white-space: nowrap;
+    cursor: pointer;
+    border: 1px solid transparent;
+    text-decoration: none;
+    transition: filter .15s, box-shadow .15s;
+    line-height: 1;
+}
+.tb-btn:hover { filter: brightness(1.1); }
+/* secondary (End / New) */
+.tb-sec {
+    background: #1e1e2e;
+    color: #c9d1d9;
+    border-color: #30363d;
+}
+/* primary (Download PDF) */
+.tb-pri {
+    background: #6366f1;
+    color: #fff;
+    border-color: #4f52d4;
+    box-shadow: 0 1px 4px rgba(99,102,241,.35);
+}
+.tb-pri:disabled { opacity: .5; cursor: default; }
+/* PDF badge pills */
+.pdf-badge-draft {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 7px;
+    border-radius: 99px;
+    background: #d97706;
+    color: #fff;
+    margin-left: 4px;
+    vertical-align: middle;
+    letter-spacing: 0.03em;
+}
+.pdf-badge-complete {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 7px;
+    border-radius: 99px;
+    background: #16a34a;
+    color: #fff;
+    margin-left: 4px;
+    vertical-align: middle;
+    letter-spacing: 0.03em;
+}
+.tb-title {
+    font-family: system-ui, -apple-system, sans-serif;
+    font-size: 15px;
+    font-weight: 700;
+    color: #e2e8f0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+</style>
+""", unsafe_allow_html=True)
+
+    col_title, col_actions = st.columns([5, 2])
     with col_title:
-        st.markdown("**PRD Builder**")
-    with col_end:
+        st.markdown('<span class="tb-title">Data Science Information Gathering</span>',
+                    unsafe_allow_html=True)
+    with col_actions:
+        # ── Derive button states ──────────────────────────────────────────
         is_pending = bool(sv.get("is_complete", False) or sv.get("input_disabled", False))
-        if st.button("⏹ End", use_container_width=True, disabled=is_pending):
-            st.session_state._pending_payload = {"event_type": "TERMINATE_SESSION", "content": ""}
-            st.rerun()
-    with col_new:
-        if st.button("↩ New", use_container_width=True):
-            st.session_state.thread_id = str(uuid.uuid4())
-            st.session_state.graph_started = False
-            st.session_state.last_elapsed_ms = None
-            st.session_state.last_node_timings_ms = {}
-            st.session_state.image_context_buffer = []
-            st.session_state.active_reference = None
-            st.rerun()
-    with col_dl:
-        prd_md = sv.get("prd_markdown", "")
-        if prd_md:
-            st.download_button(
-                label="⬇ PRD",
-                data=prd_md,
-                file_name="product_requirements.md",
-                mime="text/markdown",
-                use_container_width=True,
-                type="primary",
-            )
-        # ── PDF download — always a live snapshot of current session state ────
-        # Regenerated on every Streamlit render pass so the bytes always reflect
-        # the latest confirmed_qa_store and prd_sections, not a stale cached copy.
+
+        # ── PDF: always fresh snapshot ────────────────────────────────────
         prd_pdf = b""
+        _report_title = "Draft Requirements Report"
         if st.session_state.get("graph_started"):
             try:
                 from graph.nodes import _render_pdf, _build_section_summaries, _build_executive_summary
@@ -904,25 +952,59 @@ if st.session_state.graph_started:
                 )
                 _exec = _build_executive_summary(_summaries, _qa if isinstance(_qa, dict) else {})
                 _ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
-                _report_title = (
-                    sv.get("prd_report_title", "")
-                    or "Draft Requirements Report"
-                )
+                _report_title = sv.get("prd_report_title", "") or "Draft Requirements Report"
                 prd_pdf = _render_pdf(_report_title, _ts, _exec, _summaries)
             except Exception:
-                pass  # silently degrade; button hidden if generation fails
+                pass
 
-        if prd_pdf:
-            safe_title = re.sub(r"[^\w\s\-]", "", _report_title).strip().replace(" ", "_")[:60] or "requirements_report"
-            st.download_button(
-                label="📥 Download PDF",
-                data=prd_pdf,
-                file_name=f"{safe_title}.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-                key="pdf_download_btn",
-            )
+        safe_title = re.sub(r"[^\w\s\-]", "", _report_title).strip().replace(" ", "_")[:60] or "requirements_report"
+
+        # ── Render action buttons ─────────────────────────────────────────
+        # Three equal-width columns so buttons don't reflow
+        b_end, b_new, b_dl = st.columns(3)
+        with b_end:
+            if st.button("⏹ End", use_container_width=True,
+                         disabled=is_pending, key="tb_end"):
+                st.session_state._pending_payload = {"event_type": "TERMINATE_SESSION", "content": ""}
+                st.rerun()
+        with b_new:
+            if st.button("↩ New", use_container_width=True, key="tb_new"):
+                st.session_state.thread_id = str(uuid.uuid4())
+                st.session_state.graph_started = False
+                st.session_state.last_elapsed_ms = None
+                st.session_state.last_node_timings_ms = {}
+                st.session_state.image_context_buffer = []
+                st.session_state.active_reference = None
+                st.rerun()
+        with b_dl:
+            # ── PDF gate: locked < 80 %, Draft 80-99 %, Final 100 % ─────
+            try:
+                _pdf_pct = compute_progress_data(sv, PRD_SECTIONS)["pct"]
+            except Exception:
+                _pdf_pct = 0
+            _pdf_gate = get_pdf_download_state(_pdf_pct)
+            if _pdf_gate["enabled"] and prd_pdf:
+                st.download_button(
+                    label=_pdf_gate["label"],
+                    data=prd_pdf,
+                    file_name=f"{safe_title}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    type=_pdf_gate["btn_type"],
+                    key="pdf_download_btn",
+                    help=_pdf_gate["hint"],
+                )
+            else:
+                st.button(
+                    _pdf_gate["label"],
+                    use_container_width=True,
+                    disabled=True,
+                    key="pdf_download_btn_disabled",
+                    help=_pdf_gate["hint"],
+                )
+
     st.divider()
+
 
     # ── PRD Progress panel ────────────────────────────────────────────────────
     # Sticky bar: section badges + active section name label.
@@ -1313,19 +1395,37 @@ if st.session_state.graph_started:
                 elif msg_type == "complete":
                     st.balloons()
                     st.success(_present_content(content, source_lookup, confirmed_qa_store))
-                    # ── U1: Inline PDF download — shown immediately after the final message ──
+                    # ── U1: Inline PDF download — gated by 80% threshold ──
                     _inline_pdf = sv.get("prd_pdf_bytes", b"")
                     if _inline_pdf:
                         _raw_title = sv.get("prd_report_title", "") or "requirements_report"
                         _safe_fn = re.sub(r"[^\w\s\-]", "", _raw_title).strip().replace(" ", "_")[:60] or "requirements_report"
-                        st.download_button(
-                            label="📥 Download PDF Report",
-                            data=_inline_pdf,
-                            file_name=f"{_safe_fn}.pdf",
-                            mime="application/pdf",
-                            key="inline_pdf_download_btn",
-                            type="primary",
-                        )
+                        _inline_pct = compute_progress_data(sv, PRD_SECTIONS)["pct"]
+                        _inline_gate = get_pdf_download_state(_inline_pct)
+                        if _inline_gate["enabled"]:
+                            st.download_button(
+                                label=_inline_gate["label"],
+                                data=_inline_pdf,
+                                file_name=f"{_safe_fn}.pdf",
+                                mime="application/pdf",
+                                key="inline_pdf_download_btn",
+                                type=_inline_gate["btn_type"],
+                                help=_inline_gate["hint"],
+                            )
+                        else:
+                            st.button(
+                                _inline_gate["label"],
+                                disabled=True,
+                                key="inline_pdf_download_btn_locked",
+                                help=_inline_gate["hint"],
+                            )
+                        if _inline_gate["badge"]:
+                            badge_cls = "pdf-badge-draft" if _inline_gate["badge"] == "Draft" else "pdf-badge-complete"
+                            st.markdown(
+                                f'<span class="{badge_cls}">{_inline_gate["badge"]}</span> '
+                                f'<span style="font-size:11px;color:#6b7280">{_inline_gate["hint"]}</span>',
+                                unsafe_allow_html=True,
+                            )
 
     if sv.get("session_status") == "ended_retry_limit":
         st.error(f"**Session Ended:** {sv.get('session_end_message', 'Unable to get enough information to continue. Session has ended.')}")
@@ -1372,6 +1472,10 @@ if st.session_state.graph_started and st.session_state.get("active_reference"):
         if st.button("✕", key="clear_active_reference", help="Remove reference"):
             st.session_state.active_reference = None
             st.rerun()
+
+# ── Compact timeline bar: rendered once per rerun above the chat composer ─────────────
+if st.session_state.graph_started and sv:
+    _render_timeline_bar(sv)
 
 if True:
     if st.session_state.graph_started:

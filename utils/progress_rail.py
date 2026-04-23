@@ -48,7 +48,9 @@ def compute_progress_data(
         total         : int   — total sections
         current_id    : str   — ID of the active section
         current_title : str   — human-readable title of the active section
-        checklist     : list[dict]  — [{id, title, status}], status ∈ {complete,current,pending}
+        checklist     : list[dict]  — [{id, title, status}]
+                        status ∈ {complete, current, partial, pending}
+                        partial = has answers captured but no PASS verdict yet
         still_needed  : list[str]  — ≤3 plain-English items missing in the current section
     """
     if not isinstance(sv, dict):
@@ -71,26 +73,43 @@ def compute_progress_data(
     current_section = prd_sections[idx]
 
     # ── Completed sections ────────────────────────────────────────────────────
-    # Primary signal: PASS verdict from section_scores.
-    # Secondary heuristic: section is before the current index (was advanced over).
+    # Two canonical completion signals, either is sufficient:
+    #   1. Explicit PASS verdict written to section_scores by the scoring node.
+    #   2. section_index has advanced PAST this position (i < idx) — this is the
+    #      authoritative signal written by advance_section_node regardless of
+    #      whether the advance was via PASS or a forced cap (ITER_CAP/RECOVERY_CAP).
+    #
+    # The old code also required _is_current_section_incomplete to be False for
+    # path 2 — which demanded a PASS verdict — defeating the entire heuristic for
+    # ITER_CAP advances.  That guard is REMOVED.
     completed_count = 0
     checklist: list[dict] = []
 
     for i, sec in enumerate(prd_sections):
         score_entry = section_scores.get(sec.id, {})
         verdict = (score_entry.get("verdict", "") if isinstance(score_entry, dict) else "")
-        is_complete = (verdict == "PASS") or (
-            i < idx and not _is_current_section_incomplete(sec, section_scores, confirmed_qa)
-        )
+        is_complete = (verdict == "PASS") or (i < idx)
 
         if is_complete:
             completed_count += 1
+
+        # Has the user captured any answer for this section (without PASS)?
+        is_partial = (
+            not is_complete
+            and sec.id != current_section.id
+            and any(
+                isinstance(v, dict) and v.get("section_id") == sec.id
+                for v in confirmed_qa.values()
+            )
+        )
 
         is_current = sec.id == current_section.id
         if is_current:
             status = "current"
         elif is_complete:
             status = "complete"
+        elif is_partial:
+            status = "partial"
         else:
             status = "pending"
 
@@ -118,14 +137,9 @@ def compute_progress_data(
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
-
-def _is_current_section_incomplete(sec, section_scores: dict, confirmed_qa: dict) -> bool:
-    """Returns True if this section clearly has NOT been completed (for heuristic guard)."""
-    score_entry = section_scores.get(sec.id, {})
-    if not isinstance(score_entry, dict):
-        return True
-    verdict = score_entry.get("verdict", "")
-    return verdict not in ("PASS",)
+# _is_current_section_incomplete intentionally removed:
+# completed-section detection now uses `i < idx` as the sole positional signal,
+# which is always set by advance_section_node regardless of PASS vs forced cap.
 
 
 def _derive_still_needed(section, confirmed_qa: dict, limit: int = 3) -> list[str]:
@@ -155,3 +169,42 @@ def _derive_still_needed(section, confirmed_qa: dict, limit: int = 3) -> list[st
             break
 
     return missing
+
+
+# ── PDF download gate ─────────────────────────────────────────────────────────
+
+def get_pdf_download_state(pct: int) -> dict:
+    """Return the canonical PDF button state for a given completion percentage.
+
+    Returns
+    -------
+    dict with keys:
+        enabled  : bool   — whether the download button should be active
+        label    : str    — button label text (with emoji)
+        btn_type : str    — Streamlit button type: "primary" | "secondary"
+        badge    : str    — short pill label: "" | "Draft" | "Complete"
+        hint     : str    — tooltip / caption text shown near the button
+    """
+    if pct < 80:
+        return {
+            "enabled": False,
+            "label": "🔒 Reach 80% to unlock PDF",
+            "btn_type": "secondary",
+            "badge": "",
+            "hint": f"{pct}% complete — reach 80% to enable PDF export",
+        }
+    if pct < 100:
+        return {
+            "enabled": True,
+            "label": "📥 Download Draft PDF",
+            "btn_type": "secondary",
+            "badge": "Draft",
+            "hint": f"{pct}% complete — draft export available",
+        }
+    return {
+        "enabled": True,
+        "label": "📥 Download Final PDF",
+        "btn_type": "primary",
+        "badge": "Complete",
+        "hint": "100% complete — final report ready",
+    }
