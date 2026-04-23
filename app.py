@@ -706,6 +706,19 @@ if st.session_state.graph_started:
                 use_container_width=True,
                 type="primary",
             )
+        # PDF download button (U1: only when bytes are present)
+        prd_pdf = sv.get("prd_pdf_bytes", b"")
+        if prd_pdf:
+            raw_title = sv.get("prd_report_title", "") or "requirements_report"
+            safe_title = re.sub(r"[^\w\s\-]", "", raw_title).strip().replace(" ", "_")[:60]
+            st.download_button(
+                label="📅 Download PDF",
+                data=prd_pdf,
+                file_name=f"{safe_title}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key="pdf_download_btn",
+            )
     st.divider()
 
     # ── PRD Progress panel ────────────────────────────────────────────────────
@@ -1097,6 +1110,19 @@ if st.session_state.graph_started:
                 elif msg_type == "complete":
                     st.balloons()
                     st.success(_present_content(content, source_lookup, confirmed_qa_store))
+                    # ── U1: Inline PDF download — shown immediately after the final message ──
+                    _inline_pdf = sv.get("prd_pdf_bytes", b"")
+                    if _inline_pdf:
+                        _raw_title = sv.get("prd_report_title", "") or "requirements_report"
+                        _safe_fn = re.sub(r"[^\w\s\-]", "", _raw_title).strip().replace(" ", "_")[:60] or "requirements_report"
+                        st.download_button(
+                            label="📥 Download PDF Report",
+                            data=_inline_pdf,
+                            file_name=f"{_safe_fn}.pdf",
+                            mime="application/pdf",
+                            key="inline_pdf_download_btn",
+                            type="primary",
+                        )
 
     if sv.get("session_status") == "ended_retry_limit":
         st.error(f"**Session Ended:** {sv.get('session_end_message', 'Unable to get enough information to continue. Session has ended.')}")
@@ -1158,7 +1184,7 @@ if True:
             user_input_obj = st.chat_input(placeholder, accept_file=True, file_type=["png", "jpg", "jpeg", "webp"])
                 
         elif sv.get("is_complete", False):
-            st.chat_input("Session complete — download your PRD above.", disabled=True)
+            st.chat_input("Session complete — see download in chat above.", disabled=True)
             user_input_obj = None
         elif sv.get("input_disabled", False):
             st.chat_input("Session has ended.", disabled=True)

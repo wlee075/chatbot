@@ -353,6 +353,20 @@ def _render_pdf(
     try:
         from fpdf import FPDF  # type: ignore[import]
 
+        # Sanitize: fpdf2 built-in Helvetica only supports Latin-1.
+        # Replace em-dash / bullet and encode to latin-1 lossy.
+        def _safe(text: str) -> str:
+            return (
+                text.replace("\u2014", " - ")
+                    .replace("\u2013", " - ")
+                    .replace("\u2022", "-")
+                    .encode("latin-1", errors="replace")
+                    .decode("latin-1")
+            )
+
+        report_title = _safe(report_title)
+        executive_summary = _safe(executive_summary)
+
         class _PRD_PDF(FPDF):  # type: ignore[misc]
             _title: str = ""
             _ts: str = ""
@@ -376,67 +390,73 @@ def _render_pdf(
         pdf._ts = generated_at
         pdf.add_page()
 
-        # ── Title block ──
-        pdf.set_font("Helvetica", "B", 22)
+        # ── Title block (use cell() not multi_cell to prevent overflow) ──
+        pdf.set_font("Helvetica", "B", 16)
         pdf.set_text_color(30, 30, 30)
-        pdf.multi_cell(0, 10, "Requirements Summary Report", align="L")
-        pdf.set_font("Helvetica", "", 11)
+        safe_report_title = _safe(report_title)[:80]
+        pdf.cell(0, 10, "Requirements Summary Report", new_x="LMARGIN", new_y="NEXT", align="L")
+        pdf.set_font("Helvetica", "", 10)
         pdf.set_text_color(80, 80, 80)
-        pdf.multi_cell(0, 7, report_title, align="L")
+        pdf.cell(0, 7, safe_report_title, new_x="LMARGIN", new_y="NEXT", align="L")
         pdf.set_font("Helvetica", "I", 9)
         pdf.set_text_color(130, 130, 130)
-        pdf.multi_cell(0, 6, f"Generated: {generated_at}", align="L")
+        pdf.cell(0, 6, f"Generated: {generated_at}", new_x="LMARGIN", new_y="NEXT", align="L")
         pdf.ln(6)
+
+        # Helper: always reset x before multi_cell to avoid corruption after cell() calls
+        def _mc(h: float, text: str) -> None:
+            pdf.set_x(pdf.l_margin)
+            pdf.multi_cell(0, h, text, align="L")
 
         # ── Executive Summary ──
         pdf.set_font("Helvetica", "B", 13)
         pdf.set_text_color(30, 30, 30)
-        pdf.multi_cell(0, 8, "Executive Summary", align="L")
+        _mc(8, "Executive Summary")
         pdf.set_font("Helvetica", "", 10)
         pdf.set_text_color(50, 50, 50)
-        pdf.multi_cell(0, 6, executive_summary, align="L")
+        _mc(6, executive_summary)
         pdf.ln(6)
 
         # ── Requirements by section ──
         pdf.set_font("Helvetica", "B", 13)
         pdf.set_text_color(30, 30, 30)
-        pdf.multi_cell(0, 8, "Requirements by Section", align="L")
+        _mc(8, "Requirements by Section")
         pdf.ln(2)
 
         for s in summaries:
             pdf.set_font("Helvetica", "B", 11)
             pdf.set_text_color(40, 40, 40)
-            pdf.multi_cell(0, 7, s["title"], align="L")
+            _mc(7, _safe(s["title"]))
             pdf.set_font("Helvetica", "", 10)
             if s["is_empty"]:
                 pdf.set_text_color(160, 80, 0)
-                pdf.multi_cell(0, 6, "[Incomplete / Not finalized]", align="L")
+                _mc(6, "[Incomplete / Not finalized]")
             else:
                 pdf.set_text_color(50, 50, 50)
-                pdf.multi_cell(0, 6, s["prose"], align="L")
+                _mc(6, _safe(s["prose"]))
             pdf.ln(4)
 
         # ── Open Questions ──
         pdf.set_font("Helvetica", "B", 13)
         pdf.set_text_color(30, 30, 30)
-        pdf.multi_cell(0, 8, "Open Questions / Assumptions", align="L")
+        _mc(8, "Open Questions / Assumptions")
         pdf.set_font("Helvetica", "", 10)
         pdf.set_text_color(50, 50, 50)
-        pdf.multi_cell(0, 6, "No major open questions captured.", align="L")
+        _mc(6, "No major open questions captured.")
         pdf.ln(6)
 
         # ── Next Steps ──
         pdf.set_font("Helvetica", "B", 13)
         pdf.set_text_color(30, 30, 30)
-        pdf.multi_cell(0, 8, "Next Steps", align="L")
+        _mc(8, "Next Steps")
         pdf.set_font("Helvetica", "", 10)
         pdf.set_text_color(50, 50, 50)
         for step in [
-            "\u2022 Validate requirements with stakeholders",
-            "\u2022 Estimate implementation scope and effort",
-            "\u2022 Draft implementation plan",
+            "- Validate requirements with stakeholders",
+            "- Estimate implementation scope and effort",
+            "- Draft implementation plan",
         ]:
-            pdf.multi_cell(0, 6, step, align="L")
+            _mc(6, step)
 
         return bytes(pdf.output())
 
@@ -5098,8 +5118,17 @@ def terminal_session_node(state: PRDState) -> dict:
 
 def finalize_node(state: PRDState) -> dict:
     """
-    Compiles all approved section drafts into a single Markdown PRD document.
+    Compiles all approved section drafts into a Markdown + PDF report.
+
+    Outputs 4 artifact keys: prd_markdown, prd_report_title,
+    prd_generated_at_utc, prd_pdf_bytes.
+
+    PDF render failure is handled gracefully: markdown is always produced,
+    prd_pdf_bytes is set to b"" and a WARNING is logged.
     """
+    from datetime import datetime, timezone
+    import re as _re
+
     ctx = _log_ctx(state, "finalize_node")
     t0 = time.monotonic()
     sections_completed = len(state.get("prd_sections", {}))
@@ -5109,42 +5138,63 @@ def finalize_node(state: PRDState) -> dict:
         sections_completed=sections_completed, total_sections=len(PRD_SECTIONS),
     )
 
-    from datetime import date
+    # T4: generate timestamp ONCE — shared across markdown, PDF, and UI
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    lines = [
-        "# Product Requirements Document",
-        f"_Generated: {date.today().isoformat()}_",
-        "",
-    ]
+    # Build section summaries (canonical-data-driven, deduped, empties flagged)
+    summaries = _build_section_summaries(
+        state.get("prd_sections", {}),
+        state.get("confirmed_qa_store", {}),
+    )
 
-    for section in PRD_SECTIONS:
-        if section.id in state.get("prd_sections", {}):
-            lines += [
-                f"## {section.title}",
-                "",
-                state["prd_sections"][section.id],
-                "",
-            ]
+    # T5: stable deterministic report title (safe for filenames)
+    first_non_empty = next((s for s in summaries if not s["is_empty"]), None)
+    project_hint = ""
+    if first_non_empty:
+        raw = first_non_empty["prose"].splitlines()[0].strip().strip("-•*").strip()
+        raw = _re.sub(r"(?i)^(the |a |an )", "", raw)
+        if raw and len(raw) <= 55 and not any(c in raw for c in ["{", "}", ":", "/"]):
+            project_hint = raw
+    report_title = (
+        f"Requirements Summary — {project_hint}" if project_hint
+        else "Requirements Summary Report"
+    )
 
-    prd_markdown = "\n".join(lines)
+    # Executive summary (deterministic-first, optional LLM, never raises)
+    executive_summary = _build_executive_summary(summaries, dict(state))
+
+    # Markdown (always succeeds)
+    prd_markdown = _build_markdown(report_title, generated_at, executive_summary, summaries)
+
+    # PDF (graceful failure — never raises, returns b"" on error)
+    prd_pdf_bytes = _render_pdf(report_title, generated_at, executive_summary, summaries)
+    if not prd_pdf_bytes:
+        log_event(
+            **ctx, level="WARNING", event_type="pdf_render_failure",
+            message="PDF render failed; markdown artifact preserved",
+        )
 
     duration_ms = int((time.monotonic() - t0) * 1000)
     log_event(
         **ctx, level="INFO", event_type="node_end",
-        message="finalize_node finished — PRD generation complete",
+        message="finalize_node finished",
         duration_ms=duration_ms, sections_completed=sections_completed,
         total_sections=len(PRD_SECTIONS), prd_len=len(prd_markdown),
+        pdf_bytes=len(prd_pdf_bytes),
     )
 
     return {
         "prd_markdown": prd_markdown,
+        "prd_report_title": report_title,
+        "prd_generated_at_utc": generated_at,
+        "prd_pdf_bytes": prd_pdf_bytes,
         "chat_history": [
             {
                 "role": "assistant",
                 "msg_id": f"msg_{str(uuid.uuid4())[:8]}",
                 "type": "complete",
                 "content": (
-                    "🎉 **Your PRD is complete!** All sections have been reviewed "
+                    "\U0001f389 **Your PRD is complete!** All sections have been reviewed "
                     "and approved. Download it using the button in the sidebar."
                 ),
             }
