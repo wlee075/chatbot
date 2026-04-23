@@ -61,10 +61,25 @@ def route_after_draft(state: PRDState) -> str:
     """
     Only run reflect after a real draft write.
     Skip straight back to question generation when draft_node determined there
-    was no material new value.
+    was no material new value — UNLESS question generation already signaled
+    section-complete (no_question_available), in which case route directly to
+    advance_section. Reflect cannot evaluate a completed section with no draft
+    and would always LOOP, creating an infinite cycle.
     """
     mode = state.get("draft_execution_mode", "drafted")
-    route = "reflect" if mode == "drafted" else "generate_questions"
+    gen_status = state.get("generation_status", "question_generated")
+
+    if mode == "drafted":
+        route = "reflect"
+    elif gen_status == "no_question_available":
+        # Section is complete but draft was skipped (no new material).
+        # Route directly to advance_section — reflect has no draft to score
+        # and would always return LOOP, creating:
+        #   generate_questions → draft(skip) → reflect(LOOP) → generate_questions
+        route = "advance_section"
+    else:
+        route = "generate_questions"
+
     log_event(
         thread_id=state.get("thread_id", ""),
         run_id=state.get("run_id", ""),
@@ -74,9 +89,10 @@ def route_after_draft(state: PRDState) -> str:
         iteration=state.get("iteration", 0),
         level="INFO",
         event_type="routing_decision",
-        message=f"Routing after draft: {mode} → {route}",
+        message=f"Routing after draft: {mode} (gen_status={gen_status}) → {route}",
         route=route,
         reason=mode,
+        generation_status=gen_status,
     )
     return route
 

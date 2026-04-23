@@ -487,3 +487,7 @@ class PRDState(TypedDict):
     # ── Final output ──────────────────────────────────────────────────────────
     prd_markdown: str
     is_complete: bool
+    # ── Final report artifact ─────────────────────────────────────────────────
+    prd_report_title: str          # e.g. "Requirements Summary — Adaptive Matching"
+    prd_generated_at_utc: str      # ISO-8601 UTC timestamp set once by finalize_node
+    prd_pdf_bytes: bytes           # rendered PDF binary; b"" if render fails

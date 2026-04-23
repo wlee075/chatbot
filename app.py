@@ -879,19 +879,41 @@ if st.session_state.graph_started:
             
         # Classify the terminal block for this cycle
         has_advance = any(m.get("type") in ("advance", "complete") for m in assistant_msgs)
+        # Index of the advance/complete message — elicit messages BEFORE this
+        # index are section-closure clarifications (suppress them); elicit
+        # messages AFTER are the opening question for the next section (keep them).
+        advance_idx = next(
+            (i for i, m in enumerate(assistant_msgs) if m.get("type") in ("advance", "complete")),
+            len(assistant_msgs),
+        )
+        # When multiple post-advance elicits exist (e.g. parser-fallback dual-call
+        # pattern in generate_questions_node emits two elicit messages), only the
+        # LAST one is authoritative — it is the actual next-section opening question.
+        last_post_advance_elicit_idx = None
+        if has_advance:
+            for _k in range(len(assistant_msgs) - 1, advance_idx, -1):
+                if assistant_msgs[_k].get("type") == "elicit":
+                    last_post_advance_elicit_idx = _k
+                    break
         
         # Single Bubble Context
         with st.chat_message("Agent", avatar="assistant"):
-            for msg in assistant_msgs:
+            for msg_i, msg in enumerate(assistant_msgs):
                 msg_type = msg.get("type", "")
                 content = msg.get("content", "")
                 msg_id = f"msg_{msg['_idx']}"
                 st.markdown(f'<div id="{msg_id}"></div>', unsafe_allow_html=True)
                 
                 # --- Filter Logic ---
-                if msg_type in ("reflect", "elicit") and has_advance:
-                    # Forbidden: ADVANCE_SECTION + clarification request
+                if msg_type in ("reflect", "elicit") and has_advance and msg_i < advance_idx:
+                    # Suppress clarification/elicit messages that appear BEFORE
+                    # the section-advance banner (those belong to the old section).
                     continue
+                if msg_type == "elicit" and has_advance and msg_i > advance_idx:
+                    # Multiple post-advance elicits: only keep the final one.
+                    if msg_i != last_post_advance_elicit_idx:
+                        continue
+
                     
                 if msg_type == "elicit" and "I have all the details I need for this section. Let's move on." in content and len(content) > 65:
                     content = content.replace("I have all the details I need for this section. Let's move on.", "").strip()

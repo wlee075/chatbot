@@ -298,6 +298,7 @@ def build_graph(checkpointer: MemorySaver | None = None):
         {
             "reflect": "reflect",
             "generate_questions": "rebuild_mirror",
+            "advance_section": "advance_section",
         },
     )
 
@@ -320,8 +321,6 @@ def build_graph(checkpointer: MemorySaver | None = None):
             "finalize": "finalize",
         },
     )
-
-    builder.add_edge("advance_section", "generate_questions")
 
     builder.add_edge("terminal_session", END)
     builder.add_edge("finalize", END)

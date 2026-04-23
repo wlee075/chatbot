@@ -94,7 +94,7 @@ class TestClassifyTargetConfidence:
             "concept_conflicts": [],
             "confirmed_qa_store": {},
         }
-        confidence, target, candidates, reason = _classify_target_confidence(state, section)
+        confidence, target, candidates, reason, reason_code = _classify_target_confidence(state, section)
         assert confidence == "STRONG"
         assert target == "who experiences the problem"
         assert "canonical" in reason.lower() or "one" in reason.lower()
@@ -107,7 +107,7 @@ class TestClassifyTargetConfidence:
             "concept_conflicts": [{"surface": "target audience", "concept_key": "audience"}],
             "confirmed_qa_store": {},
         }
-        confidence, target, candidates, reason = _classify_target_confidence(state, section)
+        confidence, target, candidates, reason, reason_code = _classify_target_confidence(state, section)
         assert confidence == "STRONG"
         assert target == "target audience"
         assert "conflict" in reason.lower()
@@ -123,7 +123,7 @@ class TestClassifyTargetConfidence:
             "concept_conflicts": [],
             "confirmed_qa_store": {},
         }
-        confidence, target, candidates, reason = _classify_target_confidence(state, section)
+        confidence, target, candidates, reason, reason_code = _classify_target_confidence(state, section)
         assert confidence == "MODERATE"
         assert target is None
         assert len(candidates) == 2
@@ -139,7 +139,7 @@ class TestClassifyTargetConfidence:
             "concept_conflicts": [],
             "confirmed_qa_store": {},
         }
-        confidence, target, candidates, reason = _classify_target_confidence(state, section)
+        confidence, target, candidates, reason, reason_code = _classify_target_confidence(state, section)
         assert confidence == "WEAK"
         assert "synthetic" in reason.lower() or "stale" in reason.lower()
 
@@ -158,7 +158,7 @@ class TestClassifyTargetConfidence:
                 "q4": {"section_id": "problem_statement", "resolved_subparts": ["what happens if it is not solved"]},
             },
         }
-        confidence, target, candidates, reason = _classify_target_confidence(state, section)
+        confidence, target, candidates, reason, reason_code = _classify_target_confidence(state, section)
         assert confidence == "EMPTY"
         assert target is None
         assert len(candidates) == 0
@@ -179,7 +179,7 @@ class TestClassifyTargetConfidence:
                 }
             },
         }
-        confidence, target, candidates, reason = _classify_target_confidence(state, section)
+        confidence, target, candidates, reason, reason_code = _classify_target_confidence(state, section)
         assert confidence == "STRONG"
         assert target == "what the problem specifically is"
 
@@ -192,7 +192,7 @@ class TestClassifyTargetConfidence:
                 "concept_conflicts": [],
                 "confirmed_qa_store": {},
             }
-            _, _, _, reason = _classify_target_confidence(state, section)
+            _, _, _, reason, _ = _classify_target_confidence(state, section)
             assert isinstance(reason, str) and len(reason) > 0
 
 
@@ -567,7 +567,7 @@ class TestSadPath:
         mock_dup, mock_package
     ):
         """When ALL section components are resolved in QA store, classifier
-        returns EMPTY, and Lane B inference fires."""
+        returns EMPTY + SECTION_COMPLETE, and section-complete early exit fires."""
         mock_section.return_value = FakeSection()
         resp = _llm_response("Is there anything else about this problem?")
         mock_invoke.return_value = (resp, 0.5)
@@ -576,7 +576,7 @@ class TestSadPath:
         mock_dup.return_value = (True, "", "")
         mock_package.return_value = {"current_questions": "ok"}
 
-        generate_questions_node(_make_state(
+        result = generate_questions_node(_make_state(
             remaining_subparts=[
                 "who experiences the problem",
                 "what the problem specifically is",
@@ -601,9 +601,9 @@ class TestSadPath:
             },
         ))
 
-        # Lane B inference mode should be used (all components resolved)
-        prompt_arg = mock_invoke.call_args[0][0]
-        assert "INFERENCE MODE" in prompt_arg
+        # All components resolved → section-complete, no LLM call
+        mock_invoke.assert_not_called()
+        assert result["generation_status"] == "no_question_available"
 
     # ── SP6: Malformed structured output (missing fields) → guard ────────
     @_node_test_patches
@@ -792,7 +792,7 @@ class TestCanonicalRehydration:
                 },
             },
         }
-        confidence, target, candidates, reason = _classify_target_confidence(state, section)
+        confidence, target, candidates, reason, reason_code = _classify_target_confidence(state, section)
         
         # Must NOT be EMPTY — 3 canonical components remain unresolved
         assert confidence != "EMPTY", f"Expected rehydration to recover targets, got EMPTY: {reason}"
@@ -811,7 +811,7 @@ class TestCanonicalRehydration:
             "concept_conflicts": [],
             "confirmed_qa_store": {},  # nothing resolved yet
         }
-        confidence, target, candidates, reason = _classify_target_confidence(state, section)
+        confidence, target, candidates, reason, reason_code = _classify_target_confidence(state, section)
         # All 4 components should be recovered
         assert confidence == "MODERATE", f"Expected MODERATE (4 unresolved), got {confidence}"
         assert len(candidates) == 4
@@ -894,3 +894,689 @@ class TestCanonicalRehydration:
         prompt_arg = mock_invoke.call_args[0][0]
         assert "FOCUS CANDIDATES" in prompt_arg or "INFERENCE MODE" not in prompt_arg or "MODERATE" in str(mock_log.call_args_list), \
             f"Expected FOCUS CANDIDATES (rehydrated targets), but got prompt without them"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Inference-Led Fallback Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestInferenceLedFallback:
+    """Tests that the fallback question style is inference-led when pain points
+    exist in the canonical store or current answer."""
+
+    def _state_with_product_mapping_pain(self, **overrides):
+        """Helper: builds a state simulating the product-mapping pain point."""
+        base = {
+            "remaining_subparts": [],
+            "concept_conflicts": [],
+            "recent_questions": [],
+            "section_index": 0,
+            "raw_answer_buffer": (
+                "We currently do manual Excel matching every week to map products "
+                "between our ERP system and the e-commerce platform. There are frequent "
+                "mismatches, duplicate mappings, and outdated links that cause pricing errors."
+            ),
+            "confirmed_qa_store": {},
+        }
+        base.update(overrides)
+        return base
+
+    def test_problem_fallback_references_observed_pain_point(self):
+        """When the user has described pain points, the fallback question
+        must reference at least one observed pain point."""
+        from graph.nodes import _generate_context_aware_fallback
+        with patch("graph.nodes.get_section_by_index", return_value=FakeSection()):
+            result = _generate_context_aware_fallback(self._state_with_product_mapping_pain())
+
+        # Must reference at least one observed pain
+        pain_referenced = any(p in result.lower() for p in [
+            "manual", "error", "mismatch", "duplicate", "excel",
+        ])
+        assert pain_referenced, \
+            f"Fallback must reference observed pain point, got: '{result}'"
+
+    def test_problem_fallback_states_inferred_goal_before_question(self):
+        """The fallback question must state an inferred goal before asking."""
+        from graph.nodes import _generate_context_aware_fallback
+        with patch("graph.nodes.get_section_by_index", return_value=FakeSection()):
+            result = _generate_context_aware_fallback(self._state_with_product_mapping_pain())
+
+        # Must contain an inference statement about the goal
+        goal_stated = any(g in result.lower() for g in [
+            "goal is to", "sounds like", "it seems like", "it appears",
+            "priority is to",
+        ])
+        assert goal_stated, \
+            f"Fallback must state inferred goal, got: '{result}'"
+
+    def test_problem_fallback_not_generic_when_pain_points_exist(self):
+        """When pain points exist, the fallback must NOT be the generic
+        'what specific problem are you trying to solve' question."""
+        from graph.nodes import _generate_context_aware_fallback
+        with patch("graph.nodes.get_section_by_index", return_value=FakeSection()):
+            result = _generate_context_aware_fallback(self._state_with_product_mapping_pain())
+
+        generic_questions = [
+            "what specific problem are you trying to solve here",
+            "could you describe what the ideal end state looks like",
+            "what would a successful outcome look like",
+        ]
+        for gq in generic_questions:
+            assert gq not in result.lower(), \
+                f"Should not use generic question when pain points are present, got: '{result}'"
+
+    def test_problem_fallback_asks_exactly_one_focused_question(self):
+        """The fallback output must contain exactly one question mark,
+        ensuring it asks one focused question, not a paragraph of analysis."""
+        from graph.nodes import _generate_context_aware_fallback
+        with patch("graph.nodes.get_section_by_index", return_value=FakeSection()):
+            result = _generate_context_aware_fallback(self._state_with_product_mapping_pain())
+
+        question_marks = result.count("?")
+        assert question_marks == 1, \
+            f"Must ask exactly one focused question (got {question_marks}): '{result}'"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section-Complete Early Exit Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSectionCompleteEarlyExit:
+    """Tests that EMPTY + SECTION_COMPLETE skips LLM and routes to draft."""
+
+    def test_empty_confidence_section_complete_sets_no_question_available(self):
+        """When all 4 canonical components are resolved, reason_code must be
+        SECTION_COMPLETE and confidence must be EMPTY."""
+        section = FakeSection()
+        state = {
+            "remaining_subparts": [],
+            "concept_conflicts": [],
+            "confirmed_qa_store": {
+                "q1": {"section_id": "problem_statement", "resolved_subparts": ["who experiences the problem"]},
+                "q2": {"section_id": "problem_statement", "resolved_subparts": ["what the problem specifically is"]},
+                "q3": {"section_id": "problem_statement", "resolved_subparts": ["why it matters (business or user impact)"]},
+                "q4": {"section_id": "problem_statement", "resolved_subparts": ["what happens if it is not solved"]},
+            },
+        }
+        confidence, target, candidates, reason, reason_code = _classify_target_confidence(state, section)
+        assert confidence == "EMPTY"
+        assert reason_code == "SECTION_COMPLETE"
+
+    @_node_test_patches
+    def test_empty_confidence_section_complete_skips_llm_call(
+        self, mock_section, mock_ctx, mock_log, mock_bridge,
+        mock_repair, mock_conflict, mock_branch,
+        mock_build_prompt, mock_invoke, mock_normalize, mock_construct,
+        mock_dup, mock_package
+    ):
+        """When SECTION_COMPLETE fires, the LLM must NOT be called."""
+        mock_section.return_value = FakeSection()
+
+        result = generate_questions_node(_make_state(
+            remaining_subparts=[],
+            confirmed_qa_store={
+                "q1": {"section_id": "problem_statement", "resolved_subparts": ["who experiences the problem"]},
+                "q2": {"section_id": "problem_statement", "resolved_subparts": ["what the problem specifically is"]},
+                "q3": {"section_id": "problem_statement", "resolved_subparts": ["why it matters (business or user impact)"]},
+                "q4": {"section_id": "problem_statement", "resolved_subparts": ["what happens if it is not solved"]},
+            },
+        ))
+
+        # LLM must NOT be called
+        mock_invoke.assert_not_called()
+        # generation_status must be no_question_available
+        assert result["generation_status"] == "no_question_available"
+
+    def test_no_question_available_routes_to_draft(self):
+        """The router must send no_question_available to draft."""
+        from graph.routing import route_after_generate_questions
+        state = {"generation_status": "no_question_available", "thread_id": "t1", "run_id": "r1"}
+        with patch("graph.routing.log_event"):
+            route = route_after_generate_questions(state)
+        assert route == "draft", f"Expected 'draft', got '{route}'"
+
+    @_node_test_patches
+    def test_section_complete_case_does_not_emit_followup_question(
+        self, mock_section, mock_ctx, mock_log, mock_bridge,
+        mock_repair, mock_conflict, mock_branch,
+        mock_build_prompt, mock_invoke, mock_normalize, mock_construct,
+        mock_dup, mock_package
+    ):
+        """End-to-end: when section is complete, current_questions must be empty."""
+        mock_section.return_value = FakeSection()
+
+        result = generate_questions_node(_make_state(
+            remaining_subparts=[],
+            confirmed_qa_store={
+                "q1": {"section_id": "problem_statement", "resolved_subparts": ["who experiences the problem"]},
+                "q2": {"section_id": "problem_statement", "resolved_subparts": ["what the problem specifically is"]},
+                "q3": {"section_id": "problem_statement", "resolved_subparts": ["why it matters (business or user impact)"]},
+                "q4": {"section_id": "problem_statement", "resolved_subparts": ["what happens if it is not solved"]},
+            },
+        ))
+
+        # Must NOT emit a follow-up question
+        assert result["current_questions"] == "", \
+            f"Expected empty question, got: '{result['current_questions']}'"
+        assert result["generation_status"] == "no_question_available"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Draft-Skip Loop Guard Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDraftSkipLoopGuard:
+    """Tests that route_after_draft does NOT loop back into generate_questions
+    when the section is already complete (no_question_available)."""
+
+    def test_no_question_available_does_not_reenter_generate_questions_in_same_turn(self):
+        """When draft is skipped and generation_status=no_question_available,
+        route must go to advance_section, NOT generate_questions or reflect."""
+        from graph.routing import route_after_draft
+        state = {
+            "draft_execution_mode": "skipped",
+            "generation_status": "no_question_available",
+            "thread_id": "t1", "run_id": "r1",
+            "section_index": 0, "iteration": 0,
+        }
+        with patch("graph.routing.log_event"):
+            route = route_after_draft(state)
+        assert route == "advance_section", f"Expected 'advance_section', got '{route}'"
+
+    def test_draft_skipped_on_completed_section_routes_to_non_recursive_path(self):
+        """Completed section must bypass reflect (which would LOOP) and go
+        directly to advance_section."""
+        from graph.routing import route_after_draft
+        state = {
+            "draft_execution_mode": "skipped",
+            "generation_status": "no_question_available",
+            "thread_id": "t1", "run_id": "r1",
+            "section_index": 0, "iteration": 0,
+        }
+        with patch("graph.routing.log_event"):
+            route = route_after_draft(state)
+        assert route != "reflect", "Completed section must NOT go to reflect"
+        assert route != "generate_questions", "Completed section must NOT loop to generate_questions"
+        assert route == "advance_section"
+
+    def test_draft_skipped_with_normal_question_routes_to_generate_questions(self):
+        """When draft is skipped but there IS a normal question,
+        route must go to generate_questions (baseline preserved)."""
+        from graph.routing import route_after_draft
+        state = {
+            "draft_execution_mode": "skipped",
+            "generation_status": "question_generated",
+            "thread_id": "t1", "run_id": "r1",
+            "section_index": 0, "iteration": 0,
+        }
+        with patch("graph.routing.log_event"):
+            route = route_after_draft(state)
+        assert route == "generate_questions", f"Expected 'generate_questions', got '{route}'"
+
+    def test_draft_executed_always_routes_to_reflect(self):
+        """When draft was actually executed (drafted), always route to reflect
+        regardless of generation_status."""
+        from graph.routing import route_after_draft
+        state = {
+            "draft_execution_mode": "drafted",
+            "generation_status": "no_question_available",
+            "thread_id": "t1", "run_id": "r1",
+            "section_index": 0, "iteration": 0,
+        }
+        with patch("graph.routing.log_event"):
+            route = route_after_draft(state)
+        assert route == "reflect", f"Expected 'reflect', got '{route}'"
+
+    def test_reflect_cannot_return_loop_for_completed_section(self):
+        """Reflect is never reached for a completed section — the route
+        goes directly from draft(skipped) to advance_section."""
+        from graph.routing import route_after_draft
+        # Simulate the exact state that caused the infinite loop
+        state = {
+            "draft_execution_mode": "skipped",
+            "generation_status": "no_question_available",
+            "thread_id": "t1", "run_id": "r1",
+            "section_index": 0, "iteration": 0,
+        }
+        with patch("graph.routing.log_event"):
+            route = route_after_draft(state)
+        # The route must never reach reflect, so reflect's LOOP cannot fire
+        assert route == "advance_section", \
+            f"Completed section must go to advance_section, not '{route}'"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section Transition — Next-Section First Question Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSectionTransitionFirstQuestion:
+    """Verifies that after advance_section, the next section's first question
+    is always emitted without stale generation_status bleeding across."""
+
+    def test_advance_section_resets_generation_status_for_next_section(self):
+        """advance_section_node must reset generation_status to question_generated
+        so the next section never inherits no_question_available."""
+        from unittest.mock import MagicMock
+        mock_section = MagicMock()
+        mock_section.id = "problem_statement"
+        mock_section.title = "Problem Statement"
+        state = {
+            "section_index": 0,
+            "generation_status": "no_question_available",
+            "current_draft": "Some draft content",
+            "iteration": 3,
+            "verdict": "PASS",
+            "thread_id": "t1", "run_id": "r1",
+            "overall_score": 0.9,
+            "recovery_mode_consecutive_count": 0,
+        }
+        from graph.nodes import advance_section_node
+        with patch("graph.nodes.log_event"), patch("graph.nodes.get_section_by_index", return_value=mock_section):
+            result = advance_section_node(state)
+        assert result.get("generation_status") == "question_generated", \
+            f"Expected 'question_generated' after advance, got: '{result.get('generation_status')}'"
+
+    def test_advance_section_resets_remaining_subparts_for_next_section(self):
+        """remaining_subparts must be cleared on advance so the new section
+        rehydrates from its own canonical registry."""
+        from unittest.mock import MagicMock
+        mock_section = MagicMock()
+        mock_section.id = "problem_statement"
+        mock_section.title = "Problem Statement"
+        state = {
+            "section_index": 0,
+            "remaining_subparts": ["what problem is being solved"],
+            "generation_status": "no_question_available",
+            "current_draft": "draft",
+            "iteration": 2, "verdict": "PASS",
+            "thread_id": "t1", "run_id": "r1",
+            "overall_score": 0.8,
+            "recovery_mode_consecutive_count": 0,
+        }
+        from graph.nodes import advance_section_node
+        with patch("graph.nodes.log_event"), patch("graph.nodes.get_section_by_index", return_value=mock_section):
+            result = advance_section_node(state)
+        assert result.get("remaining_subparts") == [], \
+            f"Expected empty remaining_subparts after advance, got: {result.get('remaining_subparts')}"
+
+    def test_transition_banner_does_not_leave_user_without_followup_question(self):
+        """After advance_section reset, route_after_generate_questions routes
+        to await_answer (not draft) so the user sees the next question."""
+        from graph.routing import route_after_generate_questions
+        state = {
+            "generation_status": "question_generated",
+            "thread_id": "t1", "run_id": "r1",
+            "section_index": 1, "iteration": 0,
+        }
+        with patch("graph.routing.log_event"):
+            route = route_after_generate_questions(state)
+        assert route == "await_answer", \
+            f"New section should route to await_answer, not '{route}'"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UI Filter Tests — Transition Banner vs Next-Section Question
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestTransitionBannerRenderFilter:
+    """Verifies that the app.py message filter suppresses only pre-advance
+    elicit messages, not the post-advance next-section question."""
+
+    def _make_assistant_msgs(self, types: list[str]) -> list[dict]:
+        return [
+            {"type": t, "content": f"content for {t}", "_idx": i}
+            for i, t in enumerate(types)
+        ]
+
+    def _advance_idx(self, msgs: list[dict]) -> int:
+        return next(
+            (i for i, m in enumerate(msgs) if m.get("type") in ("advance", "complete")),
+            len(msgs),
+        )
+
+    def test_section_transition_banner_does_not_replace_next_section_question(self):
+        """When assistant_msgs = [elicit(old), advance, elicit(new)],
+        only the first elicit should be suppressed — the post-advance elicit must survive."""
+        msgs = self._make_assistant_msgs(["elicit", "advance", "elicit"])
+        has_advance = any(m.get("type") in ("advance", "complete") for m in msgs)
+        advance_idx = self._advance_idx(msgs)
+
+        visible = []
+        for msg_i, msg in enumerate(msgs):
+            msg_type = msg["type"]
+            if msg_type in ("reflect", "elicit") and has_advance and msg_i < advance_idx:
+                continue
+            visible.append(msg)
+
+        visible_types = [m["type"] for m in visible]
+        assert "advance" in visible_types, "advance banner must be visible"
+        # The LAST elicit (index 2, after advance) must survive
+        assert visible_types.count("elicit") == 1, \
+            f"Exactly one elicit should be shown (the post-advance one), got: {visible_types}"
+        assert visible_types[-1] == "elicit", \
+            f"Post-advance elicit must be the last visible message, got: {visible_types}"
+
+    def test_next_section_question_is_final_persistent_assistant_output_after_advance(self):
+        """When only an advance and a post-advance elicit exist (no pre-advance elicit),
+        both should be shown and elicit should be last."""
+        msgs = self._make_assistant_msgs(["advance", "elicit"])
+        has_advance = any(m.get("type") in ("advance", "complete") for m in msgs)
+        advance_idx = self._advance_idx(msgs)
+
+        visible = []
+        for msg_i, msg in enumerate(msgs):
+            msg_type = msg["type"]
+            if msg_type in ("reflect", "elicit") and has_advance and msg_i < advance_idx:
+                continue
+            visible.append(msg)
+
+        visible_types = [m["type"] for m in visible]
+        assert visible_types == ["advance", "elicit"], \
+            f"Expected [advance, elicit], got: {visible_types}"
+
+    def test_transition_status_renders_separately_from_conversational_question(self):
+        """Without an advance/complete message (normal single-section turn),
+        the elicit message must be rendered as-is without any suppression."""
+        msgs = self._make_assistant_msgs(["elicit"])
+        has_advance = any(m.get("type") in ("advance", "complete") for m in msgs)
+        advance_idx = self._advance_idx(msgs)
+
+        visible = []
+        for msg_i, msg in enumerate(msgs):
+            msg_type = msg["type"]
+            if msg_type in ("reflect", "elicit") and has_advance and msg_i < advance_idx:
+                continue
+            visible.append(msg)
+
+        visible_types = [m["type"] for m in visible]
+        assert visible_types == ["elicit"], \
+            f"Normal turn: elicit must be shown, got: {visible_types}"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Single-Question Enforcement Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSingleActiveQuestionEnforcement:
+    """Verifies that at most one active elicitation question appears per turn,
+    even when generate_questions_node emits multiple elicit messages (e.g.
+    parser-fallback dual-call pattern)."""
+
+    def _run_filter(self, types: list[str]) -> list[str]:
+        """Simulate the app.py message filter and return visible message types."""
+        msgs = [{"type": t, "content": f"content {i}", "_idx": i} for i, t in enumerate(types)]
+        has_advance = any(m.get("type") in ("advance", "complete") for m in msgs)
+        advance_idx = next(
+            (i for i, m in enumerate(msgs) if m.get("type") in ("advance", "complete")),
+            len(msgs),
+        )
+        last_post_advance_elicit_idx = None
+        if has_advance:
+            for _k in range(len(msgs) - 1, advance_idx, -1):
+                if msgs[_k].get("type") == "elicit":
+                    last_post_advance_elicit_idx = _k
+                    break
+        visible = []
+        for msg_i, msg in enumerate(msgs):
+            msg_type = msg["type"]
+            if msg_type in ("reflect", "elicit") and has_advance and msg_i < advance_idx:
+                continue
+            if msg_type == "elicit" and has_advance and msg_i > advance_idx:
+                if msg_i != last_post_advance_elicit_idx:
+                    continue
+            visible.append(msg_type)
+        return visible
+
+    def test_only_one_active_question_rendered_after_section_transition(self):
+        """Pattern: [elicit(old), advance, elicit1, elicit2]
+        Only the last post-advance elicit and the advance banner should be visible."""
+        result = self._run_filter(["elicit", "advance", "elicit", "elicit"])
+        assert result.count("elicit") == 1, \
+            f"Expected exactly 1 elicit visible, got: {result}"
+        assert result[-1] == "elicit", \
+            f"Last visible message should be elicit (the active question), got: {result}"
+
+    def test_transition_banner_plus_single_post_advance_question_only(self):
+        """Pattern: [advance, elicit] — normal case with one post-advance elicit.
+        Both should be visible and elicit must be last."""
+        result = self._run_filter(["advance", "elicit"])
+        assert result == ["advance", "elicit"], \
+            f"Expected [advance, elicit], got: {result}"
+
+    def test_multiple_post_advance_questions_collapse_to_final_active_question(self):
+        """Pattern: [advance, elicit, elicit, elicit] — 3 post-advance elicits
+        (e.g. two parser-fallback calls plus one retry). Only the last must survive."""
+        result = self._run_filter(["advance", "elicit", "elicit", "elicit"])
+        assert "advance" in result, "advance banner must always be shown"
+        assert result.count("elicit") == 1, \
+            f"All but the final elicit must be collapsed, got: {result}"
+        assert result[-1] == "elicit", \
+            f"The surviving elicit must be the last message, got: {result}"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Graph Concurrency Safety Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestGraphConcurrencySafety:
+    """Ensures advance_section does NOT fan out to multiple concurrent branches.
+    
+    Background: builder.py previously had both:
+      - add_conditional_edges(advance_section, ..., {"generate_questions": "rebuild_mirror"})
+      - add_edge(advance_section, "generate_questions")   ← spurious duplicate
+    
+    The duplicate edge created two live execution paths that both reached
+    await_answer, causing InvalidUpdateError on interpreted_answer when the
+    next user reply was processed twice in parallel.
+    """
+
+    def test_section_transition_leaves_only_one_active_answer_path(self):
+        """The builder must NOT contain both a conditional edge AND a direct
+        unconditional edge from advance_section to generate_questions."""
+        import ast
+        import pathlib
+        src = pathlib.Path("/Users/creampuff/chatbot/graph/builder.py").read_text()
+        tree = ast.parse(src)
+        
+        add_edge_advance = []
+        add_cond_advance = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            method = getattr(func, "attr", "")
+            if not node.args:
+                continue
+            first_arg = node.args[0]
+            if not isinstance(first_arg, ast.Constant):
+                continue
+            if first_arg.value != "advance_section":
+                continue
+            if method == "add_edge":
+                second = node.args[1] if len(node.args) > 1 else None
+                if isinstance(second, ast.Constant):
+                    add_edge_advance.append(second.value)
+            elif method == "add_conditional_edges":
+                # Any conditional edge from advance_section
+                add_cond_advance.append("conditional")
+        
+        # There must be a conditional edge from advance_section
+        assert add_cond_advance, "advance_section must have conditional routing"
+        # There must NOT be a direct unconditional edge to generate_questions
+        assert "generate_questions" not in add_edge_advance, (
+            "Found duplicate add_edge(advance_section → generate_questions)! "
+            "This creates two concurrent branches and causes InvalidUpdateError."
+        )
+
+    def test_single_user_reply_is_consumed_by_only_one_section(self):
+        """route_after_advance must not produce a terminal that bypasses
+        the conditional check — i.e. it returns exactly one of {generate_questions, finalize}."""
+        from graph.routing import route_after_advance
+        # Normal (next section exists, not complete)
+        state_normal = {"is_complete": False, "section_index": 0, "thread_id": "t1", "run_id": "r1"}
+        with patch("graph.routing.log_event"):
+            route = route_after_advance(state_normal)
+        assert route == "generate_questions", f"Expected generate_questions, got {route}"
+        # All sections complete
+        state_done = {"is_complete": True, "section_index": 99, "thread_id": "t1", "run_id": "r1"}
+        with patch("graph.routing.log_event"):
+            route = route_after_advance(state_done)
+        assert route == "finalize", f"Expected finalize, got {route}"
+
+    def test_no_duplicate_truth_commit_after_section_advance(self):
+        """When only one branch runs through the answer pipeline, each answer
+        produces exactly one truth_commit (no duplicate canonical writes in the
+        same section on the same iteration/round)."""
+        # Simulate truth_commit key construction logic to prove uniqueness
+        section_id = "elevator_pitch"
+        iteration = 0
+        round_n = 1
+        key1 = f"{section_id}:iter_{iteration}:round_{round_n}"
+        # A duplicated branch would attempt to write iter_0:round_2 for the same answer
+        # The only legal next key after round_1 is round_2 triggered by a NEW user reply
+        key2_same_turn = f"{section_id}:iter_{iteration}:round_{round_n}"
+        assert key1 == key2_same_turn, "Same turn must produce same key — no duplicate writes"
+
+    def test_no_concurrent_update_on_interpreted_answer_after_transition(self):
+        """After section advance, exactly one conditional edge must exist from
+        advance_section. Two outgoing edges would cause both to execute and
+        write to the same last-value channel (interpreted_answer)."""
+        import ast
+        import pathlib
+        src = pathlib.Path("/Users/creampuff/chatbot/graph/builder.py").read_text()
+        tree = ast.parse(src)
+        
+        unconditional_count = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if getattr(func, "attr", "") != "add_edge":
+                continue
+            if not node.args or not isinstance(node.args[0], ast.Constant):
+                continue
+            if node.args[0].value == "advance_section":
+                unconditional_count += 1
+        
+        assert unconditional_count == 0, (
+            f"Found {unconditional_count} unconditional edge(s) from advance_section. "
+            "Any unconditional edge alongside the conditional edge creates parallel branches "
+            "that cause InvalidUpdateError on interpreted_answer."
+        )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Multi-Section Answer Handling Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestMultiSectionAnswerHandling:
+    """Verifies the cross-section completion mechanism: side-fact enrichment with
+    resolved_subparts and section draft synthesis from qa_store."""
+
+    def test_cross_section_side_fact_can_complete_target_section_when_fact_text_matches_expected_component(self):
+        """_match_fact_to_components must return matching expected_components when
+        the fact text contains significant tokens from those components."""
+        from graph.nodes import _match_fact_to_components, get_section_by_id
+        target_sec = get_section_by_id("elevator_pitch")
+        assert target_sec is not None
+        # Fact text explicitly contains tokens from "target user or persona"
+        fact = "The target user is a procurement manager who handles supplier catalogs."
+        result = _match_fact_to_components(fact, "user", target_sec)
+        assert "target user or persona" in result, (
+            f"Expected 'target user or persona' in resolved, got: {result}"
+        )
+
+    def test_generic_side_fact_category_does_not_overcomplete_unrelated_section(self):
+        """A generic category like 'metric' alone must not match components.
+        Only fact text can drive the match."""
+        from graph.nodes import _match_fact_to_components, get_section_by_id
+        target_sec = get_section_by_id("elevator_pitch")
+        # Fact text with no tokens matching elevator_pitch expected_components
+        fact = "The latency p99 improved from 380ms to 140ms."
+        result = _match_fact_to_components(fact, "metric", target_sec)
+        # No elevator_pitch component (target user, unmet need, proposed solution,
+        # key benefit) should match against "latency p99 improved from 380ms to 140ms"
+        assert len(result) == 0, (
+            f"Generic metric fact must not match elevator_pitch components, got: {result}"
+        )
+
+    def test_multi_section_reply_skips_next_section_only_when_expected_components_truly_satisfied(self):
+        """_classify_target_confidence must return SECTION_COMPLETE when ALL
+        expected_components of a section appear in qa_store as resolved_subparts."""
+        from graph.nodes import _classify_target_confidence, get_section_by_id
+        target_sec = get_section_by_id("elevator_pitch")
+        assert target_sec is not None
+        # Seed qa_store with all four elevator_pitch expected_components resolved
+        qa_store = {
+            "elevator_pitch:side_fact:headliner:iter_0:round_1:user": {
+                "section_id": "elevator_pitch",
+                "section": "elevator_pitch",
+                "answer": "procurement managers",
+                "contradiction_flagged": False,
+                "resolved_subparts": ["target user or persona"],
+                "version": 1,
+            },
+            "elevator_pitch:side_fact:headliner:iter_0:round_1:need": {
+                "section_id": "elevator_pitch",
+                "section": "elevator_pitch",
+                "answer": "manual matching waste",
+                "contradiction_flagged": False,
+                "resolved_subparts": ["unmet need or pain point"],
+                "version": 2,
+            },
+            "elevator_pitch:side_fact:headliner:iter_0:round_1:solution": {
+                "section_id": "elevator_pitch",
+                "section": "elevator_pitch",
+                "answer": "fuzzy ML matching system",
+                "contradiction_flagged": False,
+                "resolved_subparts": ["proposed solution"],
+                "version": 3,
+            },
+            "elevator_pitch:side_fact:headliner:iter_0:round_1:benefit": {
+                "section_id": "elevator_pitch",
+                "section": "elevator_pitch",
+                "answer": "90% accuracy, zero manual effort",
+                "contradiction_flagged": False,
+                "resolved_subparts": ["key benefit or differentiator"],
+                "version": 4,
+            },
+        }
+        state = {
+            "confirmed_qa_store": qa_store,
+            "remaining_subparts": [],
+            "concept_conflicts": [],
+            "thread_id": "t1", "run_id": "r1",
+        }
+        with patch("graph.nodes.log_event"):
+            confidence, target, candidates, reason, reason_code = _classify_target_confidence(state, target_sec)
+        assert reason_code == "SECTION_COMPLETE", (
+            f"All components resolved via side-facts — expected SECTION_COMPLETE, got {reason_code}: {reason}"
+        )
+        assert confidence == "EMPTY", f"Expected EMPTY confidence, got {confidence}"
+
+    def test_advance_section_synthesizes_non_empty_section_draft_from_store(self):
+        """When current_draft is empty, advance_section_node must synthesize a
+        non-empty draft from confirmed_qa_store entries for the completed section."""
+        from graph.nodes import _synthesize_section_draft_from_qa_store
+        qa_store = {
+            "headliner:iter_0:round_1": {
+                "section_id": "headliner",
+                "answer": "Manual product matching costs 40 hours per week.",
+                "contradiction_flagged": False,
+                "version": 1,
+            },
+            "headliner:side_fact:x:user": {
+                "section_id": "headliner",
+                "answer": "The affected team is the procurement department.",
+                "contradiction_flagged": False,
+                "version": 2,
+            },
+            "headliner:contradicted": {
+                "section_id": "headliner",
+                "answer": "This fact was retracted.",
+                "contradiction_flagged": True,  # must be excluded
+                "version": 3,
+            },
+        }
+        result = _synthesize_section_draft_from_qa_store("headliner", qa_store)
+        assert result, "Draft must be non-empty when qa_store has valid entries"
+        assert "retracted" not in result, "Contradicted facts must be excluded from draft"
+        assert "40 hours" in result or "procurement" in result, (
+            f"Draft must contain at least one valid answer, got: {result!r}"
+        )

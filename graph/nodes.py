@@ -174,6 +174,320 @@ def _get_llm() -> ChatGoogleGenerativeAI:
     return ChatGoogleGenerativeAI(model=model, temperature=0)
 
 
+# ── Cross-section completion helpers ─────────────────────────────────────────
+
+def get_section_by_id(section_id: str):
+    """Look up a PRDSection by its id string. Returns None if not found."""
+    return next((s for s in PRD_SECTIONS if s.id == section_id), None)
+
+
+def _match_fact_to_components(fact_text: str, category: str, target_section) -> list:
+    """Return expected_components from target_section that are confidently
+    evidenced by fact_text using normalized token overlap.
+
+    Rules:
+    - Split each component name into significant tokens (len > 3).
+    - Require >= 50% of those tokens to appear verbatim (case-insensitive) in
+      the fact text for the component to be considered resolved.
+    - Category string is *not* used as the primary signal — it may serve as a
+      weak secondary hint in future but currently adding zero logic for it so
+      that generic categories like 'tool' or 'risk' cannot over-complete sections.
+    - Returns an empty list when fact_text is blank or target_section is None.
+    """
+    import re as _re
+    if not fact_text or not target_section:
+        return []
+    norm_fact = fact_text.lower()
+    matched = []
+    for comp in target_section.expected_components:
+        tokens = [t for t in _re.split(r"\W+", comp.lower()) if len(t) > 3]
+        if not tokens:
+            continue
+        hits = sum(1 for t in tokens if t in norm_fact)
+        if hits / len(tokens) >= 0.5:
+            matched.append(comp)
+    return matched
+
+
+def _synthesize_section_draft_from_qa_store(section_id: str, qa_store: dict) -> str:
+    """Build a plain-text bullet draft for section_id from confirmed_qa_store.
+
+    Used when current_draft is empty (section advanced via early-exit side-fact
+    path without going through the LLM draft node).
+
+    Rules:
+    - Includes only non-contradicted entries for this section_id.
+    - Deduplicates identical answer strings.
+    - Prefers the latest version when two entries have the same answer.
+    """
+    seen: set = set()
+    lines: list = []
+    # Sort by version descending so latest facts win deduplication
+    entries = sorted(
+        [(k, v) for k, v in qa_store.items()
+         if v.get("section_id") == section_id and not v.get("contradiction_flagged")],
+        key=lambda kv: kv[1].get("version", 0),
+        reverse=True,
+    )
+    for _, v in entries:
+        answer = (v.get("answer") or "").strip()
+        if answer and answer not in seen:
+            seen.add(answer)
+            lines.append(f"- {answer}")
+    return "\n".join(lines)
+
+
+# ── PDF Report helpers ─────────────────────────────────────────────
+
+def _build_section_summaries(prd_sections: dict, qa_store: dict) -> list:
+    """━━━━ T1 — canonical-data-aware section summary builder ━━━━
+
+    For each PRD section, in canonical order:
+      1. Use prd_sections[section.id] prose when present and non-empty.
+      2. Fall back to synthesizing from qa_store (deduplicated, latest-first).
+      3. Cross-normalise: deduplicate bullet lines that appear in BOTH sources.
+      4. Mark sections with no usable content as is_empty=True (T2).
+
+    Returns list of {id, title, prose, is_empty}.
+    Decision for empty sections: include them in the report under a clearly
+    labeled \u201cIncomplete / Not finalized\u201d note rather than silently omitting
+    (consistent, reviewable audit trail).
+    """
+    import re as _re
+
+    def _normalize(text: str) -> str:
+        return _re.sub(r"^[\-\u2022\*]\s*", "", text.strip()).lower()
+
+    summaries = []
+    for section in PRD_SECTIONS:
+        draft = (prd_sections.get(section.id) or "").strip()
+        synth = _synthesize_section_draft_from_qa_store(section.id, qa_store).strip()
+
+        # Merge and deduplicate lines from both sources
+        seen_norms: set = set()
+        final_lines: list = []
+        for line in (draft + "\n" + synth).splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            norm = _normalize(line)
+            if norm and norm not in seen_norms:
+                seen_norms.add(norm)
+                final_lines.append(line)
+
+        prose = "\n".join(final_lines).strip()
+        summaries.append({
+            "id": section.id,
+            "title": section.title,
+            "prose": prose,
+            "is_empty": not prose,
+        })
+    return summaries
+
+
+def _build_executive_summary(summaries: list, state: dict) -> str:
+    """━━━━ T3 — deterministic-first executive summary ━━━━
+
+    Primary path (always succeeds):
+      Take the first sentence of the first 4 non-empty section prose
+      blocks and join them into a short paragraph.
+
+    Optional LLM enrichment:
+      If the deterministic result is very short, attempt one bounded
+      LLM call. Any exception — including timeout — is caught silently;
+      the deterministic result is used as the safe fallback.
+    """
+    import re as _re
+
+    non_empty = [s for s in summaries if not s["is_empty"]]
+    sentences: list = []
+    for s in non_empty[:4]:
+        first_sent = _re.split(r"\.\s+", s["prose"].replace("\n", " "))[0].strip().strip("-\u2022*").strip()
+        if first_sent:
+            sentences.append(first_sent)
+
+    deterministic = " ".join(sentences)
+    if not deterministic:
+        return "This document summarises the requirements gathered during the elicitation session."
+
+    # Optional LLM enrichment (T3: strict try/except, never raises)
+    if len(deterministic) < 120 and non_empty:
+        try:
+            import signal as _signal
+
+            def _timeout_handler(signum, frame):
+                raise TimeoutError("executive_summary_llm_timeout")
+
+            prompt_text = (
+                "Write a single concise paragraph (3–5 sentences) summarising this project.\n"
+                "Focus on: goal, core problem, proposed solution, expected outcome.\n"
+                "Do not use internal labels, section names, or debug tokens.\n\n"
+                + "\n".join(s["prose"][:300] for s in non_empty[:4])
+            )
+            _signal.signal(_signal.SIGALRM, _timeout_handler)
+            _signal.alarm(8)  # 8-second hard timeout
+            try:
+                llm = _get_llm()
+                enriched = llm.invoke(prompt_text).content.strip()
+                if enriched and len(enriched) >= len(deterministic):
+                    deterministic = enriched
+            finally:
+                _signal.alarm(0)  # always cancel alarm
+        except Exception:
+            pass  # deterministic fallback ensures this never raises
+
+    return deterministic
+
+
+def _render_pdf(
+    report_title: str,
+    generated_at: str,
+    executive_summary: str,
+    summaries: list,
+) -> bytes:
+    """━━━━ T4 / T5 — PDF renderer using fpdf2 ━━━━
+
+    Returns rendered PDF bytes on success, b"" on any failure.
+    Never raises — all FPDF exceptions are caught and logged via stderr.
+    """
+    try:
+        from fpdf import FPDF  # type: ignore[import]
+
+        class _PRD_PDF(FPDF):  # type: ignore[misc]
+            _title: str = ""
+            _ts: str = ""
+
+            def header(self):
+                self.set_font("Helvetica", "B", 10)
+                self.set_text_color(100, 100, 100)
+                self.cell(0, 8, self._title, align="L", new_x="LMARGIN", new_y="NEXT")
+                self.ln(2)
+
+            def footer(self):
+                self.set_y(-14)
+                self.set_font("Helvetica", "", 8)
+                self.set_text_color(150, 150, 150)
+                self.cell(0, 8, f"Page {self.page_no()} | {self._ts}", align="C")
+
+        pdf = _PRD_PDF(orientation="P", unit="mm", format="A4")
+        pdf.set_margins(left=20, top=20, right=20)
+        pdf.set_auto_page_break(auto=True, margin=20)
+        pdf._title = report_title
+        pdf._ts = generated_at
+        pdf.add_page()
+
+        # ── Title block ──
+        pdf.set_font("Helvetica", "B", 22)
+        pdf.set_text_color(30, 30, 30)
+        pdf.multi_cell(0, 10, "Requirements Summary Report", align="L")
+        pdf.set_font("Helvetica", "", 11)
+        pdf.set_text_color(80, 80, 80)
+        pdf.multi_cell(0, 7, report_title, align="L")
+        pdf.set_font("Helvetica", "I", 9)
+        pdf.set_text_color(130, 130, 130)
+        pdf.multi_cell(0, 6, f"Generated: {generated_at}", align="L")
+        pdf.ln(6)
+
+        # ── Executive Summary ──
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.set_text_color(30, 30, 30)
+        pdf.multi_cell(0, 8, "Executive Summary", align="L")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(50, 50, 50)
+        pdf.multi_cell(0, 6, executive_summary, align="L")
+        pdf.ln(6)
+
+        # ── Requirements by section ──
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.set_text_color(30, 30, 30)
+        pdf.multi_cell(0, 8, "Requirements by Section", align="L")
+        pdf.ln(2)
+
+        for s in summaries:
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.set_text_color(40, 40, 40)
+            pdf.multi_cell(0, 7, s["title"], align="L")
+            pdf.set_font("Helvetica", "", 10)
+            if s["is_empty"]:
+                pdf.set_text_color(160, 80, 0)
+                pdf.multi_cell(0, 6, "[Incomplete / Not finalized]", align="L")
+            else:
+                pdf.set_text_color(50, 50, 50)
+                pdf.multi_cell(0, 6, s["prose"], align="L")
+            pdf.ln(4)
+
+        # ── Open Questions ──
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.set_text_color(30, 30, 30)
+        pdf.multi_cell(0, 8, "Open Questions / Assumptions", align="L")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(50, 50, 50)
+        pdf.multi_cell(0, 6, "No major open questions captured.", align="L")
+        pdf.ln(6)
+
+        # ── Next Steps ──
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.set_text_color(30, 30, 30)
+        pdf.multi_cell(0, 8, "Next Steps", align="L")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(50, 50, 50)
+        for step in [
+            "\u2022 Validate requirements with stakeholders",
+            "\u2022 Estimate implementation scope and effort",
+            "\u2022 Draft implementation plan",
+        ]:
+            pdf.multi_cell(0, 6, step, align="L")
+
+        return bytes(pdf.output())
+
+    except Exception as _pdf_err:  # noqa: BLE001
+        import sys
+        print(f"[finalize_node] PDF render failed: {_pdf_err}", file=sys.stderr)
+        return b""
+
+
+def _build_markdown(
+    report_title: str,
+    generated_at: str,
+    executive_summary: str,
+    summaries: list,
+) -> str:
+    """Build the markdown fallback /companion document."""
+    lines = [
+        "# Requirements Summary Report",
+        f"**{report_title}**",
+        f"_Generated: {generated_at}_",
+        "",
+        "## Executive Summary",
+        "",
+        executive_summary,
+        "",
+        "## Requirements by Section",
+        "",
+    ]
+    for s in summaries:
+        lines.append(f"### {s['title']}")
+        lines.append("")
+        if s["is_empty"]:
+            lines.append("_Incomplete / Not finalized_")
+        else:
+            lines.append(s["prose"])
+        lines.append("")
+
+    lines += [
+        "## Open Questions / Assumptions",
+        "",
+        "No major open questions captured.",
+        "",
+        "## Next Steps",
+        "",
+        "- Validate requirements with stakeholders",
+        "- Estimate implementation scope and effort",
+        "- Draft implementation plan",
+    ]
+    return "\n".join(lines)
+
+
 def _format_prd_so_far(prd_sections: dict) -> str:
     """Render accumulated PRD sections as readable markdown."""
     if not prd_sections:
@@ -1773,17 +2087,86 @@ def _apply_repeat_guard(response: dict | str, recent_q_history: list[str], state
                         )
     return is_semantic_repeat, new_q_text, {"reason": decision_reason}
 
+def _extract_pain_points_from_store(state: "PRDState") -> tuple[list[str], str]:
+    """
+    Scans confirmed_qa_store and the latest user answer for concrete pain points.
+    Returns (pain_point_phrases, raw_evidence_text).
+    Pain points are short descriptive phrases extracted from user answers.
+    """
+    qa_store = state.get("confirmed_qa_store", {})
+    raw_answer = state.get("raw_answer_buffer", "")
+    
+    # Collect all answer text from this section
+    section_index = state.get("section_index", 0)
+    evidence_texts = []
+    try:
+        section = get_section_by_index(section_index)
+        for v in qa_store.values():
+            if v.get("section_id") == section.id and not v.get("contradiction_flagged"):
+                ans = v.get("answer", "")
+                if ans:
+                    evidence_texts.append(ans)
+    except (IndexError, AttributeError):
+        pass
+    
+    if raw_answer.strip():
+        evidence_texts.append(raw_answer.strip())
+    
+    combined = " ".join(evidence_texts).lower()
+    if not combined or len(combined) < 20:
+        return [], ""
+    
+    # Extract pain-point indicators from the evidence
+    pain_indicators = []
+    pain_keywords = [
+        ("manual", "manual process"),
+        ("time-consuming", "time-consuming work"),
+        ("error", "error-prone process"),
+        ("mismatch", "data mismatches"),
+        ("duplicate", "duplicate entries"),
+        ("outdated", "outdated information"),
+        ("slow", "slow turnaround"),
+        ("tedious", "tedious workflow"),
+        ("inconsistent", "inconsistent data"),
+        ("broken", "broken workflow"),
+        ("missing", "missing information"),
+        ("costly", "costly operation"),
+        ("frustrat", "user frustration"),
+        ("bottleneck", "process bottleneck"),
+        ("spreadsheet", "spreadsheet-based process"),
+        ("excel", "Excel-based workflow"),
+        ("copy", "manual copy-paste"),
+        ("paste", "manual copy-paste"),
+        ("rework", "rework cycles"),
+        ("delay", "processing delays"),
+    ]
+    
+    seen_phrases = set()
+    for keyword, phrase in pain_keywords:
+        if keyword in combined and phrase not in seen_phrases:
+            pain_indicators.append(phrase)
+            seen_phrases.add(phrase)
+    
+    return pain_indicators, combined
+
+
 def _generate_context_aware_fallback(state: "PRDState") -> str:
     """
     Deterministically generates the best possible fallback question when the LLM
     fails to extract a structured response, avoiding lazy 'Tell me more' strings.
+    
     History-aware: checks recent_questions to avoid repeating the same question.
+    Inference-led: when concrete pain points exist in the canonical store or current
+    answer, generates questions that reference the observed pain and state the
+    inferred goal before asking a focused confirmation question.
+    
     Priority:
     1. Active blocker / remaining subpart (non-phantom)
     2. Concept conflict
     3. Image/screen context
-    4. Unresolved section component from canonical registry
-    5. Generic goal fallback (with history dedup)
+    4. Inference-led question from observed pain points
+    5. Unresolved section component from canonical registry
+    6. Generic goal fallback (with history dedup)
     """
     recent = state.get("recent_questions", [])
     recent_lower = [q.lower() for q in recent]
@@ -1809,7 +2192,6 @@ def _generate_context_aware_fallback(state: "PRDState") -> str:
             q = f"I'm still missing some details about the {subpart}. Could you clarify what is expected there?"
         if _not_recently_asked(q):
             return q
-        # If the blocker-based question was recently asked, fall through to other options
         
     # 2. Concept Conflicts
     conflicts = state.get("concept_conflicts", [])
@@ -1825,7 +2207,41 @@ def _generate_context_aware_fallback(state: "PRDState") -> str:
         if _not_recently_asked(q):
             return q
     
-    # 4. Unresolved section components from canonical registry
+    # 4. Inference-led question from observed pain points (R1-R4)
+    pain_points, evidence = _extract_pain_points_from_store(state)
+    if pain_points:
+        # Build the inference-led question
+        if len(pain_points) == 1:
+            pain_summary = pain_points[0]
+        elif len(pain_points) == 2:
+            pain_summary = f"{pain_points[0]} and {pain_points[1]}"
+        else:
+            pain_summary = f"{', '.join(pain_points[:-1])}, and {pain_points[-1]}"
+        
+        # Map pain points to likely goals
+        goal_inference = "streamline this workflow"
+        if any(p in pain_summary for p in ["manual", "tedious", "copy-paste", "Excel", "spreadsheet"]):
+            goal_inference = "reduce manual effort and automate the process"
+        if any(p in pain_summary for p in ["error", "mismatch", "inconsistent", "duplicate"]):
+            if "manual" in pain_summary or "Excel" in pain_summary:
+                goal_inference = "reduce manual effort and prevent data errors"
+            else:
+                goal_inference = "eliminate data quality issues"
+        if "bottleneck" in pain_summary or "slow" in pain_summary or "delay" in pain_summary:
+            goal_inference = "remove processing bottlenecks and speed up turnaround"
+        
+        # Generate focused confirmation questions per inferred goal
+        confirmation_options = [
+            f"From what you've described — {pain_summary} — it sounds like your main goal is to {goal_inference}. Is that the core problem, or is there a deeper issue driving this?",
+            f"Based on the {pain_summary} you mentioned, it seems like the priority is to {goal_inference}. Is that right, or is there a different outcome you're targeting?",
+            f"You've highlighted {pain_summary}. It appears the goal is to {goal_inference}. What would success specifically look like once this is solved?",
+        ]
+        
+        for q in confirmation_options:
+            if _not_recently_asked(q):
+                return q
+    
+    # 5. Unresolved section components from canonical registry
     section_index = state.get("section_index")
     if section_index is not None:
         try:
@@ -1841,13 +2257,19 @@ def _generate_context_aware_fallback(state: "PRDState") -> str:
             for comp in section.expected_components:
                 comp_norm = comp.lower().replace(" ", "_")
                 if comp not in resolved_components and comp_norm not in resolved_components:
-                    q = f"I'm still missing some details about {comp}. Could you share what you have in mind?"
+                    # If we have pain points, make this inference-led too
+                    if pain_points:
+                        pain_ref = pain_points[0]
+                        q = f"Given the {pain_ref} you described, I'd like to understand {comp}. Could you share what you have in mind?"
+                    else:
+                        q = f"I'm still missing some details about {comp}. Could you share what you have in mind?"
                     if _not_recently_asked(q):
                         return q
         except (IndexError, AttributeError):
             pass
         
-    # 5. Generic Goal Fallback (with history dedup)
+    # 6. Generic Goal Fallback (with history dedup)
+    # These are only used when NO pain points have been observed
     generic_options = [
         "I'm missing one key piece of context: what specific problem are you trying to solve here?",
         "Could you describe what the ideal end state looks like once this is built?",
@@ -2262,7 +2684,7 @@ def _is_synthetic_blocker(blocker: str, canonical_set: set[str]) -> bool:
     # If it doesn't match any canonical root at all, it's also non-canonical (either synthetic or new)
     return blocker not in canonical_set
 
-def _classify_target_confidence(state: "PRDState", section) -> tuple[str, str | None, list[str], str]:
+def _classify_target_confidence(state: "PRDState", section) -> tuple[str, str | None, list[str], str, str]:
     """
     Deterministic target selection for the two-lane question generation architecture.
     
@@ -2271,11 +2693,13 @@ def _classify_target_confidence(state: "PRDState", section) -> tuple[str, str | 
     This prevents starvation after parser fallback or blocker pipeline gaps.
     
     Returns:
-        (confidence, target, candidates, reason)
+        (confidence, target, candidates, reason, reason_code)
         - confidence: "STRONG" | "MODERATE" | "WEAK" | "EMPTY"
         - target: the selected blocker name (only for STRONG)
         - candidates: list of valid candidate blockers
-        - reason: human-readable classification reason (T2)
+        - reason: human-readable classification reason
+        - reason_code: structured enum-style code for routing decisions (T2):
+            CONFLICT, SINGLE_CANONICAL, MULTI_CANONICAL, SYNTHETIC_ONLY, SECTION_COMPLETE
     """
     remaining = list(state.get("remaining_subparts", []))
     conflicts = state.get("concept_conflicts", [])
@@ -2332,27 +2756,39 @@ def _classify_target_confidence(state: "PRDState", section) -> tuple[str, str | 
     if conflicts:
         conflict_target = conflicts[0].get("surface", conflicts[0].get("concept_key", "concept"))
         return ("STRONG", conflict_target, [],
-                f"Active conflict on '{conflict_target}'{rehydration_note}")
+                f"Active conflict on '{conflict_target}'{rehydration_note}",
+                "CONFLICT")
     
     # D1: STRONG — exactly one canonical unresolved blocker
     if len(canonical_unresolved) == 1:
         target = canonical_unresolved[0]
         return ("STRONG", target, [],
-                f"Exactly one canonical unresolved blocker: '{target}'{rehydration_note}")
+                f"Exactly one canonical unresolved blocker: '{target}'{rehydration_note}",
+                "SINGLE_CANONICAL")
     
     # D2: MODERATE — multiple canonical candidates
     if len(canonical_unresolved) > 1:
         return ("MODERATE", None, canonical_unresolved,
-                f"Multiple canonical candidates remain: {canonical_unresolved}{rehydration_note}")
+                f"Multiple canonical candidates remain: {canonical_unresolved}{rehydration_note}",
+                "MULTI_CANONICAL")
     
     # D3: WEAK — only synthetic/stale blockers remain
     if synthetic_unresolved:
         return ("WEAK", None, synthetic_unresolved,
-                f"Only synthetic/stale blockers remain: {synthetic_unresolved}{rehydration_note}")
+                f"Only synthetic/stale blockers remain: {synthetic_unresolved}{rehydration_note}",
+                "SYNTHETIC_ONLY")
     
-    # D4: EMPTY — truly nothing left (all components resolved)
+    # D4: EMPTY — truly nothing left
+    # SECTION_COMPLETE only when the canonical registry is non-empty (real section).
+    # If the registry is empty (e.g. MagicMock, missing config), Lane B inference
+    # should still fire because we cannot confirm the section is actually done.
+    if canonical_components_original:
+        return ("EMPTY", None, [],
+                f"All section components resolved in QA store{rehydration_note}",
+                "SECTION_COMPLETE")
     return ("EMPTY", None, [],
-            f"All section components resolved in QA store{rehydration_note}")
+            f"No canonical components available to evaluate{rehydration_note}",
+            "NO_REGISTRY")
 
 def generate_questions_node(state: "PRDState") -> dict:
     import time
@@ -2407,11 +2843,40 @@ def generate_questions_node(state: "PRDState") -> dict:
     # At most 2 LLM calls (Lane A → Lane B demotion on duplicate)
     # Terminal: deterministic last-resort via _generate_context_aware_fallback
     
-    confidence, target, candidates, classification_reason = _classify_target_confidence(state, section)
+    confidence, target, candidates, classification_reason, reason_code = _classify_target_confidence(state, section)
     log_event(**ctx, level="INFO", event_type="target_confidence_classified",
               message=f"Target confidence: {confidence}",
               confidence=confidence, target=target, candidates=candidates,
-              reason=classification_reason)
+              reason=classification_reason, reason_code=reason_code)
+    
+    # ── Section-complete early exit (F1/F2/F3) ───────────────────────────────
+    # When all canonical components are resolved, skip LLM entirely and
+    # return no_question_available so the router advances to draft.
+    if confidence == "EMPTY" and reason_code == "SECTION_COMPLETE":
+        import time
+        duration_ms = int((time.monotonic() - ctx.get("_t0", time.monotonic())) * 1000)
+        log_event(**ctx, level="INFO", event_type="section_complete_detected",
+                  message="All canonical components resolved — skipping question generation",
+                  reason=classification_reason, reason_code=reason_code,
+                  duration_ms=duration_ms)
+        return _enforce_visibility({
+            "generation_status": "no_question_available",
+            "generation_reason": f"Section complete: {classification_reason}",
+            "selected_candidate_id": "",
+            "duplicate_details": {"total_candidates_evaluated": 0, "rejection_reasons": []},
+            "current_questions": "",
+            "content_segments": [],
+            "current_question_object": {},
+            "remaining_subparts": [],
+            "active_question_id": "",
+            "active_question_type": "",
+            "active_question_options": [],
+            "question_status": "COMPLETE",
+            "resolved_option_id": "",
+            "answered_at": "",
+            "recent_questions": state.get("recent_questions", []),
+            "repair_instruction": "",
+        }, "", section.title if section else "Unknown", state["section_index"], state.get("iteration", 0), event_type="elicit")
     
     base_prompt = _build_elicitor_prompt_context(state, section, bridge_output)
     
@@ -3713,6 +4178,12 @@ def detect_impact_node(state: PRDState) -> dict:
             sf_key = f"{target_sid}:side_fact:{concept_key_base}:{sf['category']}"
 
             if sf_key not in existing_store:  # deduplicate
+                # Derive resolved_subparts from fact text vs target section components.
+                # Category is NOT used as the primary signal (too brittle).
+                _sf_target_sec = get_section_by_id(target_sid)
+                _resolved_sps = _match_fact_to_components(
+                    sf["fact"], sf["category"], _sf_target_sec
+                )
                 side_store_updates[sf_key] = {
                     "fact_id": sf_id,
                     "answer": sf["fact"],
@@ -3724,6 +4195,7 @@ def detect_impact_node(state: PRDState) -> dict:
                     "source_round": len(qa_pairs),
                     "contradiction_flagged": False,
                     "version": current_version,
+                    "resolved_subparts": _resolved_sps,  # enables SECTION_COMPLETE detection
                 }
                 
                 # Telemetry
@@ -4529,9 +5001,15 @@ def advance_section_node(state: PRDState) -> dict:
         next_section=next_section_name, is_complete=is_complete,
     )
 
+    # Synthesize a draft from qa_store when current_draft is empty
+    # (section completed via side-fact early-exit path rather than LLM draft)
+    section_draft = state.get("current_draft") or _synthesize_section_draft_from_qa_store(
+        section.id, state.get("confirmed_qa_store", {})
+    )
+
     return {
-        # Persist the approved draft (merge reducer adds it to the dict)
-        "prd_sections": {section.id: state["current_draft"]},
+        # Persist the approved draft (or synthesized fallback)
+        "prd_sections": {section.id: section_draft},
         # Advance navigation
         "section_index": next_index,
         "is_complete": is_complete,
@@ -4556,6 +5034,16 @@ def advance_section_node(state: PRDState) -> dict:
         "pending_concept_updates": {},
         "answer_confirmation_status": "",
         "draft_execution_mode": "",
+        # Reset generation tracking for new section — critical:
+        # generation_status must not carry "no_question_available" from the
+        # previous section's section-complete exit into the new section's first
+        # question generation pass, or route_after_generate_questions will send
+        # the new section directly to draft instead of await_answer.
+        "generation_status": "question_generated",
+        "generation_reason": "",
+        # remaining_subparts are section-specific; reset so the new section's
+        # canonical rehydration can seed fresh targets.
+        "remaining_subparts": [],
         "pending_interrupt_type": "question",
         "interrupt_queue": [],
         # Phase 1 hybrid — reset per-turn impact state
