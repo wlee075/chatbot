@@ -178,7 +178,7 @@ def route_after_numeric_validation(state: PRDState) -> str:
 
 def route_after_answer(state: PRDState) -> str:
     """
-    Standard events (ANSWER, REPLY_TO_MESSAGE) → enter numeric check gate.
+    Standard events (ANSWER, REPLY_TO_MESSAGE) → answer_validity gate first.
     Tagged events (TAG_MESSAGE_AS_TRUTH, CORRECT_MESSAGE) → handle directly,
       bypassing the validation gate since the UI already identified the exact message.
     Intercept: if uploaded_files are populated, route to file_upload_intake.
@@ -189,13 +189,41 @@ def route_after_answer(state: PRDState) -> str:
         return "terminal_session"
     if event_type in ("SUBMIT_SESSION_CONTEXT", "REMOVE_SESSION_CONTEXT", "REVERT_SESSION_CONTEXT"):
         return "handle_tagged_event"
-        
+
     if state.get("uploaded_files"):
         return "file_upload_intake"
-        
+
     if event_type in ("TAG_MESSAGE_AS_TRUTH", "CORRECT_MESSAGE"):
         return "handle_tagged_event"
-    return "numeric_validation"
+    # All standard ANSWER / REPLY_TO_MESSAGE paths go through the validity gate first
+    return "answer_validity"
+
+
+def route_after_answer_validity(state: PRDState) -> str:
+    """
+    REJECTED → back to await_answer so the user can retype.
+              (clarification message is already in chat_history;
+               raw_answer_buffer was cleared by answer_validity_node)
+    PASSED   → continue to numeric_validation as normal.
+    """
+    status = state.get("answer_guardrail_status", "PASSED")
+    if status == "REJECTED":
+        route = "await_answer"
+    else:
+        route = "numeric_validation"
+
+    log_event(
+        thread_id=state.get("thread_id", ""),
+        run_id=state.get("run_id", ""),
+        node_name="route_after_answer_validity",
+        level="INFO",
+        event_type="routing_decision",
+        message=f"Routing after answer_validity: {status} → {route}",
+        route=route,
+        reason=status,
+        guardrail_reason=state.get("answer_guardrail_reason", ""),
+    )
+    return route
 
 
 def route_after_intent(state: PRDState) -> str:

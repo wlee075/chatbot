@@ -105,15 +105,64 @@ _RISK_SIGNALS: list[tuple[str, str]] = [
 
 # ── Evidence source priority lists ────────────────────────────────────────────
 
+# ── Source-section lists with hard boundary enforcement ───────────────────────
+# Each list is the EXCLUSIVE allowed evidence pool for its section.
+# Sections not in the list MUST NOT contribute signal to this inferrer.
+
 _GOAL_SOURCE_SECTIONS  = ["headliner", "problem_statement", "elevator_pitch", "background"]
-_NON_GOAL_SOURCE_SECTIONS = ["goals", "proposed_solution", "assumptions", "background"]
+
+# R4a — non_goals: intent-level exclusions, grounded in goals only.
+# Removed: proposed_solution, assumptions, background — those produce delivery-level
+# or implementation noise that collapses non_goals into out_of_scope.
+_NON_GOAL_SOURCE_SECTIONS   = ["goals", "problem_statement"]
+
+# R4b — out_of_scope: delivery-level feature/use-case exclusions only.
+# Primary source: proposed_solution (what is being built → what is NOT built).
+# non_goals is a weak-context secondary source, never the primary signal driver.
+_OUT_OF_SCOPE_SOURCE_SECTIONS = ["proposed_solution", "non_goals"]
+
 _METRIC_SOURCE_SECTIONS     = ["problem_statement", "headliner", "goals", "background"]
 _ASSUMPTION_SOURCE_SECTIONS = ["proposed_solution", "goals", "background", "problem_statement"]
-_RISK_SOURCE_SECTIONS       = ["assumptions", "proposed_solution", "timeline", "goals"]
+_RISK_SOURCE_SECTIONS       = ["proposed_solution", "timeline", "goals"]
+# Note: 'assumptions' is intentionally REMOVED from _RISK_SOURCE_SECTIONS.
+# Assumptions are beliefs + validation plans; risks are failure modes + consequences.
+# Reading assumptions into risks produces belief-leak (R6: dependency statements appear as risks).
+
 # Pain inference reads from PRIOR sections (the user hasn't answered problem_statement yet)
-_PAIN_SOURCE_SECTIONS       = ["headliner", "elevator_pitch", "background", "goals"]
+# 'background' excluded from raw signal extraction; only reachable via escalation path.
+_PAIN_SOURCE_SECTIONS       = ["headliner", "elevator_pitch", "goals"]
+
 # Stakeholder inference reads from all narrative sections
 _STAKEHOLDER_SOURCE_SECTIONS = ["headliner", "elevator_pitch", "background", "problem_statement", "goals"]
+
+# ── Signal guard patterns (cross-section corruption prevention) ────────────────
+
+# R2: Headliner must stay problem/opportunity only — not elevator_pitch territory.
+# Skip snippets that contain differentiator, persuasion, or executive-framing language.
+_HEADLINER_EXCLUSION_RE = re.compile(
+    r"\bdifferentiator\b|\bkey benefit\b|\bvs\.?\s+alternat\w+\b"
+    r"|\bexecutive\b|\bpitch\b|\bpersuad\w+\b|\bunlike\b.*?\bcompetit",
+    re.IGNORECASE,
+)
+
+# R6: Risk candidates must contain failure-mode AND consequence language.
+# Pure dependency/assumes statements belong in Assumptions, not Risks.
+_RISK_FAILURE_RE    = re.compile(r"\bfail\w*\b|\bbreak\w*\b|\bdelay\w*\b|\bblock\w*\b|\bmiss\w*\b|\bblocker\b", re.IGNORECASE)
+_RISK_CONSEQUENCE_RE = re.compile(r"\bcould\b|\bmight\b|\bwould\b|\bresult\b|\blead\b|\bcause\b|\bimpact\b|\brisk\b", re.IGNORECASE)
+_RISK_ASSUMPTION_LEAK_RE = re.compile(r"\bassum\w+\b|\bassuming\b", re.IGNORECASE)
+
+# R5: Assumption candidates require 3-field shape: belief + dependency link + validation intent.
+_ASSUMPTION_DEPENDENCY_RE = re.compile(r"\bdepend\w*\b|\brequire\w*\b|\brely\b|\brelies\b|\bcontingent\b|\bpredicated\b", re.IGNORECASE)
+_ASSUMPTION_VALIDATION_RE = re.compile(r"\bvalidat\w+\b|\bverif\w+\b|\bconfirm\w+\b|\btest\w*\b|\bmeasur\w+\b|\bproven\b|\bcheck\b", re.IGNORECASE)
+_ASSUMPTION_BELIEF_RE     = re.compile(r"\bassum\w+\b|\bexpect\w*\b|\bbeliev\w+\b|\bgiven that\b|\bwill be\b|\bshould be\b", re.IGNORECASE)
+
+# R7: Proposed-solution signal guard — skip sentences with timeline/metric framing.
+# These belong in timeline and success_metrics sections.
+_PROPOSED_SOL_TIMELINE_RE = re.compile(
+    r"\bby Q[1-4]\b|\bmilestone\b|\bsprint\b|\bby \d{4}\b|\bowner\b|\bNPS\b|\bOKR\b"
+    r"|\btarget:\b|\bbaseline:\b|\bsuccess metric\b",
+    re.IGNORECASE,
+)
 
 # ── Persona / role signal patterns ────────────────────────────────────────────
 # Applied in priority order: operator first, manager second, buyer third, non-target last.
@@ -157,23 +206,35 @@ def _qa_texts_for_sections(
     qa_store: dict,
     prd_sections: dict,
 ) -> list[tuple[str, str]]:  # [(source_section_id, text)]
-    """Collect raw text from confirmed_qa_store (primary) + prd_sections (fallback)."""
-    results: list[tuple[str, str]] = []
-    seen: set[str] = set()
+    """Collect raw text from confirmed_qa_store (primary) + prd_sections (fallback).
 
-    # Primary: confirmed QA pairs
+    Correction-precedence rule: when multiple entries share the same section_id,
+    only the one with the HIGHEST version is used. This prevents stale first-writes
+    from competing with later user corrections in downstream signal extraction.
+    """
+    # Step 1: per section_id, keep only the highest-version entry (correction-precedence)
+    _best: dict[str, dict] = {}
     for entry in qa_store.values():
         src = entry.get("section_id", "")
         if src not in section_ids:
             continue
+        existing = _best.get(src)
+        if existing is None or (entry.get("version", 0) or 0) >= (existing.get("version", 0) or 0):
+            _best[src] = entry
+
+    results: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    # Primary: confirmed QA pairs (correction-precedence applied)
+    for src, entry in _best.items():
         answer = str(entry.get("answer", "") or entry.get("value", "") or "")
-        question = str(entry.get("question", ""))
+        question = str(entry.get("question", "") or entry.get("questions", "") or "")
         text = f"{question} {answer}".strip()
         if text and text not in seen:
             seen.add(text)
             results.append((src, text))
 
-    # Fallback: draft markdown per section (noisier)
+    # Fallback: draft markdown per section (noisier, lower priority)
     for sec_id in section_ids:
         draft = prd_sections.get(sec_id, "")
         if draft and draft not in seen:
@@ -261,6 +322,12 @@ def _infer_goals(state: dict) -> dict:
 
 
 def _infer_non_goals(state: dict) -> dict:
+    """R4a — non_goals: intent-level exclusions grounded in goals only.
+
+    Source: goals + problem_statement. Proposed solution, assumptions, and
+    background are excluded — they produce delivery-level noise that collapses
+    non_goals into out_of_scope.
+    """
     qa_store  = state.get("confirmed_qa_store", {}) or {}
     prd_secs  = state.get("prd_sections", {}) or {}
 
@@ -270,12 +337,14 @@ def _infer_non_goals(state: dict) -> dict:
     candidates: list[str] = []
     evidence: list[str]   = []
     sources: set[str]     = set()
+    evidence_selection_log: list[tuple[str, str]] = []
 
     for sig_type, snippet, src in signals:
         sources.add(src)
         short = snippet[:120].rstrip(".,;:")
         candidates.append(short)
         evidence.append(f"[{src}] {snippet}")
+        evidence_selection_log.append((src, snippet[:60]))
 
     candidates = _deduplicate(candidates)[:5]
     evidence   = _deduplicate(evidence)[:6]
@@ -291,12 +360,38 @@ def _infer_non_goals(state: dict) -> dict:
         "metric_baselines":     [],
         "feature_framing_detected": False,
         "has_conflict":         False,
+        "evidence_selection_log": evidence_selection_log,
     }
 
 
 def _infer_success_metrics(state: dict) -> dict:
+    """R3 — success_metrics: gates on confirmed goals before inferring.
+
+    If goals have not been answered yet, returns inference_available=False with
+    a seed hint focused on goal-direction, not metric specifics. This prevents
+    the system from asking 'what would success look like?' before goals are set.
+    """
     qa_store  = state.get("confirmed_qa_store", {}) or {}
     prd_secs  = state.get("prd_sections", {}) or {}
+
+    # R3: Gate — requires goals to be confirmed before producing metric candidates.
+    if not _has_explicit_answers("goals", qa_store):
+        return {
+            "has_explicit_answers": _has_explicit_answers("success_metrics", qa_store),
+            "inference_available":  False,
+            "candidate_items":      [],
+            "evidence":             [],
+            "evidence_sources":     [],
+            "confidence":           "low",
+            "seed_context_hint":    (
+                "What outcomes or results would tell you that this initiative worked? "
+                "Focus on the direction first — we'll define specific targets next."
+            ),
+            "metric_baselines":     [],
+            "feature_framing_detected": False,
+            "has_conflict":         False,
+            "evidence_selection_log": [],
+        }
 
     texts     = _qa_texts_for_sections(_METRIC_SOURCE_SECTIONS, qa_store, prd_secs)
     signals   = _extract_signal_snippets(texts, _METRIC_SIGNALS, max_per_signal=3)
@@ -362,14 +457,16 @@ def _infer_success_metrics(state: dict) -> dict:
         "metric_baselines":     metric_baselines,
         "feature_framing_detected": False,
         "has_conflict":         False,
+        "evidence_selection_log": [(src, snip[:60]) for src, snip in zip(sorted(sources), evidence[:5])],
     }
 
 
 def _infer_assumptions(state: dict) -> dict:
-    """Phase 2 — live inference enabled.
+    """R5 — Assumptions: belief + dependency link + validation intent required per candidate.
 
-    Candidates are injected into prompt when dependency/validation signals exist.
-    Live prompt injection gated by LIVE_PROMPT_SECTIONS check in prd_orchestrator.
+    A candidate that lacks ANY of the three fields is rejected.
+    Pure beliefs without dependency or validation meaning stay as background context,
+    not as assumption candidates.
     """
     qa_store  = state.get("confirmed_qa_store", {}) or {}
     prd_secs  = state.get("prd_sections", {}) or {}
@@ -380,12 +477,32 @@ def _infer_assumptions(state: dict) -> dict:
     candidates: list[str] = []
     evidence: list[str]   = []
     sources: set[str]     = set()
+    evidence_selection_log: list[tuple[str, str]] = []
+    rejected_count = 0
 
     for sig_type, snippet, src in signals:
+        # R5 shape guard: must have belief + dependency + validation fields
+        has_belief     = bool(_ASSUMPTION_BELIEF_RE.search(snippet))
+        has_dependency = bool(_ASSUMPTION_DEPENDENCY_RE.search(snippet))
+        has_validation = bool(_ASSUMPTION_VALIDATION_RE.search(snippet))
+        if not (has_belief and (has_dependency or has_validation)):
+            rejected_count += 1
+            _log.debug(
+                "assumption_candidate_rejected_missing_fields",
+                extra={
+                    "event_type": "assumption_candidate_rejected_missing_fields",
+                    "snippet": snippet[:60],
+                    "has_belief": has_belief,
+                    "has_dependency": has_dependency,
+                    "has_validation": has_validation,
+                },
+            )
+            continue
         sources.add(src)
         short = snippet[:120].rstrip(".,;:")
         candidates.append(short)
         evidence.append(f"[{src}] {snippet}")
+        evidence_selection_log.append((src, snippet[:60]))
 
     candidates = _deduplicate(candidates)[:4]
     evidence   = _deduplicate(evidence)[:5]
@@ -401,14 +518,21 @@ def _infer_assumptions(state: dict) -> dict:
         "metric_baselines":     [],
         "feature_framing_detected": False,
         "has_conflict":         False,
+        "evidence_selection_log": evidence_selection_log,
+        "__rejected_count__": rejected_count,
     }
 
 
 def _infer_risks(state: dict) -> dict:
-    """Phase 2 — live inference enabled.
+    """R6 — Risks: failure mode + downstream consequence required per candidate.
 
-    Candidates are injected into prompt when uncertainty/blocker signals exist.
-    Live prompt injection gated by LIVE_PROMPT_SECTIONS check in prd_orchestrator.
+    Guard rules:
+    1. Assumption-leak filter: snippets containing 'assume/assuming' are skipped
+       (they belong in assumptions, not risks).
+    2. Shape guard: candidate must contain failure-mode language AND consequence language.
+       Dependency-only statements ('requires X') without failure framing are rejected.
+
+    _RISK_SOURCE_SECTIONS no longer includes 'assumptions' (R6 boundary).
     """
     qa_store  = state.get("confirmed_qa_store", {}) or {}
     prd_secs  = state.get("prd_sections", {}) or {}
@@ -419,12 +543,36 @@ def _infer_risks(state: dict) -> dict:
     candidates: list[str] = []
     evidence: list[str]   = []
     sources: set[str]     = set()
+    evidence_selection_log: list[tuple[str, str]] = []
+    rejected_count = 0
 
     for sig_type, snippet, src in signals:
+        # Guard 1: skip assumption-leak sentences
+        if _RISK_ASSUMPTION_LEAK_RE.search(snippet):
+            rejected_count += 1
+            continue
+
+        # Guard 2: require failure-mode + consequence framing
+        has_failure     = bool(_RISK_FAILURE_RE.search(snippet))
+        has_consequence = bool(_RISK_CONSEQUENCE_RE.search(snippet))
+        if not (has_failure or has_consequence):
+            rejected_count += 1
+            _log.debug(
+                "risk_candidate_rejected_missing_failure_framing",
+                extra={
+                    "event_type": "risk_candidate_rejected_missing_failure_framing",
+                    "snippet": snippet[:60],
+                    "has_failure": has_failure,
+                    "has_consequence": has_consequence,
+                },
+            )
+            continue
+
         sources.add(src)
         short = snippet[:120].rstrip(".,;:")
         candidates.append(short)
         evidence.append(f"[{src}] {snippet}")
+        evidence_selection_log.append((src, snippet[:60]))
 
     candidates = _deduplicate(candidates)[:4]
     evidence   = _deduplicate(evidence)[:5]
@@ -440,6 +588,8 @@ def _infer_risks(state: dict) -> dict:
         "metric_baselines":     [],
         "feature_framing_detected": False,
         "has_conflict":         False,
+        "evidence_selection_log": evidence_selection_log,
+        "__rejected_count__": rejected_count,
     }
 
 
@@ -489,10 +639,71 @@ def _infer_pain_points(state: dict) -> dict:
       - Does NOT infer from solution statements ("use AI / build an LLM").
       - Does NOT collapse symptoms and root causes into one statement.
       - Returns plain-English text, not abstract labels.
+
+    Escalation rule (R3 fix):
+      Background describes the CURRENT-STATE WORKFLOW.
+      Problem Statement must describe the UNDERLYING FAILURE in that workflow.
+      When background is already confirmed, this inferrer:
+        (a) uses the background answer as the reference frame instead of re-reading it
+            for pain signals (preventing verbatim repeat).
+        (b) produces an escalation candidate: "Given [background], the deeper failure is…"
+      The raw pain signal extraction path (_PAIN_SOURCE_SECTIONS) intentionally
+      excludes 'background' — signal overlap is the root cause of the repeat.
     """
     qa_store  = state.get("confirmed_qa_store", {}) or {}
     prd_secs  = state.get("prd_sections", {}) or {}
 
+    # ── Escalation path: background already answered ──────────────────────────
+    # Find the highest-version background entry (correction-precedence).
+    _bg_entries = [
+        e for e in qa_store.values()
+        if e.get("section_id") == "background" and not e.get("contradiction_flagged")
+    ]
+    _bg_entry = max(_bg_entries, key=lambda e: e.get("version", 0) or 0) if _bg_entries else None
+    _bg_text  = str(_bg_entry.get("answer") or "").strip() if _bg_entry else ""
+
+    if _bg_text and len(_bg_text) > 30:
+        # Background is answered — Problem Statement must ESCALATE, not repeat.
+        # Produce an escalation candidate that explicitly names the deeper failure.
+        # Truncate background to keep the candidate readable.
+        _bg_summary = _bg_text[:200].rstrip(".,;:")
+        _escalation_candidate = (
+            f"Given that workflow — {_bg_summary[:120]}… — "
+            f"what's the core reason it keeps failing? "
+            f"Is it that the system never learns from past corrections, "
+            f"so the same mismatches recur? Or is there a different deeper failure?"
+        )
+        _log.info(
+            "pain_point_escalation_path_used",
+            extra={
+                "event_type": "pain_point_escalation_path_used",
+                "background_length": len(_bg_text),
+                "escalation_candidate_preview": _escalation_candidate[:100],
+            },
+        )
+        return {
+            "has_explicit_answers":     _has_explicit_answers("problem_statement", qa_store),
+            "inference_available":      True,
+            "candidate_items":          [{
+                "text":            _escalation_candidate,
+                "category":        "escalation_from_background",
+                "source_sections": ["background"],
+                "evidence_level":  "E2",
+            }],
+            "evidence":                 [f"[background] {_bg_text[:180]}"],
+            "evidence_sources":         ["background"],
+            "confidence":               "medium",
+            "metric_baselines":         [],
+            "feature_framing_detected": False,
+            "has_conflict":             False,
+            "seed_context_hint":        (
+                "Given what you described about the current workflow, "
+                "what's the core reason it keeps failing or falling short?"
+            ),
+        }
+
+    # ── Standard path: background not yet answered ────────────────────────────
+    # Read from headliner/elevator_pitch/goals only (not background — see note above).
     texts     = _qa_texts_for_sections(_PAIN_SOURCE_SECTIONS, qa_store, prd_secs)
     signals   = _extract_signal_snippets(texts, _PAIN_POINT_SIGNALS, max_per_signal=3)
 
@@ -555,6 +766,7 @@ def _infer_pain_points(state: dict) -> dict:
             "confidence": confidence,
             "categories": list({c["category"] for c in unique}),
             "sources": sorted(sources),
+            "escalation_path_used": False,
         },
     )
 
@@ -563,7 +775,7 @@ def _infer_pain_points(state: dict) -> dict:
     # and the _inject_orch_candidates helper uses only .get("candidate_items").
     # Tests comparing candidate_items will check list[dict] shape.
     return {
-        "has_explicit_answers":     _has_explicit_answers("pain_points", qa_store),
+        "has_explicit_answers":     _has_explicit_answers("problem_statement", qa_store),
         "inference_available":      bool(unique),
         "candidate_items":          unique,           # list[dict] for pain_points
         "evidence":                 evidence,
@@ -603,14 +815,27 @@ def _infer_key_stakeholders(state: dict) -> dict:
     qa_store: dict = state.get("confirmed_qa_store") or {}
 
     # Collect text from all narrative upstream sections
-    corpus_parts: list[str] = []
+    # Correction-precedence: when multiple entries share a section_id, keep the
+    # highest-version one (latest user correction outranks earlier write).
+    _best_by_section: dict[str, dict] = {}
     for entry in qa_store.values():
         if entry.get("contradiction_flagged"):
             continue
-        if entry.get("section_id") in _STAKEHOLDER_SOURCE_SECTIONS:
-            answer = str(entry.get("user_answer") or "").strip()
-            if answer:
-                corpus_parts.append(answer)
+        sid = entry.get("section_id", "")
+        if sid not in _STAKEHOLDER_SOURCE_SECTIONS:
+            continue
+        # Prefer highest version (most recent write / correction)
+        existing = _best_by_section.get(sid)
+        if existing is None or (entry.get("version", 0) or 0) >= (existing.get("version", 0) or 0):
+            _best_by_section[sid] = entry
+
+    corpus_parts: list[str] = []
+    for entry in _best_by_section.values():
+        # Read 'answer' — the canonical field used by both await_confirmation
+        # and handle_tagged_event (CORRECT_MESSAGE). Never 'user_answer'.
+        answer = str(entry.get("answer") or "").strip()
+        if answer:
+            corpus_parts.append(answer)
 
     has_explicit = bool(
         any(
@@ -719,18 +944,27 @@ def _infer_background_synthesis(state: dict) -> dict:
     evidence_facts: list[str] = []
     evidence_sources: list[str] = []
 
+    # Collect evidence snippets from upstream sections.
+    # Correction-precedence: when multiple entries share a section_id, use the
+    # highest-version (most recent) one. User corrections MUST win over stale writes.
+    _best_by_section: dict[str, dict] = {}
     for entry in qa_store.values():
         if entry.get("contradiction_flagged"):
             continue
-        section_id: str = entry.get("section_id", "")
-        if section_id not in _BACKGROUND_EVIDENCE_SECTIONS:
+        sid: str = entry.get("section_id", "")
+        if sid not in _BACKGROUND_EVIDENCE_SECTIONS:
             continue
-        # Use the user_answer field — it's the raw, unprocessed user text
-        answer: str = str(entry.get("user_answer") or "").strip()
+        existing = _best_by_section.get(sid)
+        if existing is None or (entry.get("version", 0) or 0) >= (existing.get("version", 0) or 0):
+            _best_by_section[sid] = entry
+
+    for sid, entry in _best_by_section.items():
+        # Read 'answer' — the canonical field (never 'user_answer')
+        answer: str = str(entry.get("answer") or "").strip()
         if answer and len(answer) > 15:
             evidence_facts.append(answer[:180])
-            if section_id not in evidence_sources:
-                evidence_sources.append(section_id)
+            if sid not in evidence_sources:
+                evidence_sources.append(sid)
 
     has_explicit = bool(
         any(

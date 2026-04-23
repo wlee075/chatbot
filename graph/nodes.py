@@ -3411,6 +3411,12 @@ def _format_deterministic_propose_question(plan: dict, section) -> str:
 
     Returns empty string if candidates cannot be formatted (caller falls through
     to LLM-constrained path).
+
+    Corruption guards enforced here:
+    - Nested opener phrases (prior assistant text re-wrapped) → discard or recover
+    - Unmatched/trailing inline quotes from snippet truncation → strip
+    - Dangling word fragments at end of truncated text → trim or discard
+    - Clean evidence is synthesised INTO prose, never quoted inline as display text
     """
     candidates = plan.get("candidate_items", [])
     section_id = plan.get("target_section_id", section.id if section else "")
@@ -3419,36 +3425,108 @@ def _format_deterministic_propose_question(plan: dict, section) -> str:
     if not candidates:
         return ""
 
-    # Normalize candidates to plain English labels
-    def _label(c) -> str:  # type: ignore[return]
-        if isinstance(c, dict):
-            text = c.get("text", "") or c.get("answer", "")
-            category = c.get("category", "")
-            category_label = (
-                f" (related to {category.replace('_', ' ')})" if category else ""
-            )
-            return f"{str(text)[:180]}{category_label}"
-        return str(c)[:180]
+    # ── Corruption detection patterns ───────────────────────────────────────────
+    _NESTED_OPENER_RE = re.compile(
+        r"^(from what you'?ve shared|based on what you'?ve|here'?s my read|it sounds like"
+        r"|i'?m still missing|tell me more|could you share what|what problem is being solved)",
+        re.IGNORECASE,
+    )
+    _DANGLING_TAIL_RE = re.compile(r'\s+\S{1,3}["\u201c\u201d]?\s*$')
 
-    labels = [_label(c) for c in candidates[:3] if _label(c).strip()]
+    def _sanitize_candidate_text(raw: str) -> str:
+        """Return clean display text, or '' if the candidate is a corrupt fragment."""
+        text = raw.strip()
+        if not text:
+            return ""
+
+        # R4: strip nested opener wrappers (prior assistant prompt text)
+        if _NESTED_OPENER_RE.match(text):
+            parts = re.split(r'(?<=[.?!])\s+', text, maxsplit=1)
+            text = parts[1].strip() if len(parts) > 1 else ""
+            if not text:
+                return ""
+
+        # R3: strip leading/trailing quotation marks left by snippet stitching
+        text = re.sub(r'^[\s"\u201c\u201d]+', '', text)
+        text = re.sub(r'["\u201c\u201d]+\s*$', '', text).rstrip()
+
+        # R2: trim dangling short-token tail (e.g. '...Wh"' or '...De')
+        if _DANGLING_TAIL_RE.search(text):
+            text = _DANGLING_TAIL_RE.sub('', text).strip()
+
+        text = text.rstrip('.,;:')
+
+        # Require a meaningful minimum length after all surgery
+        return text if len(text) >= 20 else ""
+
+    # Normalize candidates to clean, plain-English display labels
+    def _label(c) -> str:
+        if isinstance(c, dict):
+            raw = c.get("text", "") or c.get("answer", "") or ""
+        else:
+            raw = str(c)
+        # Guard: never use text longer than 200 chars directly
+        return _sanitize_candidate_text(str(raw)[:200])
+
+    raw_labels = [_label(c) for c in candidates[:3]]
+    labels     = [lb for lb in raw_labels if lb]
+
+    log_event(
+        thread_id="", run_id="", node_name="deterministic_formatter",
+        level="INFO", event_type="deterministic_formatter_candidate_sanitization",
+        message="Candidate sanitization results",
+        section_id=section_id, action=action,
+        raw_count=len(raw_labels), clean_count=len(labels),
+        discarded_count=len(raw_labels) - len(labels),
+        clean_previews=[lb[:80] for lb in labels],
+    )
+
     if not labels:
+        log_event(
+            thread_id="", run_id="", node_name="deterministic_formatter",
+            level="WARNING", event_type="deterministic_formatter_all_candidates_rejected",
+            message="All candidates rejected by corruption guards — returning empty (LLM fallback)",
+            section_id=section_id,
+        )
         return ""
 
-    # PROPOSE_ONE: single focused candidate — confirm or correct
+    # ── PROPOSE_ONE: synthesise prose from clean evidence — do NOT inline-quote it ──
+    # The old pattern was: f'"From what...\" "{labels[0]}\".'
+    # That produces double-opener corruption when labels[0] itself starts with an opener.
+    # New pattern: write a sentence ABOUT the evidence, not a sentence CONTAINING it as a quote.
     if action == "PROPOSE_ONE" or len(labels) == 1:
-        return (
-            f"From what you've shared, it sounds like the main focus here is: "
-            f"\"{labels[0]}\". "
-            f"Is that accurate, or would you frame it differently?"
+        # Lowercase first char so it reads naturally after the opener
+        body = labels[0][0].lower() + labels[0][1:] if labels[0] else ""
+        synthesis = (
+            f"From what you've shared, the current state seems to be that "
+            f"{body}. "
+            f"Is that the right picture, or would you frame it differently?"
         )
+        log_event(
+            thread_id="", run_id="", node_name="deterministic_formatter",
+            level="INFO", event_type="deterministic_formatter_propose_one_assembled",
+            message="PROPOSE_ONE assembled (clean synthesis)",
+            section_id=section_id, synthesis_preview=synthesis[:120],
+        )
+        return synthesis
 
-    # PROPOSE_LIST: multiple candidates — list and ask confirm/refine
-    bullets = "\n".join(f"  \u2022 {lab}" for lab in labels)
-    return (
+    # ── PROPOSE_LIST: one bullet per clean candidate ──────────────────────────────
+    bullets = "\n".join(
+        f"  \u2022 {lb[0].upper() + lb[1:]}" for lb in labels
+    )
+    synthesis = (
         f"Based on what you've described so far, here's what I'm understanding "
         f"for {section_title}:\n{bullets}\n\n"
         f"Does that capture it, or is something missing or off?"
     )
+    log_event(
+        thread_id="", run_id="", node_name="deterministic_formatter",
+        level="INFO", event_type="deterministic_formatter_propose_list_assembled",
+        message="PROPOSE_LIST assembled (clean synthesis)",
+        section_id=section_id, bullet_count=len(labels),
+        synthesis_preview=synthesis[:120],
+    )
+    return synthesis
 
 
 def _inject_orch_candidates(base_prompt: str, plan: dict) -> str:
@@ -3691,11 +3769,30 @@ def generate_questions_node(state: "PRDState") -> dict:
         if orch_action == ACTION_DIRECT_ELICIT:
             pass  # fall through — two-lane handles this
         elif orch_action in (ACTION_PROPOSE_ONE, ACTION_PROPOSE_LIST):
-            _orch_base_prompt_override = "PROPOSE" if is_live else None
+            # PROPOSE + live → deterministic propose formatter (no LLM).
+            # PROPOSE + not_live → inject candidates as constraint block (LLM still runs).
+            # Previously this was None (silence), which let two-lane fallback to SEED.
+            _orch_base_prompt_override = "PROPOSE" if is_live else "PROPOSE_CONSTRAINED"
         elif orch_action == ACTION_SEED_QUESTION:
             _orch_base_prompt_override = "SEED"   # inject seed regardless of live status
         elif orch_action == ACTION_TRADEOFF_QUESTION:
             _orch_base_prompt_override = "TRADEOFF"  # inject tradeoff regardless
+
+        # — Full ActionPlan debug log (captures every field for debuggability) —
+        log_event(
+            **ctx, level="INFO", event_type="orchestrator_action_plan_full",
+            message="Full ActionPlan fields",
+            target_section_id=orch_plan.get("target_section_id", ""),
+            recommended_action=orch_action,
+            confidence=orch_plan.get("confidence", ""),
+            candidate_count=len(orch_plan.get("candidate_items", [])),
+            candidate_items=orch_plan.get("candidate_items", []),
+            seed_context_hint=orch_plan.get("seed_context_hint", "")[:120],
+            is_live_prompt_eligible=is_live,
+            section_jumped=orch_plan.get("section_jumped", False),
+            reasoning_summary=orch_plan.get("reasoning_summary", "")[:120],
+            prompt_override_assigned=_orch_base_prompt_override,
+        )
 
     except Exception as _orch_err:
         import logging as _logging
@@ -3793,6 +3890,26 @@ def generate_questions_node(state: "PRDState") -> dict:
             section_id=section.id, action=orch_action,
             candidate_count=len(orch_plan.get("candidate_items", [])),
             path="llm_constrained",
+        )
+    elif _orch_base_prompt_override == "PROPOSE_CONSTRAINED":
+        # PROPOSE + not_live: cannot deterministically format (no live injection gate),
+        # but we still constrain the LLM with candidate context so it asks an anchored
+        # confirm/correct question rather than a generic seed opener.
+        base_prompt = _inject_orch_candidates(base_prompt, orch_plan)
+        log_event(
+            **ctx, level="INFO",
+            event_type="orchestrator_prompt_override_applied",
+            message="Candidate constraint injected (PROPOSE_CONSTRAINED — not-live section, LLM phrasing path)",
+            section_id=section.id, action=orch_action,
+            candidate_count=len(orch_plan.get("candidate_items", [])),
+            path="propose_constrained",
+        )
+        log_event(
+            **ctx, level="INFO",
+            event_type="orchestrator_branch_selected",
+            message="Branch: PROPOSE_CONSTRAINED (evidence-rich, not-live section)",
+            recommended_action=orch_action, branch_taken="propose_constrained",
+            current_section_id=section.id,
         )
     elif _orch_base_prompt_override == "SEED":
         base_prompt = _inject_seed_hint(base_prompt, orch_plan)

@@ -43,6 +43,72 @@ def _has_reversal(text: str) -> bool:
     return any(r in tl for r in _REVERSAL_MARKERS)
 
 
+def answer_validity_node(state: PRDState) -> dict:
+    """Pre-commit response quality gate.
+
+    Runs immediately after await_answer and before numeric_validation.
+    Prevents accidental keystrokes (e.g. 'ñ', '.', 'aaaa') from advancing
+    section state or being echoed as confirmed facts.
+
+    Decision:
+      PASSED  → no-op; downstream nodes proceed normally
+      REJECTED → gentle clarification emitted; raw_answer_buffer cleared;
+                 downstream numeric_validation / intent_classifier skipped
+                 via route_after_answer_validity router.
+    """
+    import uuid as _uuid
+    from utils.answer_guardrail import check_answer_quality
+
+    ctx = _log_ctx(state, "answer_validity")
+    raw_answer = state.get("raw_answer_buffer", "").strip()
+    question   = state.get("current_questions", "").strip()
+
+    # Image-only submissions are always valid (no text required)
+    if not raw_answer and state.get("uploaded_files"):
+        log_event(**ctx, level="INFO", event_type="answer_guardrail_passed",
+                  message="Image-only submission — guardrail bypassed", reason="image_only")
+        return {"answer_guardrail_status": "PASSED"}
+
+    result = check_answer_quality(raw_answer, question)
+
+    if result.passed:
+        log_event(**ctx, level="INFO", event_type="answer_guardrail_passed",
+                  message="Answer quality check passed",
+                  reason=result.reason, score=result.score,
+                  input_length=len(raw_answer))
+        return {"answer_guardrail_status": "PASSED"}
+
+    # ── Reject path ──────────────────────────────────────────────────────────
+    log_event(**ctx, level="WARNING", event_type="answer_guardrail_triggered",
+              message="Answer quality check REJECTED input — clarification prompted",
+              reason=result.reason, score=result.score,
+              input_length=len(raw_answer),
+              **{f"signal_{k}": v for k, v in result.signals.items()})
+
+    section_index = state.get("section_index", 0)
+    try:
+        section_title = get_section_by_index(section_index).title
+    except Exception:
+        section_title = ""
+
+    clarification_msg = {
+        "role":     "assistant",
+        "msg_id":   f"msg_{str(_uuid.uuid4())[:8]}",
+        "type":     "answer_validity_clarification",
+        "content":  result.clarification_prompt,
+        "run_id":   state.get("run_id", ""),
+        "section":  section_title,
+    }
+
+    return {
+        "answer_guardrail_status": "REJECTED",
+        "answer_guardrail_reason": result.reason,
+        # Clear the buffer so echo_generation / truth_commit cannot touch it
+        "raw_answer_buffer": "",
+        "chat_history": [clarification_msg],
+    }
+
+
 def numeric_validation_node(state: PRDState) -> dict:
     """1a. Numeric Validation Node"""
     raw_answer = state.get("raw_answer_buffer", "").strip()
@@ -57,6 +123,7 @@ def numeric_validation_node(state: PRDState) -> dict:
             "reply_intent": "NUMERIC_ERROR"
         }
     return {}
+
 
 def intent_classifier_node(state: PRDState) -> dict:
     """1. Intent Classifier Node"""

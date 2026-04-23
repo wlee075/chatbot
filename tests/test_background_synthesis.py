@@ -19,9 +19,10 @@ from utils.section_inference import infer_section_candidates
 def _qa(section_id: str, answer: str) -> dict:
     return {
         "section_id": section_id,
-        "user_answer": answer,
+        "answer": answer,          # canonical field; matches confirmed_qa_store schema
         "contradiction_flagged": False,
         "resolved_subparts": [],
+        "version": 1,
     }
 
 

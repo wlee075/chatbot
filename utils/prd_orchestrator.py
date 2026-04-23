@@ -505,8 +505,47 @@ def inference_first_prd_orchestrator(state: dict, section: Any) -> dict:
         action = ACTION_PROPOSE_LIST
         reasoning = f"Strong evidence for {section_title}. Propose 2–3 candidates for confirm/correct/extend."
 
+    # ── Rich First-Turn Evidence Guardrail ────────────────────────────────────
+    # If the latest user turn already contains ≥3 rich evidence signals
+    # (pain, failure mode, baseline, target metric, mechanism, approval dependency)
+    # the SEED_QUESTION path is FORBIDDEN. Downgrading a rich answer to a generic
+    # opener wastes a turn and signals the system isn't listening.
+    _RICH_SIGNAL_PATTERNS = [
+        re.compile(r"\b(manual|manually|human.validat|by hand|handl)\b", re.I),       # operational pain
+        re.compile(r"\b(fail|broken|error|miss|inconsist|corrupt|chaos|UOM|GTIN)\b", re.I),  # failure modes
+        re.compile(r"\b(\d+\s*%|accuracy|precision|recall)\b", re.I),                # current baseline
+        re.compile(r"\b(\d+\s*(second|minute|hour|min|sec)|latency|throughput)\b", re.I),  # target metric
+        re.compile(r"\b(pipeline|automat|model|self.correct|algorithm|ML|AI)\b", re.I),  # mechanism
+        re.compile(r"\b(sign.off|approv|log.access|review.queue|clearance|stakeholder)\b", re.I), # approval
+    ]
+    _latest_turn = snapshot.get("latest_user_turn", "") or ""
+    _rich_signal_count = sum(1 for p in _RICH_SIGNAL_PATTERNS if p.search(_latest_turn))
+    _is_rich_first_turn = _rich_signal_count >= 3
+
+    if _is_rich_first_turn and action == ACTION_SEED_QUESTION:
+        # Evidence-rich input: promote to PROPOSE_ONE regardless of is_live.
+        # The user already gave us a full problem frame — seed questions are insulting.
+        action = ACTION_PROPOSE_ONE if not candidates else action
+        # If there are no inferrer candidates yet (first turn, no QA store),
+        # use the latest turn text as the sole candidate summary.
+        if not candidates:
+            candidates = [
+                (_latest_turn[:200] + "…") if len(_latest_turn) > 200 else _latest_turn
+            ]
+        _log.info(
+            "orchestrator_rich_first_turn_guardrail",
+            extra={
+                "event_type": "orchestrator_rich_first_turn_guardrail",
+                "section_id": section_id,
+                "rich_signal_count": _rich_signal_count,
+                "prior_action": ACTION_SEED_QUESTION,
+                "promoted_to": ACTION_PROPOSE_ONE,
+            },
+        )
+
     # Override action to SEED_QUESTION for non-live sections (observe-only — T2)
-    if not is_live and action in (ACTION_PROPOSE_ONE, ACTION_PROPOSE_LIST, ACTION_TRADEOFF_QUESTION):
+    # Exception: rich first-turn evidence bypasses this downgrade.
+    if not is_live and not _is_rich_first_turn and action in (ACTION_PROPOSE_ONE, ACTION_PROPOSE_LIST, ACTION_TRADEOFF_QUESTION):
         action = ACTION_SEED_QUESTION  # observing; don't inject live yet
 
     # ── Persona stance — propagated to question generator for continuity guardrail ──
