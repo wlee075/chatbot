@@ -188,7 +188,7 @@ def get_pdf_download_state(pct: int) -> dict:
     if pct < 80:
         return {
             "enabled": False,
-            "label": "🔒 Reach 80% to unlock PDF",
+            "label": "🔒 Download PDF",
             "btn_type": "secondary",
             "badge": "",
             "hint": f"{pct}% complete — reach 80% to enable PDF export",
@@ -196,14 +196,14 @@ def get_pdf_download_state(pct: int) -> dict:
     if pct < 100:
         return {
             "enabled": True,
-            "label": "📥 Download Draft PDF",
+            "label": "📥 Download PDF",
             "btn_type": "secondary",
             "badge": "Draft",
             "hint": f"{pct}% complete — draft export available",
         }
     return {
         "enabled": True,
-        "label": "📥 Download Final PDF",
+        "label": "📥 Download PDF",
         "btn_type": "primary",
         "badge": "Complete",
         "hint": "100% complete — final report ready",

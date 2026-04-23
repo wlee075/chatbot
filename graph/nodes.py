@@ -33,6 +33,15 @@ from utils.logger import log_event
 from utils.llm_logger import llm_invoke, flush_turn_summary
 from utils.telemetry import log_canonical_write, log_integrity_failure, log_suppression_decision
 from utils.validator import IntegrityValidator
+from utils.prd_orchestrator import (
+    inference_first_prd_orchestrator,
+    ACTION_SEED_QUESTION,
+    ACTION_PROPOSE_ONE,
+    ACTION_PROPOSE_LIST,
+    ACTION_TRADEOFF_QUESTION,
+    ACTION_NO_QUESTION_NEEDED,
+    ACTION_DIRECT_ELICIT,
+)
 import html
 from enum import Enum
 from typing import TypedDict, Optional
@@ -2353,6 +2362,35 @@ def _build_elicitor_prompt_context(state: "PRDState", section, bridge_output: di
         conversation_understanding=json.dumps(bridge_output, indent=2, default=str)
     )
 
+    # ── Evidence-first inference (Goals / Non-goals / Success Metrics) ────────
+    # Query the deterministic helper and inject a candidate-confirmation block
+    # or a seed block into the prompt.  No LLM call is added.
+    _INFERENCE_SECTIONS = {"goals", "non_goals", "success_metrics"}
+    if section.id in _INFERENCE_SECTIONS:
+        from utils.section_inference import infer_section_candidates
+        from prompts.templates import (
+            INFERENCE_CANDIDATE_BLOCK,
+            INFERENCE_EVIDENCE_BLOCK,
+            INFERENCE_SEED_BLOCK,
+        )
+        _inf = infer_section_candidates(section.id, state)
+
+        if not _inf["has_explicit_answers"]:
+            if _inf["inference_available"] and _inf["candidate_items"]:
+                _bullets_e = "\n".join(f"• {e}" for e in _inf["evidence"])
+                _bullets_c = "\n".join(f"• {c}" for c in _inf["candidate_items"])
+                _inf_block = INFERENCE_CANDIDATE_BLOCK.format(
+                    bullet_evidence=_bullets_e,
+                    bullet_candidates=_bullets_c,
+                    section_title=section.title,
+                )
+            else:
+                _inf_block = INFERENCE_SEED_BLOCK.format(
+                    section_title=section.title,
+                    section_title_lower=section.title.lower(),
+                )
+            first_turn_block += f"\n\n{_inf_block}"
+
     system_prompt = ELICITOR_SYSTEM.format(
         section_title=section.title,
         section_description=section.description,
@@ -2372,10 +2410,28 @@ def _build_elicitor_prompt_context(state: "PRDState", section, bridge_output: di
     system_prompt += "\n\nCRITICAL UX RULE: Do not use internal reviewer terms like 'contradictory', 'ambiguous', 'blocker', 'rubric', 'missing components'. Explain what details you need using plain English. Ask EXACTLY ONE question."
     return system_prompt
 
-def _invoke_structured_question_generator(system_prompt: str, section, state: "PRDState") -> tuple[dict | str, float]:
+def _invoke_structured_question_generator(
+    system_prompt: str,
+    section,
+    state: "PRDState",
+    ctx: dict | None = None,
+    orch_plan: dict | None = None,
+) -> tuple[dict | str, float]:
     import time
+    import json
     llm = _get_llm()
-    
+
+    # ── O1 logging: full prompt before LLM call ─────────────────────────────────
+    if ctx:
+        log_event(
+            **ctx, level="DEBUG", event_type="question_prompt_full",
+            message="FULL PROMPT >>> sending to structured_question_generation",
+            target_section=getattr(section, "id", "unknown"),
+            prompt_preview=system_prompt[:800],
+            orchestrator_action=orch_plan.get("recommended_action") if orch_plan else None,
+            orchestrator_candidates=(orch_plan.get("candidate_items") or [])[:3] if orch_plan else [],
+        )
+
     t0 = time.monotonic()
     response = llm_invoke(
         llm.with_structured_output(
@@ -2404,7 +2460,21 @@ def _invoke_structured_question_generator(system_prompt: str, section, state: "P
         ],
         state=state, node_name="generate_questions_node", purpose="structured_question_generation"
     )
-    return response, (time.monotonic() - t0)
+    elapsed = time.monotonic() - t0
+
+    # ── O1 logging: raw LLM output before any normalization ──────────────────────
+    if ctx:
+        raw_preview = (
+            json.dumps(response)[:600] if isinstance(response, dict)
+            else str(response)[:600]
+        )
+        log_event(
+            **ctx, level="INFO", event_type="question_llm_raw_output",
+            message=f"RAW LLM OUTPUT >>> type={type(response).__name__}",
+            is_dict=isinstance(response, dict),
+            raw_preview=raw_preview,
+        )
+    return response, elapsed
 
 def _apply_repeat_guard(response: dict | str, recent_q_history: list[str], state: "PRDState", ctx: dict) -> tuple[bool, str, dict]:
     new_q_text = response.get("single_next_question", "") if isinstance(response, dict) else str(response)
@@ -2530,7 +2600,25 @@ def _generate_context_aware_fallback(state: "PRDState") -> str:
     """
     recent = state.get("recent_questions", [])
     recent_lower = [q.lower() for q in recent]
-    
+
+    # R5 guard: session freshness snapshot — always log so stale-state is diagnosable.
+    import logging as _log
+    _log.getLogger("prd_orchestrator").info(
+        "session_freshness_check",
+        extra={
+            "event_type": "session_freshness_check",
+            "is_new_session": len(state.get("confirmed_qa_store", {})) == 0 and len(state.get("conversation_history", [])) <= 1,
+            "qa_store_count": len(state.get("confirmed_qa_store", {})),
+            "mirror_fact_count": len(state.get("prd_sections", {})),
+            "contradiction_count": len([
+                c for c in state.get("concept_conflicts", [])
+                if isinstance(c, dict) and (c.get("surface") or c.get("concept_key"))
+            ]),
+            "chat_history_count": len(state.get("conversation_history", [])),
+            "section_index": state.get("section_index", 0),
+        },
+    )
+
     def _not_recently_asked(candidate: str) -> bool:
         c_lower = candidate.lower()
         return not any(
@@ -2538,7 +2626,7 @@ def _generate_context_aware_fallback(state: "PRDState") -> str:
             for r in recent_lower
             if len(r) > 10
         )
-    
+
     # 1. Remaining Subparts (skip phantom "clarification")
     PHANTOM_SUBPARTS = {"clarification", "fallback", "unknown"}
     blockers = [b for b in state.get("remaining_subparts", []) if b not in PHANTOM_SUBPARTS]
@@ -2553,10 +2641,15 @@ def _generate_context_aware_fallback(state: "PRDState") -> str:
         if _not_recently_asked(q):
             return q
         
-    # 2. Concept Conflicts
-    conflicts = state.get("concept_conflicts", [])
-    if conflicts:
-        target = conflicts[0].get("surface", conflicts[0].get("concept_key", "concept"))
+    # 2. Concept Conflicts — only fire if we actually have usable conflict objects.
+    # Guard: conflict must have a non-empty 'surface' or 'concept_key' field.
+    # Empty list, [{} ], or stale ghost entries must NOT trigger contradiction language.
+    _valid_conflicts = [
+        c for c in state.get("concept_conflicts", [])
+        if isinstance(c, dict) and (c.get("surface") or c.get("concept_key"))
+    ]
+    if _valid_conflicts:
+        target = _valid_conflicts[0].get("surface") or _valid_conflicts[0].get("concept_key", "concept")
         q = f"I'm seeing conflicting details about the {target}. Which version is correct?"
         if _not_recently_asked(q):
             return q
@@ -2664,21 +2757,146 @@ def _fallback_for_hard_blocker(remaining_subparts: list[str]) -> dict:
         "options": []
     }
 
-def _normalize_generated_question(response: dict | str, state: "PRDState", ctx: dict) -> tuple[dict, str]:
+def _orch_plan_to_fallback(orch_plan: dict | None, section, state: "PRDState") -> str:
+    """Stage 4/5 last-mile formatter.
+
+    Converts an ActionPlan into a user-facing question when the LLM has failed
+    structured extraction.  Returns empty string if no usable intelligence.
+    Mirrors the deterministic short-circuit in generate_questions_node but is
+    used as the final safety net when the LLM path collapses.
+    """
+    if not orch_plan:
+        return ""
+    action   = orch_plan.get("recommended_action", "")
+    candidates = [c for c in (orch_plan.get("candidate_items") or []) if isinstance(c, str) and c.strip()]
+    seed_hint  = orch_plan.get("seed_context_hint", "") or ""
+    section_title = (
+        getattr(section, "title", None)
+        or (orch_plan.get("target_section_title"))
+        or "this section"
+    )
+
+    if action in ("PROPOSE_ONE", "PROPOSE_LIST") and candidates:
+        # Already have high-quality inferred candidates — reflect them directly.
+        deterministic = _format_deterministic_propose_question(orch_plan, section)
+        if deterministic:
+            import logging as _log
+            _log.getLogger("prd_orchestrator").info(
+                "orchestrator_parser_fallback_override",
+                extra={
+                    "event_type": "orchestrator_parser_fallback_override",
+                    "action": action,
+                    "candidate_count": len(candidates),
+                    "path": "propose_formatter",
+                },
+            )
+            return deterministic
+
+    if action == "SEED_QUESTION" and seed_hint:
+        import logging as _log
+        _log.getLogger("prd_orchestrator").info(
+            "orchestrator_parser_fallback_override",
+            extra={
+                "event_type": "orchestrator_parser_fallback_override",
+                "action": action,
+                "path": "seed_hint",
+            },
+        )
+        return seed_hint.strip()
+
+    if action == "TRADEOFF_QUESTION" and candidates and len(candidates) >= 2:
+        import logging as _log
+        _log.getLogger("prd_orchestrator").info(
+            "orchestrator_parser_fallback_override",
+            extra={
+                "event_type": "orchestrator_parser_fallback_override",
+                "action": action,
+                "path": "tradeoff_formatter",
+            },
+        )
+        return (
+            f"I'm seeing a tension in {section_title} between "
+            f"'{candidates[0]}' and '{candidates[1]}'. "
+            f"Which one matters more right now, or is there a way to address both?"
+        )
+
+    return ""
+
+
+def _normalize_generated_question(
+    response: dict | str,
+    state: "PRDState",
+    ctx: dict,
+    orch_plan: dict | None = None,
+    section=None,
+) -> tuple[dict, str]:
+    """Normalize the LLM response to a standard dict.
+
+    Stage 4 fix: when parser_fallback fires and an ActionPlan exists with
+    candidate_items or a seed_context_hint, we derive the fallback question
+    from the orchestrator's evidence rather than the generic contextual fallback.
+    """
     import time
+    import re
     extraction_status = "success"
+
+    # ── O2/O3 logging: question text BEFORE parse ─────────────────────────────
+    _pre_parse_preview = (
+        str(response.get("single_next_question", ""))[:300] if isinstance(response, dict)
+        else str(response)[:300]
+    )
+    log_event(
+        **ctx, level="DEBUG", event_type="question_text_before_parse",
+        message=f"question_text BEFORE parse: type={type(response).__name__}",
+        preview=_pre_parse_preview,
+    )
+
     if isinstance(response, str):
         extraction_status = "fallback"
+        _raw_str = response.strip()
+
+        # ── New policy: test raw string usability before discarding ─────────────
+        _reject_patterns = re.compile(
+            r'^[\{\[]|^"|^None$|^null$|^\s*$|question_id|QuestionSchema|"type"\s*:',
+            re.IGNORECASE
+        )
+        _is_usable = (
+            len(_raw_str) > 20
+            and "?" in _raw_str
+            and not _reject_patterns.match(_raw_str)
+            and not _raw_str.startswith("{")
+            and not _raw_str.startswith('["')
+        )
+
         log_event(
             **ctx, level="WARNING", event_type="parser_fallback",
-            message="LLM returned string instead of dict. Discarding raw string and using deterministic contextual fallback.",
-            raw_response=response,
+            message="LLM returned string instead of dict.",
+            raw_response=_raw_str[:400],
+            raw_string_is_usable=_is_usable,
             model_name=getattr(_get_llm(), "model", "gemini-2.5-flash"),
         )
-        
-        # NEVER trust the LLM's raw string if it failed structured extraction, as it will likely be lazy.
-        fallback_msg = _generate_context_aware_fallback(state)
-        
+
+        if _is_usable:
+            # Preserve the usable raw string — do not discard.
+            log_event(
+                **ctx, level="INFO", event_type="raw_string_preserved",
+                message="RAW LLM string is usable — preserving as question text instead of discarding.",
+                raw_preview=_raw_str[:300],
+            )
+            fallback_msg = _raw_str
+        else:
+            # Raw string is garbage — fall through to orchestrator/deterministic.
+            fallback_msg = _orch_plan_to_fallback(orch_plan, section, state)
+            if not fallback_msg:
+                fallback_msg = _generate_context_aware_fallback(state)
+
+        log_event(
+            **ctx, level="INFO", event_type="question_text_after_fallback",
+            message="FALLBACK OUTPUT >>> final fallback text chosen",
+            is_raw_string=_is_usable,
+            text_preview=fallback_msg[:300],
+        )
+
         last_q_text = ""
         recent = state.get("recent_questions", [])
         if recent:
@@ -2688,8 +2906,12 @@ def _normalize_generated_question(response: dict | str, state: "PRDState", ctx: 
         preserved_options = []
         preserved_type = "OPEN_ENDED"
         
-        # Only override the deterministic fallback if we somehow hit an exact repeat issue 
-        if last_q_text and (last_q_text.lower() in fallback_msg.lower() or fallback_msg.lower() in last_q_text.lower()):
+        # Only override the deterministic fallback if we somehow hit an exact repeat issue.
+        # IMPORTANT: do NOT run dedup logic when the raw LLM string was preserved —
+        # the preserved string is a novel model response, not a fallback repeat.
+        if not _is_usable and last_q_text and (
+            last_q_text.lower() in fallback_msg.lower() or fallback_msg.lower() in last_q_text.lower()
+        ):
             if state.get("resolved_option_id"):
                 fallback_msg = f"Could you elaborate more on the {state.get('resolved_option_id')}?"
                 gap_reason = ""
@@ -2731,7 +2953,7 @@ def _normalize_generated_question(response: dict | str, state: "PRDState", ctx: 
         }
     elif not isinstance(response, dict):
         extraction_status = "malformed"
-        fallback_msg = _generate_context_aware_fallback(state)
+        fallback_msg = _orch_plan_to_fallback(orch_plan, section, state) or _generate_context_aware_fallback(state)
         PHANTOM_SUBPARTS = {"clarification", "fallback", "unknown"}
         validated_subparts = [
             s for s in state.get("remaining_subparts", [])
@@ -3174,6 +3396,216 @@ def _extract_draft_markers(section_id: str, prd_sections: dict) -> "str | None":
     return matches[0].strip() if matches else None
 
 
+# ── Orchestrator prompt helpers (Steps 3–4) ───────────────────────────────────
+
+def _format_deterministic_propose_question(plan: dict, section) -> str:
+    """Build a confirm/correct question directly from orchestrator candidate_items.
+
+    This is the deterministic last-mile formatter — it produces the final
+    user-facing question WITHOUT an LLM call.
+
+    Used when:
+    - orchestrator action is PROPOSE_ONE or PROPOSE_LIST
+    - candidate_items is non-empty
+    - section is live_prompt_eligible
+
+    Returns empty string if candidates cannot be formatted (caller falls through
+    to LLM-constrained path).
+    """
+    candidates = plan.get("candidate_items", [])
+    section_id = plan.get("target_section_id", section.id if section else "")
+    section_title = plan.get("target_section_title", section.title if section else "this area")
+    action = plan.get("recommended_action", "")
+    if not candidates:
+        return ""
+
+    # Normalize candidates to plain English labels
+    def _label(c) -> str:  # type: ignore[return]
+        if isinstance(c, dict):
+            text = c.get("text", "") or c.get("answer", "")
+            category = c.get("category", "")
+            category_label = (
+                f" (related to {category.replace('_', ' ')})" if category else ""
+            )
+            return f"{str(text)[:180]}{category_label}"
+        return str(c)[:180]
+
+    labels = [_label(c) for c in candidates[:3] if _label(c).strip()]
+    if not labels:
+        return ""
+
+    # PROPOSE_ONE: single focused candidate — confirm or correct
+    if action == "PROPOSE_ONE" or len(labels) == 1:
+        return (
+            f"From what you've shared, it sounds like the main focus here is: "
+            f"\"{labels[0]}\". "
+            f"Is that accurate, or would you frame it differently?"
+        )
+
+    # PROPOSE_LIST: multiple candidates — list and ask confirm/refine
+    bullets = "\n".join(f"  \u2022 {lab}" for lab in labels)
+    return (
+        f"Based on what you've described so far, here's what I'm understanding "
+        f"for {section_title}:\n{bullets}\n\n"
+        f"Does that capture it, or is something missing or off?"
+    )
+
+
+def _inject_orch_candidates(base_prompt: str, plan: dict) -> str:
+    """Prepend orchestrator-supplied candidates with CONSTRAINT block.
+
+    Authority rule: LLM must paraphrase supplied candidates and ask
+    confirm/correct — must NOT invent new candidates.
+
+    Handles both list[str] (goals/non_goals/metrics) and list[dict]
+    (pain_points with text/category/evidence_level shape).
+    """
+    candidates = plan.get("candidate_items", [])
+    section_id = plan.get("target_section_id", "")
+    section_title = plan.get("target_section_title", "this section")
+    if not candidates:
+        return base_prompt
+
+    # Normalize: pain_points returns list[dict], others return list[str]
+    def _to_label(c) -> str:  # noqa: ANN001
+        if isinstance(c, dict):
+            text = c.get("text", "")
+            category = c.get("category", "")
+            ev = c.get("evidence_level", "")
+            category_label = f" [{category}]" if category else ""
+            return f"{text[:160]}{category_label}"
+        return str(c)[:160]
+
+    candidates_block = "\n".join(f"  - {_to_label(c)}" for c in candidates[:3])
+
+    event_type = (
+        "orchestrator_pain_points_prompt_override_applied"
+        if section_id == "pain_points"
+        else "orchestrator_prompt_override_applied"
+    )
+    log_event(
+        event_type=event_type,
+        section_id=section_id,
+        action=plan.get("recommended_action", ""),
+        candidate_count=len(candidates),
+        level="INFO",
+    )
+
+    constraint = (
+        f"\n\nORCHESTRATOR CONSTRAINT — PROPOSE INFERRED CANDIDATES:\n"
+        f"Based on prior conversation evidence, these candidate items were inferred for {section_title}:\n"
+        f"{candidates_block}\n"
+        f"You MUST present these specific candidates to the user and ask them to confirm, correct, or extend.\n"
+        f"Do NOT invent new candidates. Do NOT ask an open-ended question about this section.\n"
+        f"Phrase the question naturally, as if you're sharing what you already understood.\n"
+        f"Use plain operational language — avoid abstract jargon or consultant labels.\n"
+    )
+    return base_prompt + constraint
+
+
+
+def _inject_seed_hint(base_prompt: str, plan: dict) -> str:
+    """Inject context hint for SEED_QUESTION with CONSTRAINT block.
+
+    Authority rule: LLM must ask ONE focused question anchored to the hint.
+    """
+    hint = plan.get("seed_context_hint", "")
+    section_title = plan.get("target_section_title", "this section")
+    feature_framing = plan.get("feature_framing_detected", False)
+
+    if feature_framing:
+        constraint = (
+            f"\n\nORCHESTRATOR CONSTRAINT — REDIRECT TO OUTCOME:\n"
+            f"The user described a technical method, not a business outcome.\n"
+            f"You MUST ask exactly ONE question that redirects toward the business outcome or 'why'.\n"
+            f"Do NOT ask about the technical method itself.\n"
+            f"Do NOT ask multiple questions.\n"
+        )
+    elif hint:
+        constraint = (
+            f"\n\nORCHESTRATOR CONSTRAINT — SEED QUESTION:\n"
+            f"Evidence is limited for {section_title}. Context from earlier: \"{hint}\"\n"
+            f"You MUST ask exactly ONE narrow, grounded question anchored to this context.\n"
+            f"Do NOT ask a generic open-ended question like 'What are your goals?'.\n"
+            f"Do NOT ask multiple questions.\n"
+        )
+    else:
+        constraint = (
+            f"\n\nORCHESTRATOR CONSTRAINT — SEED QUESTION:\n"
+            f"Evidence is limited for {section_title}.\n"
+            f"You MUST ask exactly ONE narrow, focused question to unlock better evidence.\n"
+            f"Do NOT ask a generic open-ended question.\n"
+            f"Do NOT ask multiple questions.\n"
+        )
+    return base_prompt + constraint
+
+
+def _inject_tradeoff_context(base_prompt: str, plan: dict) -> str:
+    """Surface conflict for TRADEOFF_QUESTION with CONSTRAINT block.
+
+    Authority rule: LLM must ask the tradeoff only — no other questions.
+    Test: test_llm_cannot_override_tradeoff_action asserts 'CONSTRAINT:' is present.
+    """
+    section_title = plan.get("target_section_title", "this section")
+    candidates = plan.get("candidate_items", [])
+    conflicting = "; ".join(candidates[:2]) if candidates else "competing priorities"
+
+    constraint = (
+        f"\n\nORCHESTRATOR CONSTRAINT: TRADEOFF_QUESTION:\n"
+        f"Conflicting signals detected for {section_title}: [{conflicting}].\n"
+        f"You MUST surface this specific tension and ask the user which matters more.\n"
+        f"Do NOT ask about anything else.\n"
+        f"Do NOT propose candidates. Do NOT ask multiple questions.\n"
+    )
+    return base_prompt + constraint
+
+
+def _package_no_question_result(
+    state: "PRDState",
+    section,
+    ctx: dict,
+    plan: dict,
+    ux_msg: str,
+) -> dict:
+    """Return a no-question result with a visible informational UX acknowledgement.
+
+    T3: generation_status = 'no_question_available'.
+    T3: current_questions carries the informational message, NOT a question.
+    """
+    log_event(
+        **ctx, level="INFO", event_type="orchestrator_no_question_needed",
+        message="Orchestrator suppressed question generation for already-covered section",
+        section_id=plan.get("target_section_id", ""),
+        reasoning=plan.get("reasoning_summary", ""),
+        ux_message=ux_msg,
+    )
+    return _enforce_visibility(
+        {
+            "generation_status": "no_question_available",
+            "generation_reason": f"Orchestrator: {plan.get('reasoning_summary', 'section already covered')}",
+            "selected_candidate_id": "",
+            "duplicate_details": {"total_candidates_evaluated": 0, "rejection_reasons": []},
+            "current_questions": ux_msg,
+            "content_segments": [{"text": ux_msg}],
+            "current_question_object": {"question_id": "", "question_text": ux_msg, "subparts": []},
+            "remaining_subparts": [],
+            "active_question_id": "",
+            "active_question_type": "",
+            "active_question_options": [],
+            "question_status": "COMPLETE",
+            "resolved_option_id": "",
+            "answered_at": "",
+            "recent_questions": state.get("recent_questions", []),
+            "repair_instruction": "",
+        },
+        ux_msg,
+        section.title if section else "Unknown",
+        state.get("section_index", 0),
+        state.get("iteration", 0),
+        event_type="elicit",
+    )
+
+
 def generate_questions_node(state: "PRDState") -> dict:
     import time
     ctx = _log_ctx(state, "generate_questions_node")
@@ -3190,6 +3622,7 @@ def generate_questions_node(state: "PRDState") -> dict:
             "generation_reason": "Generating clarification question for image/text conflict",
             "selected_candidate_id": "conflict_q",
             "duplicate_details": {"total_candidates_evaluated": 0, "rejection_reasons": []},
+
             "current_questions": q,
             "current_question_object": {"question_id": "conflict_q", "question_text": q, "subparts": []},
             "raw_answer_buffer": "",
@@ -3220,8 +3653,61 @@ def generate_questions_node(state: "PRDState") -> dict:
     if conflict: return conflict
     branch = _maybe_emit_resolved_branch_question(state, section, ctx)
     if branch: return branch
-    
+
+    # ── Inference-First Orchestrator hook (Steps 1–4, Phase 1) ───────────────
+    # Runs before any LLM call.  Orchestrator is decision-maker; LLM is formatter.
+    # Step 1 (observe-only): always log recommended action + is_inference_first.
+    # Step 3 (live, Goals/Non-goals/Metrics): inject prompt authority instructions.
+    # Step 4 (live): NO_QUESTION_NEEDED returns informational UX turn, not a question.
+    # DIRECT_ELICIT and non-live sections fall through to existing two-lane logic.
+    try:
+        orch_plan = inference_first_prd_orchestrator(state, section)
+        orch_action = orch_plan.get("recommended_action", "")
+        is_live = orch_plan.get("is_live_prompt_eligible", False)
+
+        log_event(
+            **ctx, level="INFO", event_type="orchestrator_action_decided",
+            message="Inference-first orchestrator recommendation",
+            recommended_action=orch_action,
+            confidence=orch_plan.get("confidence", ""),
+            section_id=orch_plan.get("target_section_id", ""),
+            is_inference_first=orch_plan.get("is_inference_first", False),
+            is_live_prompt_eligible=is_live,
+            section_jumped=orch_plan.get("section_jumped", False),
+            feature_framing=orch_plan.get("feature_framing_detected", False),
+        )
+
+        # Step 4: NO_QUESTION_NEEDED — return visible informational UX turn
+        if orch_action == ACTION_NO_QUESTION_NEEDED and is_live:
+            ux_msg = orch_plan.get("reasoning_summary", f"I've captured enough for {section.title}.")
+            return _package_no_question_result(state, section, ctx, orch_plan, ux_msg)
+
+        # Override dispatch — assigns prompt override type before LLM call.
+        # PROPOSE:  only when is_live (proposes inferred candidates — live sections only).
+        # SEED:     always (constrains LLM topic, doesn't propose inferred content).
+        # TRADEOFF: always (names a conflict, bounded regardless of live status).
+        # DIRECT_ELICIT: fall through to existing two-lane logic unchanged.
+        _orch_base_prompt_override = None
+        if orch_action == ACTION_DIRECT_ELICIT:
+            pass  # fall through — two-lane handles this
+        elif orch_action in (ACTION_PROPOSE_ONE, ACTION_PROPOSE_LIST):
+            _orch_base_prompt_override = "PROPOSE" if is_live else None
+        elif orch_action == ACTION_SEED_QUESTION:
+            _orch_base_prompt_override = "SEED"   # inject seed regardless of live status
+        elif orch_action == ACTION_TRADEOFF_QUESTION:
+            _orch_base_prompt_override = "TRADEOFF"  # inject tradeoff regardless
+
+    except Exception as _orch_err:
+        import logging as _logging
+        _logging.getLogger("prd_orchestrator").warning(
+            f"Orchestrator hook failed, falling through: {_orch_err}",
+            exc_info=True,
+        )
+        _orch_base_prompt_override = None
+        orch_plan = {}
+
     # ── Two-Lane Architecture ──────────────────────────────────────────────────
+
     # Lane A: deterministic target selection → LLM phrasing only
     # Lane B: LLM infers missing piece when state is insufficient
     # At most 2 LLM calls (Lane A → Lane B demotion on duplicate)
@@ -3264,7 +3750,69 @@ def generate_questions_node(state: "PRDState") -> dict:
     
     base_prompt = _build_elicitor_prompt_context(state, section, bridge_output)
 
+    # ── Orchestrator dispatch — consumes _orch_base_prompt_override ───────────
+    # Previously _orch_base_prompt_override was set but never read (dead variable).
+    # This block is the fix: we consume the orchestrator decision BEFORE any LLM call.
+    #
+    # Three paths:
+    #   1. PROPOSE + candidates → deterministic formatter short-circuit (no LLM)
+    #   2. SEED / TRADEOFF     → inject constraint block into base_prompt, LLM still runs
+    #   3. PROPOSE + no useful candidates → inject candidate CONSTRAINT, LLM still runs
+    if _orch_base_prompt_override == "PROPOSE" and orch_plan.get("candidate_items") and is_live:
+        _det_question = _format_deterministic_propose_question(orch_plan, section)
+        if _det_question:
+            log_event(
+                **ctx, level="INFO",
+                event_type="orchestrator_prompt_override_applied",
+                message="Deterministic propose path: LLM bypassed, inferred candidates formatted directly",
+                section_id=section.id,
+                action=orch_action,
+                candidate_count=len(orch_plan.get("candidate_items", [])),
+                path="deterministic",
+            )
+            _norm = {
+                "single_next_question": _det_question,
+                "question_id": f"orch_propose_{section.id}",
+                "subparts": [],
+                "gap_reason": "orchestrator_propose",
+            }
+            return _package_generated_question_result(
+                _norm, _det_question,
+                {"question_id": _norm["question_id"], "question_text": _det_question, "subparts": []},
+                state, section, ctx, base_prompt,
+                override_status="orchestrator_deterministic_propose",
+                duplicate_details={"total_candidates_evaluated": 1, "rejection_reasons": []},
+            )
+        # Candidate items exist but formatter returned empty (edge case) —
+        # fall through to LLM path with candidates injected as CONSTRAINT.
+        base_prompt = _inject_orch_candidates(base_prompt, orch_plan)
+        log_event(
+            **ctx, level="INFO",
+            event_type="orchestrator_prompt_override_applied",
+            message="Candidate constraint injected into prompt (LLM phrasing path, formatter returned empty)",
+            section_id=section.id, action=orch_action,
+            candidate_count=len(orch_plan.get("candidate_items", [])),
+            path="llm_constrained",
+        )
+    elif _orch_base_prompt_override == "SEED":
+        base_prompt = _inject_seed_hint(base_prompt, orch_plan)
+        log_event(
+            **ctx, level="INFO",
+            event_type="orchestrator_prompt_override_applied",
+            message="Seed hint injected into prompt",
+            section_id=section.id, action=orch_action, path="seed_inject",
+        )
+    elif _orch_base_prompt_override == "TRADEOFF":
+        base_prompt = _inject_tradeoff_context(base_prompt, orch_plan)
+        log_event(
+            **ctx, level="INFO",
+            event_type="orchestrator_prompt_override_applied",
+            message="Tradeoff context injected into prompt",
+            section_id=section.id, action=orch_action, path="tradeoff_inject",
+        )
+
     # ── Highest priority: draft marker resolution (B1-B4 per spec) ───────────
+
     # If the current section draft explicitly flags an unresolved item, that
     # marker becomes the question source — overriding A/B confidence routing.
     draft_marker = _extract_draft_markers(section.id, state.get("prd_sections", {}))
@@ -3313,10 +3861,29 @@ def generate_questions_node(state: "PRDState") -> dict:
     rejection_reasons = []
     
     # ── Pass 1: Primary LLM call ─────────────────────────────────────────────
-    response_data, _ = _invoke_structured_question_generator(system_prompt, section, state)
-    norm_response, raw_gap_reason = _normalize_generated_question(response_data, state, ctx)
+    response_data, _ = _invoke_structured_question_generator(
+        system_prompt, section, state, ctx=ctx, orch_plan=orch_plan
+    )
+    norm_response, raw_gap_reason = _normalize_generated_question(
+        response_data, state, ctx, orch_plan=orch_plan, section=section
+    )
+    log_event(
+        **ctx, level="DEBUG", event_type="question_text_after_parse",
+        message="PARSED OUTPUT >>> norm_response resolved",
+        parsed_question=str(norm_response.get("single_next_question", ""))[:300],
+    )
+    log_event(
+        **ctx, level="DEBUG", event_type="question_text_before_final_assembly",
+        message="question_text BEFORE _construct_final_question_text",
+        preview=str(norm_response.get("single_next_question", ""))[:300],
+    )
     questions = _construct_final_question_text(norm_response, raw_gap_reason, state)
-    
+    log_event(
+        **ctx, level="INFO", event_type="question_text_after_final_assembly",
+        message="FINAL ASSEMBLED QUESTION >>>",
+        final_question=questions[:300],
+    )
+
     is_valid, rejection_reason, matched_prior = _evaluate_duplicate_candidate(
         norm_response.get("single_next_question", ""),
         norm_response.get("subparts", []),
@@ -3350,7 +3917,9 @@ def generate_questions_node(state: "PRDState") -> dict:
             active_lane = "B_recovery"
             
             response_data, _ = _invoke_structured_question_generator(system_prompt, section, state)
-            norm_response, raw_gap_reason = _normalize_generated_question(response_data, state, ctx)
+            norm_response, raw_gap_reason = _normalize_generated_question(
+                response_data, state, ctx, orch_plan=orch_plan, section=section
+            )
             questions = _construct_final_question_text(norm_response, raw_gap_reason, state)
             
             is_valid_b, rejection_reason_b, matched_prior_b = _evaluate_duplicate_candidate(
@@ -3425,8 +3994,13 @@ def _sanitize_user_facing_question(text: str) -> str:
         out = out.replace(bad, good)
     out = re.sub(r"round\s*=\s*\d+", "earlier answer", out, flags=re.IGNORECASE)
 
-    # Agent should run consistency checks itself; ask user only for decision.
-    if re.search(r"consisten|alignment\s+check|section\s+alignment", out, re.IGNORECASE):
+    # Contradiction guard: only emit contradiction language when an explicit conflict
+    # surface has been injected into the text by the caller.  A regex match on
+    # 'consisten' / 'alignment' in arbitrary LLM output is too broad and fires
+    # falsely on first-turn with no contradiction evidence.
+    # This block is kept as a safety net but hard-gated on the injected marker.
+    if "__CONTRADICTION_OVERRIDE__" in out:
+        out = out.replace("__CONTRADICTION_OVERRIDE__", "")
         return (
             "I noticed a possible mismatch with an earlier detail. "
             "Which version should we keep going forward?"

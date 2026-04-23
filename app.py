@@ -942,18 +942,23 @@ if st.session_state.graph_started:
         _report_title = "Draft Requirements Report"
         if st.session_state.get("graph_started"):
             try:
-                from graph.nodes import _render_pdf, _build_section_summaries, _build_executive_summary
-                import datetime as _dt
-                _sections = sv.get("prd_sections", {})
-                _qa = sv.get("confirmed_qa_store", {})
-                _summaries = _build_section_summaries(
-                    _sections if isinstance(_sections, dict) else {},
-                    _qa if isinstance(_qa, dict) else {},
+                from utils.report_composer import compose_report
+                from graph.nodes import _render_pdf
+                import logging as _logging
+                _composer_log = _logging.getLogger("orchestrator_metrics")
+                _report_artifact = compose_report(sv, trigger="download")
+                _report_title = _report_artifact["report_title"]
+                _composer_log.info("composer_pdf_export_started", extra={
+                    "event_type": "composer_pdf_export_started",
+                    "trigger": "download",
+                    "source_hash": _report_artifact.get("source_hash", ""),
+                })
+                prd_pdf = _render_pdf(
+                    _report_artifact["report_title"],
+                    _report_artifact["generated_at"],
+                    _report_artifact["executive_summary"],
+                    _report_artifact["section_summaries"],
                 )
-                _exec = _build_executive_summary(_summaries, _qa if isinstance(_qa, dict) else {})
-                _ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
-                _report_title = sv.get("prd_report_title", "") or "Draft Requirements Report"
-                prd_pdf = _render_pdf(_report_title, _ts, _exec, _summaries)
             except Exception:
                 pass
 

@@ -417,6 +417,46 @@ PRD sections completed so far (use for context, do not contradict):
 ---\
 """
 
+# ── Evidence-first inference blocks (Goals / Non-goals / Success Metrics) ─────
+
+INFERENCE_CANDIDATE_BLOCK = """\
+Prior-section evidence for this section (derived from confirmed user answers):
+---
+{bullet_evidence}
+---
+
+Based on this evidence, the following are INFERRED CANDIDATE ITEMS for the "{section_title}" section:
+{bullet_candidates}
+
+Your task for this turn:
+1. Present these inferred candidates to the user in plain English using a confirm / correct / extend style.
+2. Use the example phrasing: "Based on what you've shared, I think {section_title} candidates are: [list]. Which of these are right, and what should I add or change?"
+3. Do NOT ask a blank exploratory question — present the candidates as a starting point.
+4. Do NOT invent items not present in the evidence list above.
+5. If the list seems incomplete, ask the user what is missing after presenting the candidates.\
+"""
+
+INFERENCE_EVIDENCE_BLOCK = """\
+Relevant prior-section evidence (use to sharpen your question — do not quote verbatim):
+---
+{bullet_evidence}
+---
+
+Use this evidence to ask a more targeted, evidence-backed question.
+Do NOT ask the blank version of this question — reference a specific signal from the evidence.\
+"""
+
+INFERENCE_SEED_BLOCK = """\
+Inference skipped: not enough prior evidence to propose candidates for "{section_title}".
+
+Ask exactly ONE targeted seed question to uncover the first piece of evidence.
+Seed question rules:
+- Ask about real-world pain, constraint, or outcome — not about the section name.
+- Keep it under 25 words.
+- Use a concrete example to help the user answer.
+- Do NOT ask "What are your {section_title_lower}?" — that is a blank question.\
+"""
+
 CONVERSATION_UNDERSTANDING_BLOCK = """\
 Conversation Semantic State:
 ---
