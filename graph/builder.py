@@ -54,6 +54,7 @@ from graph.routing import (
     route_after_file_intake,
     route_after_multimodal_call,
     route_after_session_context_node,
+    route_after_generate_questions,
 )
 from graph.state import PRDState
 
@@ -168,7 +169,14 @@ def build_graph(checkpointer: MemorySaver | None = None):
     builder.add_edge("rebuild_mirror", "generate_questions")
 
     # Confirmation gate: await_answer → (route) → interpret_and_echo | handle_tagged_event
-    builder.add_edge("generate_questions", "await_answer")
+    builder.add_conditional_edges(
+        "generate_questions",
+        route_after_generate_questions,
+        {
+            "await_answer": "await_answer",
+            "draft": "draft"
+        }
+    )
     builder.add_conditional_edges(
         "await_answer",
         route_after_answer,

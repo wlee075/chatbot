@@ -12,7 +12,6 @@ from graph.nodes import (
     _maybe_emit_resolved_branch_question,
     _build_elicitor_prompt_context,
     _apply_repeat_guard,
-    _apply_duplicate_question_guard,
     _suppress_resolved_subparts,
     _package_generated_question_result
 )
@@ -106,14 +105,7 @@ def test_suppress_resolved_subparts_filters_question_targets():
     assert "roles" not in filtered
     assert "workflow" in filtered
 
-def test_duplicate_question_guard_replaces_repeated_question():
-    state = {"recent_questions": ["How does this workflow operate"]}
-    response = {"question_id": "1", "single_next_question": "How does this workflow operate today?", "subparts": ["workflow"]}
-    
-    current_q_obj, q_text = _apply_duplicate_question_guard(response, "How does this workflow operate today?", ["workflow"], "", state, DummySection("1", "Title"), {})
-    
-    assert current_q_obj["question_text"] == "Can you give me a specific example of how this process works in practice today?"
-    assert "example" in q_text
+
 
 @patch("graph.nodes._segment_text_with_provenance")
 @patch("graph.nodes._enforce_visibility")

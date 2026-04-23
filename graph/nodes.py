@@ -1504,13 +1504,17 @@ def _maybe_emit_numeric_repair_prompt(state: "PRDState", section, ctx: dict) -> 
         repair_prompt = "I may have misunderstood that value. Did you mean 30 minutes per day, 3 hours per day, or something else?"
         log_event(**ctx, level="INFO", event_type="repair_prompt_emitted", message="Emitted deterministic repair prompt.")
         
-        import uuid
+        repair_id = str(uuid.uuid4())
         return _enforce_visibility({
+            "generation_status": "question_generated",
+            "generation_reason": "Emitted deterministic repair prompt.",
+            "selected_candidate_id": repair_id,
+            "duplicate_details": {"total_candidates_evaluated": 0, "rejection_reasons": []},
             "current_questions": repair_prompt,
             "question_status": "OPEN",
             "pending_numeric_clarification": False,
             "parent_question_id": state.get("active_question_id", ""),
-            "repair_question_id": str(uuid.uuid4()),
+            "repair_question_id": repair_id,
         }, repair_prompt, section.title if section else "Unknown", state["section_index"], state.get("iteration", 0), event_type="elicit")
     return None
 
@@ -1531,6 +1535,10 @@ def _maybe_emit_conflict_resolution_question(state: "PRDState", bridge_output: d
         }
         
         return _enforce_visibility({
+            "generation_status": "question_generated",
+            "generation_reason": "Short-circuited LLM generation due to semantic conflict",
+            "selected_candidate_id": current_question_object["question_id"],
+            "duplicate_details": {"total_candidates_evaluated": 0, "rejection_reasons": []},
             "current_questions": deterministic_q,
             "current_question_segments": [],
             "current_question_object": current_question_object,
@@ -1571,7 +1579,7 @@ def _maybe_emit_resolved_branch_question(state: "PRDState", section, ctx: dict) 
             
             log_event(
                 thread_id=state.get("thread_id", ""), run_id=state.get("run_id", ""), node_name="generate_questions_node",
-                event_type="metric_llm_prevention", metric_name="branch_short_circuit", metric_value=1
+                event_type="metric_llm_prevention", message="LLM call prevented by deterministic branch short-circuit", metric_name="branch_short_circuit", metric_value=1
             )
             
             import uuid
@@ -1582,6 +1590,10 @@ def _maybe_emit_resolved_branch_question(state: "PRDState", section, ctx: dict) 
             }
             
             return _enforce_visibility({
+                "generation_status": "question_generated",
+                "generation_reason": "Short-circuited LLM generation for resolved branch",
+                "selected_candidate_id": current_question_object["question_id"],
+                "duplicate_details": {"total_candidates_evaluated": 0, "rejection_reasons": []},
                 "current_questions": deterministic_q,
                 "current_question_segments": [],
                 "current_question_object": current_question_object,
@@ -1761,6 +1773,94 @@ def _apply_repeat_guard(response: dict | str, recent_q_history: list[str], state
                         )
     return is_semantic_repeat, new_q_text, {"reason": decision_reason}
 
+def _generate_context_aware_fallback(state: "PRDState") -> str:
+    """
+    Deterministically generates the best possible fallback question when the LLM
+    fails to extract a structured response, avoiding lazy 'Tell me more' strings.
+    History-aware: checks recent_questions to avoid repeating the same question.
+    Priority:
+    1. Active blocker / remaining subpart (non-phantom)
+    2. Concept conflict
+    3. Image/screen context
+    4. Unresolved section component from canonical registry
+    5. Generic goal fallback (with history dedup)
+    """
+    recent = state.get("recent_questions", [])
+    recent_lower = [q.lower() for q in recent]
+    
+    def _not_recently_asked(candidate: str) -> bool:
+        c_lower = candidate.lower()
+        return not any(
+            c_lower in r or r in c_lower
+            for r in recent_lower
+            if len(r) > 10
+        )
+    
+    # 1. Remaining Subparts (skip phantom "clarification")
+    PHANTOM_SUBPARTS = {"clarification", "fallback", "unknown"}
+    blockers = [b for b in state.get("remaining_subparts", []) if b not in PHANTOM_SUBPARTS]
+    if blockers:
+        subpart = blockers[0].replace("_", " ")
+        if "audience" in subpart or "user" in subpart:
+            q = "I'm still unclear who this is for. Is this meant for end users, admins, or someone else?"
+        elif "action" in subpart or "workflow" in subpart:
+            q = "I'm missing some details on the expected workflow. What is the specific action users should take here?"
+        else:
+            q = f"I'm still missing some details about the {subpart}. Could you clarify what is expected there?"
+        if _not_recently_asked(q):
+            return q
+        # If the blocker-based question was recently asked, fall through to other options
+        
+    # 2. Concept Conflicts
+    conflicts = state.get("concept_conflicts", [])
+    if conflicts:
+        target = conflicts[0].get("surface", conflicts[0].get("concept_key", "concept"))
+        q = f"I'm seeing conflicting details about the {target}. Which version is correct?"
+        if _not_recently_asked(q):
+            return q
+        
+    # 3. Image/Screenshot Context
+    if state.get("uploaded_files") or (state.get("pending_event", {}) and state.get("pending_event", {}).get("uploaded_files")):
+        q = "I can see the screen, but I'm unclear what users are supposed to do here. What is the main action they should complete on this page?"
+        if _not_recently_asked(q):
+            return q
+    
+    # 4. Unresolved section components from canonical registry
+    section_index = state.get("section_index")
+    if section_index is not None:
+        try:
+            section = get_section_by_index(section_index)
+            qa_store = state.get("confirmed_qa_store", {})
+            resolved_components = set()
+            for v in qa_store.values():
+                if v.get("section_id") == section.id and not v.get("contradiction_flagged"):
+                    for sp in v.get("resolved_subparts", []):
+                        resolved_components.add(sp.lower().replace(" ", "_"))
+                        resolved_components.add(sp)
+            
+            for comp in section.expected_components:
+                comp_norm = comp.lower().replace(" ", "_")
+                if comp not in resolved_components and comp_norm not in resolved_components:
+                    q = f"I'm still missing some details about {comp}. Could you share what you have in mind?"
+                    if _not_recently_asked(q):
+                        return q
+        except (IndexError, AttributeError):
+            pass
+        
+    # 5. Generic Goal Fallback (with history dedup)
+    generic_options = [
+        "I'm missing one key piece of context: what specific problem are you trying to solve here?",
+        "Could you describe what the ideal end state looks like once this is built?",
+        "What would a successful outcome look like for the people using this?",
+        "What is the most important thing this needs to do that it doesn't do today?",
+    ]
+    for option in generic_options:
+        if _not_recently_asked(option):
+            return option
+    
+    # Absolute last resort: return the first option even if it was asked before
+    return generic_options[0]
+
 def _fallback_for_hard_blocker(remaining_subparts: list[str]) -> dict:
     import time
     fallback_blocker = remaining_subparts[0] if remaining_subparts else "clarification"
@@ -1769,7 +1869,9 @@ def _fallback_for_hard_blocker(remaining_subparts: list[str]) -> dict:
     elif fallback_blocker == "mapping_logic_missing":
         safe_text = "To avoid repeating myself: could you clarify exactly which fields from the email get matched?"
     else:
-        safe_text = "I want to make sure I don't ask you for the same information twice. Could you clarify the missing piece?"
+        # Pass a mock state object to our helper to leverage deterministic fallback resolution
+        mock_state = {"remaining_subparts": remaining_subparts}
+        safe_text = _generate_context_aware_fallback(mock_state)
         
     return {
         "question_id": f"hard_block_{int(time.monotonic())}",
@@ -1787,11 +1889,14 @@ def _normalize_generated_question(response: dict | str, state: "PRDState", ctx: 
         extraction_status = "fallback"
         log_event(
             **ctx, level="WARNING", event_type="parser_fallback",
-            message="LLM returned string instead of dict. Using safe fallback.",
+            message="LLM returned string instead of dict. Discarding raw string and using deterministic contextual fallback.",
             raw_response=response,
             model_name=getattr(_get_llm(), "model", "gemini-2.5-flash"),
         )
-        fallback_msg = str(response)
+        
+        # NEVER trust the LLM's raw string if it failed structured extraction, as it will likely be lazy.
+        fallback_msg = _generate_context_aware_fallback(state)
+        
         last_q_text = ""
         recent = state.get("recent_questions", [])
         if recent:
@@ -1800,6 +1905,8 @@ def _normalize_generated_question(response: dict | str, state: "PRDState", ctx: 
         gap_reason = state.get("user_facing_gap_reason", "")
         preserved_options = []
         preserved_type = "OPEN_ENDED"
+        
+        # Only override the deterministic fallback if we somehow hit an exact repeat issue 
         if last_q_text and (last_q_text.lower() in fallback_msg.lower() or fallback_msg.lower() in last_q_text.lower()):
             if state.get("resolved_option_id"):
                 fallback_msg = f"Could you elaborate more on the {state.get('resolved_option_id')}?"
@@ -1808,24 +1915,37 @@ def _normalize_generated_question(response: dict | str, state: "PRDState", ctx: 
                 preserved_options = state.get("active_question_options")
                 preserved_type = "BINARY_CLARIFICATION"
         
+        # Preserve validated unresolved blockers from state — never inject phantom subparts.
+        # Filter out any non-semantic placeholders that may have leaked in from prior fallbacks.
+        PHANTOM_SUBPARTS = {"clarification", "fallback", "unknown"}
+        validated_subparts = [
+            s for s in state.get("remaining_subparts", [])
+            if s not in PHANTOM_SUBPARTS
+        ]
         response = {
             "question_id": f"fallback_{int(time.monotonic())}",
             "single_next_question": fallback_msg,
             "user_facing_gap_reason": gap_reason,
-            "subparts": ["clarification"],
+            "subparts": validated_subparts,
             "question_type": preserved_type,
             "options": preserved_options
         }
     elif not isinstance(response, dict):
         extraction_status = "malformed"
+        fallback_msg = _generate_context_aware_fallback(state)
+        PHANTOM_SUBPARTS = {"clarification", "fallback", "unknown"}
+        validated_subparts = [
+            s for s in state.get("remaining_subparts", [])
+            if s not in PHANTOM_SUBPARTS
+        ]
         response = {
             "question_id": "fallback_error",
-            "single_next_question": "Could you tell me a little more about what you're trying to achieve?",
+            "single_next_question": fallback_msg,
             "user_facing_gap_reason": "",
-            "subparts": ["clarification"],
+            "subparts": validated_subparts,
             "question_type": "OPEN_ENDED",
             "options": [],
-            "content_segments": [{"text": "Could you tell me a little more about what you're trying to achieve?", "provenance": None}]
+            "content_segments": [{"text": fallback_msg, "provenance": None}]
         }
 
     log_event(
@@ -1834,7 +1954,14 @@ def _normalize_generated_question(response: dict | str, state: "PRDState", ctx: 
         extraction_status=extraction_status
     )
     
-    raw_next_q = response.get("single_next_question", "Could you provide a few more details on this?")
+    raw_next_q = response.get("single_next_question", _generate_context_aware_fallback(state))
+    
+    # Actively catch generic string generations from the LLM and force context-awareness
+    # No length requirement! Any generic escape should be neutralized.
+    generics = ["could you provide a few more details", "tell me more", "can you elaborate", "what do you mean", "can you say more"]
+    if any(g in raw_next_q.lower() for g in generics):
+        raw_next_q = _generate_context_aware_fallback(state)
+        
     raw_gap_reason = state.get("user_facing_gap_reason", response.get("user_facing_gap_reason", ""))
     raw_ans_lower = state.get("raw_answer_buffer", "").lower()
     
@@ -1961,88 +2088,57 @@ def _suppress_resolved_subparts(response: dict, raw_gap_reason: str, state: "PRD
             suppressed_subparts=suppressed,
             final_question=raw_next_q
         )
-        
     return questions, filtered_subparts
 
-def _apply_duplicate_question_guard(response: dict, questions: str, filtered_subparts: list[str], raw_gap_reason: str, state: "PRDState", section, ctx: dict) -> tuple[dict, str]:
-    raw_next_q = response.get("single_next_question", "")
-    recent_questions = state.get("recent_questions", [])
-    last_q_id = state.get("active_question_id", "")
-    new_q_id = response.get("question_id", "")
-    new_raw_q_lower = raw_next_q.lower()
-    is_duplicate = False
-    matched_prior = ""
-    qa_store = state.get("confirmed_qa_store", {})
-    raw_subparts = response.get("subparts", [])
+def _apply_transition_cleanup(final_questions: str, current_question_object: dict) -> tuple[dict, str]:
+    target_transition = "I have all the details I need for this section. Let's move on."
+    short_transition = "I have all the details I need for this section."
+    if short_transition in final_questions:
+        cleaned = final_questions.replace(target_transition, "").replace(short_transition, "").strip()
+        if not cleaned:
+            final_questions = target_transition
+            current_question_object["subparts"] = []
+        else:
+            final_questions = cleaned
+    return current_question_object, final_questions
 
-    if not new_q_id.startswith("hard_block_"):
+def _evaluate_duplicate_candidate(candidate_q_text: str, candidate_subparts: list[str], raw_subparts: list[str], candidate_id: str, state: "PRDState", section, ctx: dict) -> tuple[bool, str, str]:
+    """Pure evaluative filter for question candidates."""
+    if raw_subparts and len(candidate_subparts) == 0:
+        log_event(**ctx, level="INFO", event_type="duplicate_candidate_blocked", message="All generated subparts were suppressed by previously resolved facts")
+        return False, "all_subparts_resolved", "semantic_conflict_resolved"
+
+    recent_questions = state.get("recent_questions", [])
+    candidate_q_lower = candidate_q_text.lower()
+    qa_store = state.get("confirmed_qa_store", {})
+
+    # 1. Check recent UI question history
+    if not candidate_id.startswith("hard_block_"):
         for prior_q in recent_questions:
             prior_q_lower = prior_q.lower()
-            if len(prior_q_lower) > 10 and (prior_q_lower in new_raw_q_lower or new_raw_q_lower in prior_q_lower):
-                is_duplicate = True
-                matched_prior = prior_q
-                break
+            if len(prior_q_lower) > 10 and (prior_q_lower in candidate_q_lower or candidate_q_lower in prior_q_lower):
+                log_event(**ctx, level="INFO", event_type="duplicate_candidate_blocked", message="Candidate matching recent history", prior_q=prior_q)
+                return False, "recent_question_match", prior_q
                 
-    if not is_duplicate:
-        for k, v in qa_store.items():
-            if v.get("section_id") == section.id and not v.get("contradiction_flagged"):
-                stored_q = v.get("questions", "").lower()
-                store_subparts = v.get("resolved_subparts", [])
-                
-                text_match = len(stored_q) > 10 and (stored_q in new_raw_q_lower or new_raw_q_lower in stored_q)
-                semantic_match = bool(set(store_subparts) & set(raw_subparts))
-                
-                if text_match or semantic_match:
-                    is_duplicate = True
-                    matched_prior = v.get("questions", "")
-                    break
-                    
-    current_question_object = {
-        "question_id": response.get("question_id", ""),
-        "question_text": raw_next_q,
-        "subparts": filtered_subparts,
-    }
-    
-    log_event(
-        **ctx, level="INFO", event_type="visible_question_selected",
-        message="Selected top priority visible question",
-        selected_blocker_id=filtered_subparts[0] if filtered_subparts else "",
-        selected_question_text=raw_next_q,
-        suppressed_question_count=len(raw_subparts) - len(filtered_subparts)
-    )
+    # 2. Check canonical QA store
+    for k, v in qa_store.items():
+        if v.get("section_id") == section.id and not v.get("contradiction_flagged"):
+            stored_q = v.get("questions", "").lower()
+            store_subparts = v.get("resolved_subparts", [])
+            
+            text_match = len(stored_q) > 10 and (stored_q in candidate_q_lower or candidate_q_lower in stored_q)
+            semantic_match = bool(set(store_subparts) & set(candidate_subparts))
+            
+            if text_match:
+                log_event(**ctx, level="INFO", event_type="duplicate_candidate_blocked", message="Candidate matching canonical QA history", prior_q=v.get("questions", ""))
+                return False, "exact_text_match", v.get("questions", "")
+            if semantic_match:
+                log_event(**ctx, level="INFO", event_type="duplicate_candidate_blocked", message="Candidate overlapping resolved subparts", matched_subparts=list(set(store_subparts) & set(candidate_subparts)))
+                return False, "semantic_match", v.get("questions", "")
 
-    if is_duplicate:
-        log_event(
-            **ctx, level="INFO", event_type="duplicate_question_blocked",
-            message="Duplicate question guard fired!",
-            active_question_id=last_q_id,
-            prior_question_text=matched_prior,
-            new_question_text=raw_next_q,
-            comparison_mode="CANONICAL_RAW_TEXT_ROLLING_WINDOW"
-        )
-        raw_next_q = "Can you give me a specific example of how this process works in practice today?"
-        if raw_gap_reason:
-            questions = f"{raw_gap_reason.strip().rstrip('.')}.\n\n{raw_next_q}"
-        else:
-            questions = raw_next_q
-        questions = _sanitize_user_facing_question(questions)
-        current_question_object["question_text"] = raw_next_q
-        
-        response["question_type"] = "OPEN_ENDED"
-        response["options"] = []
-        response["content_segments"] = [{"text": questions, "provenance": None}]
-        response["single_next_question"] = raw_next_q
+    return True, "", ""
 
-    if "I have all the details I need for this section." in questions:
-        if len(questions.strip()) > 60:
-            questions = questions.replace("I have all the details I need for this section. Let's move on.", "").strip()
-        else:
-            filtered_subparts = []
-            current_question_object["subparts"] = filtered_subparts
-
-    return current_question_object, questions
-
-def _package_generated_question_result(response: dict, questions: str, current_question_object: dict, state: "PRDState", section, ctx: dict, system_prompt: str) -> dict:
+def _package_generated_question_result(response: dict, questions: str, current_question_object: dict, state: "PRDState", section, ctx: dict, system_prompt: str, override_status: str = None, duplicate_details: dict = None) -> dict:
     import time
     qa_store = state.get("confirmed_qa_store", {})
     triage = state.get("triage_decision", "")
@@ -2093,11 +2189,17 @@ def _package_generated_question_result(response: dict, questions: str, current_q
     
     provenance_segments = _segment_text_with_provenance(questions, referenced_keys, state)
 
+    status = override_status if override_status else ("no_question_available" if not questions else "question_generated")
+    dup_details = duplicate_details or {"total_candidates_evaluated": 1, "rejection_reasons": []}
     return _enforce_visibility({
+        "generation_status": status,
+        "generation_reason": "Generator flow completed",
+        "selected_candidate_id": response.get("question_id", ""),
+        "duplicate_details": dup_details,
         "current_questions": questions,
         "content_segments": provenance_segments,
         "current_question_object": current_question_object,
-        "remaining_subparts": current_question_object["subparts"],
+        "remaining_subparts": [s for s in current_question_object.get("subparts", []) if s not in {"clarification", "fallback", "unknown"}],
         
         "active_question_id": response.get("question_id", ""),
         "active_question_type": response.get("question_type", "OPEN_ENDED"),
@@ -2110,6 +2212,85 @@ def _package_generated_question_result(response: dict, questions: str, current_q
         "repair_instruction": "",
     }, questions, section.title if section else "Unknown", state["section_index"], state.get("iteration", 0), event_type="elicit")
 
+def _is_synthetic_blocker(blocker: str, canonical_set: set[str]) -> bool:
+    """
+    Explicit synthetic-blocker predicate (T1).
+    A blocker is synthetic if it was NOT derived from the section's canonical expected_components.
+    Uses canonical registry membership, not substring matching, to avoid false positives.
+    """
+    if blocker in canonical_set:
+        return False
+    # Check if the blocker is a known canonical root with a suffix appended by blocker_transition
+    for canonical in canonical_set:
+        canonical_normalized = canonical.lower().replace(" ", "_")
+        if blocker.startswith(canonical_normalized):
+            # e.g. "workflow_sequence_missing_specific_interaction" starts with "workflow_sequence_missing"
+            return True
+    # If it doesn't match any canonical root at all, it's also non-canonical (either synthetic or new)
+    return blocker not in canonical_set
+
+def _classify_target_confidence(state: "PRDState", section) -> tuple[str, str | None, list[str], str]:
+    """
+    Deterministic target selection for the two-lane question generation architecture.
+    
+    Returns:
+        (confidence, target, candidates, reason)
+        - confidence: "STRONG" | "MODERATE" | "WEAK" | "EMPTY"
+        - target: the selected blocker name (only for STRONG)
+        - candidates: list of valid candidate blockers
+        - reason: human-readable classification reason (T2)
+    """
+    remaining = list(state.get("remaining_subparts", []))
+    conflicts = state.get("concept_conflicts", [])
+    qa_store = state.get("confirmed_qa_store", {})
+    
+    # Build canonical blocker registry from section expected_components
+    canonical_components = set()
+    for comp in section.expected_components:
+        # Normalize: "what problem is being solved" → "what_problem_is_being_solved"
+        canonical_components.add(comp.lower().replace(" ", "_"))
+        canonical_components.add(comp)  # Also keep original form
+    
+    # Collect already-resolved subparts from the QA store for this section
+    resolved_in_store = set()
+    for v in qa_store.values():
+        if v.get("section_id") == section.id and not v.get("contradiction_flagged"):
+            for sp in v.get("resolved_subparts", []):
+                resolved_in_store.add(sp)
+    
+    # Filter remaining subparts: remove already resolved ones
+    unresolved = [s for s in remaining if s not in resolved_in_store]
+    
+    # Separate canonical from synthetic
+    canonical_unresolved = [s for s in unresolved if not _is_synthetic_blocker(s, canonical_components)]
+    synthetic_unresolved = [s for s in unresolved if _is_synthetic_blocker(s, canonical_components)]
+    
+    # D1: STRONG — one active conflict
+    if conflicts:
+        conflict_target = conflicts[0].get("surface", conflicts[0].get("concept_key", "concept"))
+        return ("STRONG", conflict_target, [],
+                f"Active conflict on '{conflict_target}'")
+    
+    # D1: STRONG — exactly one canonical unresolved blocker
+    if len(canonical_unresolved) == 1:
+        target = canonical_unresolved[0]
+        return ("STRONG", target, [],
+                f"Exactly one canonical unresolved blocker: '{target}'")
+    
+    # D2: MODERATE — multiple canonical candidates
+    if len(canonical_unresolved) > 1:
+        return ("MODERATE", None, canonical_unresolved,
+                f"Multiple canonical candidates remain: {canonical_unresolved}")
+    
+    # D3: WEAK — only synthetic/stale blockers remain
+    if synthetic_unresolved:
+        return ("WEAK", None, synthetic_unresolved,
+                f"Only synthetic/stale blockers remain: {synthetic_unresolved}")
+    
+    # D4: EMPTY — nothing left
+    return ("EMPTY", None, [],
+            "No unresolved candidates in state")
+
 def generate_questions_node(state: "PRDState") -> dict:
     import time
     ctx = _log_ctx(state, "generate_questions_node")
@@ -2121,7 +2302,11 @@ def generate_questions_node(state: "PRDState") -> dict:
         reason_str = f" ({reason})" if reason else ""
         q = f"Your text and the uploaded image seem to suggest different things{reason_str}. Could you clarify which one is correct?"
         log_event(**ctx, level="INFO", event_type="asking_conflict_clarification", message="Generating clarification question for image/text conflict", text=q)
-        return {
+        return _enforce_visibility({
+            "generation_status": "question_generated",
+            "generation_reason": "Generating clarification question for image/text conflict",
+            "selected_candidate_id": "conflict_q",
+            "duplicate_details": {"total_candidates_evaluated": 0, "rejection_reasons": []},
             "current_questions": q,
             "current_question_object": {"question_id": "conflict_q", "question_text": q, "subparts": []},
             "raw_answer_buffer": "",
@@ -2130,7 +2315,7 @@ def generate_questions_node(state: "PRDState") -> dict:
             "pending_numeric_clarification": False,
             "repair_question_id": "",
             "phase": state.get("phase", "elicitation")
-        }
+        }, q, get_section_by_index(state["section_index"]).title if state.get("section_index") is not None else "Unknown", state.get("section_index", 0), state.get("iteration", 0), event_type="elicit")
 
     log_event(
         **ctx, level="INFO", event_type="question_generation_decision",
@@ -2153,29 +2338,143 @@ def generate_questions_node(state: "PRDState") -> dict:
     branch = _maybe_emit_resolved_branch_question(state, section, ctx)
     if branch: return branch
     
-    system_prompt = _build_elicitor_prompt_context(state, section, bridge_output)
-    recent_q_history = state.get("recent_questions", [])
+    # ── Two-Lane Architecture ──────────────────────────────────────────────────
+    # Lane A: deterministic target selection → LLM phrasing only
+    # Lane B: LLM infers missing piece when state is insufficient
+    # At most 2 LLM calls (Lane A → Lane B demotion on duplicate)
+    # Terminal: deterministic last-resort via _generate_context_aware_fallback
     
-    response = None
-    fallback_blocker = state.get("remaining_subparts", [])
-    for attempt in range(3):
-        response_data, _ = _invoke_structured_question_generator(system_prompt, section, state)
-        is_semantic_repeat, new_q_text, info = _apply_repeat_guard(response_data, recent_q_history, state, ctx)
-        if not is_semantic_repeat:
-            response = response_data
-            break
-        if attempt == 2:
-            response = _fallback_for_hard_blocker(fallback_blocker)
-            break
-        system_prompt += f"\n\nCRITICAL ERROR: DO NOT ASK '{new_q_text}'. You just asked a semantically identical question. You MUST narrow the focus to a specific missing domain detail implementation."
-
-    norm_response, raw_gap_reason = _normalize_generated_question(response, state, ctx)
+    confidence, target, candidates, classification_reason = _classify_target_confidence(state, section)
+    log_event(**ctx, level="INFO", event_type="target_confidence_classified",
+              message=f"Target confidence: {confidence}",
+              confidence=confidence, target=target, candidates=candidates,
+              reason=classification_reason)
     
-    questions, filtered_subparts = _suppress_resolved_subparts(norm_response, raw_gap_reason, state, section, ctx)
+    base_prompt = _build_elicitor_prompt_context(state, section, bridge_output)
     
-    current_question_object, final_questions = _apply_duplicate_question_guard(norm_response, questions, filtered_subparts, raw_gap_reason, state, section, ctx)
+    if confidence == "STRONG":
+        # Lane A: anchor the LLM to a specific validated target
+        lane_instruction = (
+            f"\n\nTARGET LOCK: The specific detail still missing is: '{target}'. "
+            f"Write exactly ONE focused question to elicit this detail. "
+            f"Do NOT ask about anything else. Do NOT broaden the scope."
+        )
+        system_prompt = base_prompt + lane_instruction
+        active_lane = "A"
+    else:
+        # Lane B: let LLM infer, but constrain output
+        if confidence == "MODERATE" and candidates:
+            lane_instruction = (
+                f"\n\nFOCUS CANDIDATES: The following unresolved details remain: {candidates}. "
+                f"Pick the single most critical one and write ONE focused question about it. "
+                f"Do NOT ask about multiple topics."
+            )
+        else:
+            lane_instruction = (
+                f"\n\nINFERENCE MODE: Based on everything the user has said so far, identify the single most "
+                f"important missing piece of information for this section. Then write exactly ONE focused question "
+                f"to elicit that specific detail. You MUST name what is missing before asking."
+            )
+        system_prompt = base_prompt + lane_instruction
+        active_lane = "B"
     
-    return _package_generated_question_result(norm_response, final_questions, current_question_object, state, section, ctx, system_prompt)
+    generation_status = "question_generated"
+    rejection_reasons = []
+    
+    # ── Pass 1: Primary LLM call ─────────────────────────────────────────────
+    response_data, _ = _invoke_structured_question_generator(system_prompt, section, state)
+    norm_response, raw_gap_reason = _normalize_generated_question(response_data, state, ctx)
+    questions = _construct_final_question_text(norm_response, raw_gap_reason, state)
+    
+    is_valid, rejection_reason, matched_prior = _evaluate_duplicate_candidate(
+        norm_response.get("single_next_question", ""),
+        norm_response.get("subparts", []),
+        norm_response.get("subparts", []),
+        norm_response.get("question_id", ""),
+        state, section, ctx
+    )
+    
+    current_question_object = {
+        "question_id": norm_response.get("question_id", ""),
+        "question_text": norm_response.get("single_next_question", ""),
+        "subparts": norm_response.get("subparts", []),
+    }
+    
+    if not is_valid:
+        rejection_reasons.append(rejection_reason)
+        
+        if active_lane == "A":
+            # ── Lane A → Lane B demotion ─────────────────────────────────────
+            log_event(**ctx, level="WARNING", event_type="lane_a_demoted_to_b",
+                      message="Lane A candidate blocked as duplicate, demoting to Lane B",
+                      matched_prior=matched_prior, reason=rejection_reason)
+            
+            demotion_instruction = (
+                f"\n\nCRITICAL: The question about '{target}' was already asked or resolved. "
+                f"You MUST choose a DIFFERENT unresolved detail. "
+                f"Do NOT ask about '{matched_prior}'. "
+                f"Identify the next most important missing piece and ask about that instead."
+            )
+            system_prompt = base_prompt + demotion_instruction
+            active_lane = "B_recovery"
+            
+            response_data, _ = _invoke_structured_question_generator(system_prompt, section, state)
+            norm_response, raw_gap_reason = _normalize_generated_question(response_data, state, ctx)
+            questions = _construct_final_question_text(norm_response, raw_gap_reason, state)
+            
+            is_valid_b, rejection_reason_b, matched_prior_b = _evaluate_duplicate_candidate(
+                norm_response.get("single_next_question", ""),
+                norm_response.get("subparts", []),
+                norm_response.get("subparts", []),
+                norm_response.get("question_id", ""),
+                state, section, ctx
+            )
+            
+            current_question_object = {
+                "question_id": norm_response.get("question_id", ""),
+                "question_text": norm_response.get("single_next_question", ""),
+                "subparts": norm_response.get("subparts", []),
+            }
+            
+            if not is_valid_b:
+                rejection_reasons.append(rejection_reason_b)
+                # ── Terminal: deterministic last-resort ───────────────────────
+                log_event(**ctx, level="WARNING", event_type="lane_b_terminal_fallback",
+                          message="Lane B also produced duplicate, using deterministic last-resort",
+                          matched_prior=matched_prior_b, reason=rejection_reason_b)
+                questions = _generate_context_aware_fallback(state)
+                questions = _sanitize_user_facing_question(questions)
+                current_question_object["question_text"] = questions
+                current_question_object["subparts"] = []
+                norm_response["single_next_question"] = questions
+                generation_status = "deterministic_fallback"
+            else:
+                generation_status = "blocked_duplicate_regenerated"
+        else:
+            # ── Lane B was primary and also duplicated → terminal fallback ────
+            log_event(**ctx, level="WARNING", event_type="lane_b_terminal_fallback",
+                      message="Lane B candidate blocked as duplicate, using deterministic last-resort",
+                      matched_prior=matched_prior, reason=rejection_reason)
+            questions = _generate_context_aware_fallback(state)
+            questions = _sanitize_user_facing_question(questions)
+            current_question_object["question_text"] = questions
+            current_question_object["subparts"] = []
+            norm_response["single_next_question"] = questions
+            generation_status = "deterministic_fallback"
+    
+    # ── Guaranteed non-empty output gate (T3) ────────────────────────────────
+    if not questions or not questions.strip():
+        log_event(**ctx, level="WARNING", event_type="non_empty_guard_triggered",
+                  message="Output was empty after all lanes, applying last-resort guard")
+        questions = _generate_context_aware_fallback(state)
+        questions = _sanitize_user_facing_question(questions)
+        current_question_object["question_text"] = questions
+        current_question_object["subparts"] = []
+        norm_response["single_next_question"] = questions
+        generation_status = "deterministic_fallback"
+    
+    dup_details = {"total_candidates_evaluated": len(rejection_reasons) + 1, "rejection_reasons": rejection_reasons}
+    return _package_generated_question_result(norm_response, questions, current_question_object, state, section, ctx, system_prompt, override_status=generation_status, duplicate_details=dup_details)
 
 def _sanitize_user_facing_question(text: str) -> str:
     """Clean LLM output to avoid internal jargon or audit-style asks to the PM."""

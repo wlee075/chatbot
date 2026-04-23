@@ -406,6 +406,12 @@ class PRDState(TypedDict):
     reply_intent: str
     repair_instruction: str    # Guidance passed to Elicitor if a repair hit
     
+    # ── Phase 13 Candidate Generation & Duplication Contract ──
+    generation_status: Literal["question_generated", "blocked_duplicate_regenerated", "no_question_available", ""]
+    generation_reason: str
+    selected_candidate_id: str
+    duplicate_details: dict
+    
     # Track terminal state for routing and UI evaluation rendering exclusively
     response_type: str
 

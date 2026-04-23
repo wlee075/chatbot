@@ -276,3 +276,25 @@ def route_after_session_context_node(state: PRDState) -> str:
         return "numeric_validation"
     return "discovery_questions"
 
+def route_after_generate_questions(state: PRDState) -> str:
+    """
+    If the question generator exhausted all candidates and has no active question,
+    safely bypass the `await_answer` lock and proceed directly to `draft`.
+    """
+    status = state.get("generation_status", "question_generated")
+    if status == "no_question_available":
+        route = "draft"
+    else:
+        route = "await_answer"
+        
+    log_event(
+        thread_id=state.get("thread_id", ""),
+        run_id=state.get("run_id", ""),
+        node_name="route_after_generate_questions",
+        level="INFO",
+        event_type="routing_decision",
+        message=f"Routing after generate_questions: {status} → {route}",
+        route=route,
+        reason=status,
+    )
+    return route

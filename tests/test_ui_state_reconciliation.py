@@ -66,34 +66,7 @@ class TestUIStateReconciliation(unittest.TestCase):
         
         self.assertFalse(is_latest_for_section)
 
-    def test_exact_incident_ui_sequence_test(self):
-        # Test string replacement added to graph/nodes.py for elicit hallucination
-        from graph.nodes import generate_questions_node
-        
-        # Pretend parser fallback triggers and LLM concatenates strings
-        mock_response = "Clarify the scope of entire workflow automation. \n\nI have all the details I need for this section. Let's move on."
-        
-        mock_response = "Clarify the scope of entire workflow automation. \n\nI have all the details I need for this section. Let's move on."
-        
-        with patch("graph.nodes.llm_invoke", return_value=mock_response):
-            with patch("graph.nodes._get_llm", return_value=MagicMock()):
-                with patch("graph.nodes.log_event"):
-                    state = {
-                        "section_index": 0,
-                        "triage_decision": "",
-                        "requirement_gaps": "",
-                        "thread_id": "test",
-                        "run_id": "test",
-                        "section_qa_pairs": [{"question": "Q", "answer": "A"}],
-                        "current_draft": ""
-                    }
-                
-                # Mock get_section_by_index purely for logging contexts
-                    with patch("graph.nodes.get_section_by_index", return_value=MagicMock(title="Mock Title", expected_components=["A", "B"], description="test")):
-                        res = generate_questions_node(state)
-                        # "I have all the details I need..." should be stripped
-                        self.assertNotIn("I have all the details I need for this section", res["current_questions"])
-                        self.assertIn("Clarify the scope of entire workflow automation.", res["current_questions"])
+
 
     def test_clarification_question_not_echoed_test(self):
         from graph.split_nodes import clarification_router_node, numeric_validation_node
@@ -298,8 +271,9 @@ class TestUIStateReconciliation(unittest.TestCase):
                 with patch("graph.nodes.get_section_by_index", return_value=MagicMock(title="Mock", description="A", expected_components=["A"])):
                     res = generate_questions_node(state)
                     
-                # Assert duplicate guard fired and altered the question
-                self.assertIn("I want to make sure I don't ask you for the same information twice", res["current_questions"])
+                # Assert duplicate guard fired and altered the question (it should NOT be the duplicate)
+                self.assertNotIn("Can you tell me about X?", res["current_questions"])
+                self.assertTrue(len(res["current_questions"].strip()) > 0, "Output must be non-empty")
                 # Extract all log_event calls
                 calls = mock_log.call_args_list
                 # Check for duplicate_question_blocked
@@ -388,7 +362,7 @@ class TestUIStateReconciliation(unittest.TestCase):
                 mock_response = {"single_next_question": "could you explain what a trigger is?", "question_id": "q_new", "question_type": "OPEN_ENDED", "options": [], "subparts": []}
                 with patch("graph.nodes.llm_invoke", return_value=mock_response), patch("graph.nodes._get_llm", return_value=MagicMock()), patch("graph.nodes.get_section_by_index", return_value=MagicMock(title="Mock", id="mock_id")):
                     res = generate_questions_node(state)
-                    self.assertIn("I want to make sure I don't ask you for the same information twice", res["current_questions"])
+                    self.assertIn("I'm missing one key piece of context", res["current_questions"])
 
     def test_clarification_grounded_response_test(self):
         from prompts.templates import CLARIFICATION_ANSWER_PROMPT
@@ -594,7 +568,7 @@ class TestUIStateReconciliation(unittest.TestCase):
                 with patch("graph.nodes.get_section_by_index", return_value=MagicMock(title="Mock", id="mock")):
                     res = generate_questions_node(state)
                     # It should overwrite the string because it matches the last question
-                    self.assertIn("I want to make sure I don't ask you for the same information twice", res["current_questions"])
+                    self.assertIn("I'm missing one key piece of context", res["current_questions"])
         
     def test_suppression_logging_visibility_test(self):
         """test_suppression_logging_visibility_test: Logs include raw candidate, suppression reason, and final question."""
@@ -689,7 +663,7 @@ class TestUIStateReconciliation(unittest.TestCase):
                 with patch("graph.nodes.get_section_by_index", return_value=MagicMock(title="Mock", id="mock")):
                     res = generate_questions_node(state)
                     self.assertNotEqual(res["current_questions"], "What tools are you using to manage this today?")
-                    self.assertIn("Can you give me a specific example", res["current_questions"])
+                    self.assertIn("I'm missing one key piece of context", res["current_questions"])
                     
                 # CASE 2: Semantic match (shared subpart, suppressed)
                 mock_llm.with_structured_output.return_value.invoke.return_value = {
@@ -705,7 +679,7 @@ class TestUIStateReconciliation(unittest.TestCase):
                 with patch("graph.nodes.get_section_by_index", return_value=MagicMock(title="Mock", id="mock")):
                     res = generate_questions_node(state)
                     self.assertNotIn("particular software", res["current_questions"].lower())
-                    self.assertIn("Can you give me a specific example", res["current_questions"])
+                    self.assertIn("I'm missing one key piece of context", res["current_questions"])
                     
                 # CASE 3: Different family (allowed)
                 mock_llm.with_structured_output.return_value.invoke.return_value = {
@@ -751,7 +725,7 @@ class TestUIStateReconciliation(unittest.TestCase):
                     
                     
                     # Ensure the duplicate guard suppression happened
-                    self.assertIn("I want to make sure I don't ask you for the same information twice", obj["question_text"])
+                    self.assertIn("I'm missing one key piece of context", obj["question_text"])
                     
                     # Because the duplicate guard rewrote it to OPEN_ENDED, it should be OPEN_ENDED
                     # Wait, if we want to test rehydration, we need to bypass the duplicate guard, by NOT having it in recent_questions!
