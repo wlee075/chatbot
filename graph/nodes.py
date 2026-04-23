@@ -222,10 +222,13 @@ def _synthesize_section_draft_from_qa_store(section_id: str, qa_store: dict) -> 
     """
     seen: set = set()
     lines: list = []
-    # Sort by version descending so latest facts win deduplication
+    # Sort by version descending so latest facts win deduplication.
+    # Guard: qa_store values may be raw strings in some store layouts — skip those.
     entries = sorted(
         [(k, v) for k, v in qa_store.items()
-         if v.get("section_id") == section_id and not v.get("contradiction_flagged")],
+         if isinstance(v, dict)
+         and v.get("section_id") == section_id
+         and not v.get("contradiction_flagged")],
         key=lambda kv: kv[1].get("version", 0),
         reverse=True,
     )
@@ -239,48 +242,108 @@ def _synthesize_section_draft_from_qa_store(section_id: str, qa_store: dict) -> 
 
 # ── PDF Report helpers ─────────────────────────────────────────────
 
+def _is_safe_line(text: str) -> bool:
+    """Return True if a line is substantive enough for a professional PDF report.
+
+    Filters out:
+    - Fewer than 4 words (one-word bullets, partial fragments)
+    - Question fragments (ends with ?)
+    - Conversation residue patterns
+    """
+    raw = text.strip().lstrip("-\u2022* ")
+    if not raw:
+        return False
+    words = raw.split()
+    if len(words) < 4:
+        return False
+    if raw.rstrip().endswith("?"):
+        return False
+    _RESIDUE_STARTS = (
+        "right,", "or is", "so you", "can you", "what about",
+        "i see", "got it", "okay", "sure,", "yes,", "no,",
+        "well,", "actually,", "but ", "and so",
+    )
+    if any(raw.lower().startswith(r) for r in _RESIDUE_STARTS):
+        return False
+    return True
+
+
 def _build_section_summaries(prd_sections: dict, qa_store: dict) -> list:
     """━━━━ T1 — canonical-data-aware section summary builder ━━━━
 
-    For each PRD section, in canonical order:
-      1. Use prd_sections[section.id] prose when present and non-empty.
-      2. Fall back to synthesizing from qa_store (deduplicated, latest-first).
-      3. Cross-normalise: deduplicate bullet lines that appear in BOTH sources.
-      4. Mark sections with no usable content as is_empty=True (T2).
+    For each PRD section, in canonical order, returns one of three states:
+      - status="complete": prd_sections has polished prose for this section.
+      - status="partial":  only qa_store has safe facts; prose is fragmentary.
+      - status="empty":    no trustworthy content at all.
 
-    Returns list of {id, title, prose, is_empty}.
-    Decision for empty sections: include them in the report under a clearly
-    labeled \u201cIncomplete / Not finalized\u201d note rather than silently omitting
-    (consistent, reviewable audit trail).
+    Partial sections also include a 'still_needed' list derived from the
+    section's expected_components to drive "Still needed:" rendering in the PDF.
+
+    Returns list of {id, title, prose, is_empty, status, still_needed}.
     """
     import re as _re
 
     def _normalize(text: str) -> str:
         return _re.sub(r"^[\-\u2022\*]\s*", "", text.strip()).lower()
 
+    if not isinstance(prd_sections, dict):
+        prd_sections = {}
+    if not isinstance(qa_store, dict):
+        qa_store = {}
+
     summaries = []
     for section in PRD_SECTIONS:
-        draft = (prd_sections.get(section.id) or "").strip()
+        _raw_draft = prd_sections.get(section.id)
+        draft = (str(_raw_draft) if _raw_draft and not isinstance(_raw_draft, str) else (_raw_draft or "")).strip()
         synth = _synthesize_section_draft_from_qa_store(section.id, qa_store).strip()
 
-        # Merge and deduplicate lines from both sources
-        seen_norms: set = set()
-        final_lines: list = []
-        for line in (draft + "\n" + synth).splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            norm = _normalize(line)
-            if norm and norm not in seen_norms:
-                seen_norms.add(norm)
-                final_lines.append(line)
+        # ── Determine status ──────────────────────────────────────────────────
+        # prd_sections prose = polished LLM-written draft (section is complete)
+        # qa_store only = raw answers, possibly fragmentary (section is partial)
+        draft_lines = [l.strip() for l in draft.splitlines() if l.strip()]
+        safe_draft_lines = [l for l in draft_lines if _is_safe_line(l)]
 
-        prose = "\n".join(final_lines).strip()
+        synth_lines = [l.strip() for l in synth.splitlines() if l.strip()]
+        safe_synth_lines = [l for l in synth_lines if _is_safe_line(l)]
+
+        if safe_draft_lines:
+            # Polished prose exists — section is complete
+            # Deduplicate against synth enrichment
+            seen_norms: set = set()
+            final_lines: list = []
+            for line in (draft + "\n" + synth).splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                norm = _normalize(line)
+                if norm and norm not in seen_norms:
+                    seen_norms.add(norm)
+                    final_lines.append(line)
+            prose = "\n".join(final_lines).strip()
+            status = "complete"
+            still_needed: list = []
+        elif safe_synth_lines:
+            # Only qa_store facts available — partial state
+            prose = "\n".join(safe_synth_lines)
+            status = "partial"
+            # Estimate still-needed from expected_components not clearly covered
+            covered_text = prose.lower()
+            still_needed = [
+                comp for comp in (section.expected_components or [])
+                if not any(w in covered_text for w in comp.lower().split()[:3])
+            ]
+        else:
+            prose = ""
+            status = "empty"
+            still_needed = list(section.expected_components or [])
+
         summaries.append({
             "id": section.id,
             "title": section.title,
             "prose": prose,
-            "is_empty": not prose,
+            "is_empty": status == "empty",
+            "status": status,
+            "still_needed": still_needed,
         })
     return summaries
 
@@ -299,7 +362,7 @@ def _build_executive_summary(summaries: list, state: dict) -> str:
     """
     import re as _re
 
-    non_empty = [s for s in summaries if not s["is_empty"]]
+    non_empty = [s for s in summaries if isinstance(s, dict) and not s.get("is_empty", True)]
     sentences: list = []
     for s in non_empty[:4]:
         first_sent = _re.split(r"\.\s+", s["prose"].replace("\n", " "))[0].strip().strip("-\u2022*").strip()
@@ -355,7 +418,10 @@ def _render_pdf(
 
         # Sanitize: fpdf2 built-in Helvetica only supports Latin-1.
         # Replace em-dash / bullet and encode to latin-1 lossy.
-        def _safe(text: str) -> str:
+        def _safe(text: object) -> str:  # noqa: ANN001
+            # Coerce non-str inputs (list, None, etc.) before calling .replace()
+            if not isinstance(text, str):
+                text = " ".join(str(i) for i in text) if isinstance(text, list) else str(text or "")
             return (
                 text.replace("\u2014", " - ")
                     .replace("\u2013", " - ")
@@ -414,7 +480,8 @@ def _render_pdf(
         _mc(8, "Executive Summary")
         pdf.set_font("Helvetica", "", 10)
         pdf.set_text_color(50, 50, 50)
-        _mc(6, executive_summary)
+        _exec_text = _safe(executive_summary) if isinstance(executive_summary, str) else "No structured requirements captured yet."
+        _mc(6, _exec_text or "No structured requirements captured yet.")
         pdf.ln(6)
 
         # ── Requirements by section ──
@@ -423,18 +490,69 @@ def _render_pdf(
         _mc(8, "Requirements by Section")
         pdf.ln(2)
 
-        for s in summaries:
-            pdf.set_font("Helvetica", "B", 11)
-            pdf.set_text_color(40, 40, 40)
-            _mc(7, _safe(s["title"]))
-            pdf.set_font("Helvetica", "", 10)
-            if s["is_empty"]:
-                pdf.set_text_color(160, 80, 0)
-                _mc(6, "[Incomplete / Not finalized]")
-            else:
-                pdf.set_text_color(50, 50, 50)
-                _mc(6, _safe(s["prose"]))
-            pdf.ln(4)
+        # Normalize summaries: ensure it's a list of dicts; handle empty/stub case
+        _safe_summaries = [s for s in (summaries or []) if isinstance(s, dict)]
+        if not _safe_summaries:
+            pdf.set_font("Helvetica", "I", 10)
+            pdf.set_text_color(100, 100, 100)
+            _mc(6, "No completed sections yet. Continue answering prompts to build the report.")
+        else:
+            for s in _safe_summaries:
+                status = s.get("status", "empty" if s.get("is_empty", True) else "complete")
+
+                # ── Section title ──────────────────────────────────────────
+                pdf.set_font("Helvetica", "B", 11)
+                pdf.set_text_color(40, 40, 40)
+                _mc(7, _safe(s.get("title", "")))
+                pdf.set_font("Helvetica", "", 10)
+
+                if status == "complete":
+                    # Polished prose — render as-is
+                    pdf.set_text_color(50, 50, 50)
+                    _mc(6, _safe(s.get("prose", "")))
+
+                elif status == "partial":
+                    # Professional draft state: structured partial summary
+                    pdf.set_text_color(70, 100, 140)
+                    _mc(5, "Status: In progress")
+                    pdf.set_text_color(50, 50, 50)
+                    pdf.ln(1)
+
+                    # What we know so far
+                    pdf.set_font("Helvetica", "B", 10)
+                    _mc(5, "What we know so far:")
+                    pdf.set_font("Helvetica", "", 10)
+                    prose = (s.get("prose") or "").strip()
+                    if prose:
+                        for line in prose.splitlines():
+                            line = line.strip()
+                            if line:
+                                bullet = line if line.startswith("-") else f"- {line}"
+                                _mc(5, _safe(bullet))
+                    else:
+                        _mc(5, "- No clear facts captured yet for this section.")
+
+                    # Still needed
+                    still_needed = s.get("still_needed") or []
+                    if still_needed:
+                        pdf.ln(1)
+                        pdf.set_font("Helvetica", "B", 10)
+                        _mc(5, "Still needed:")
+                        pdf.set_font("Helvetica", "", 10)
+                        pdf.set_text_color(160, 80, 0)
+                        for item in still_needed[:5]:  # cap at 5 to avoid overflow
+                            _mc(5, _safe(f"- {item}"))
+                        pdf.set_text_color(50, 50, 50)
+
+                else:
+                    # Empty — no trustworthy content yet
+                    pdf.set_text_color(120, 120, 120)
+                    _mc(5, "Status: Needs more data")
+                    pdf.set_text_color(160, 80, 0)
+                    _mc(6, "[Needs more data to fill]")
+                    pdf.set_text_color(50, 50, 50)
+
+                pdf.ln(4)
 
         # ── Open Questions ──
         pdf.set_font("Helvetica", "B", 13)
@@ -461,8 +579,9 @@ def _render_pdf(
         return bytes(pdf.output())
 
     except Exception as _pdf_err:  # noqa: BLE001
-        import sys
+        import sys, traceback as _tb
         print(f"[finalize_node] PDF render failed: {_pdf_err}", file=sys.stderr)
+        _tb.print_exc(file=sys.stderr)
         return b""
 
 
@@ -2810,6 +2929,30 @@ def _classify_target_confidence(state: "PRDState", section) -> tuple[str, str | 
             f"No canonical components available to evaluate{rehydration_note}",
             "NO_REGISTRY")
 
+def _extract_draft_markers(section_id: str, prd_sections: dict) -> "str | None":
+    """Inspect the current section draft for structured unresolved markers.
+
+    Priority order per senior spec:
+      1. [NEEDS CLARIFICATION: <topic>]
+      2. [NEEDS: <topic>]
+      3. [MISSING: <topic>]
+      4. [OPEN QUESTION: <topic>]
+
+    Returns the first matched topic as a plain string, or None if none found.
+    Handles non-string/absent drafts defensively.
+    """
+    import re as _re
+    draft = prd_sections.get(section_id, "") if isinstance(prd_sections, dict) else ""
+    if not draft or not isinstance(draft, str):
+        return None
+    pattern = _re.compile(
+        r"\[(?:NEEDS?\s+CLARIFICATION|NEEDS?|MISSING|OPEN\s+QUESTION)\s*:\s*([^\]]+)\]",
+        _re.IGNORECASE,
+    )
+    matches = pattern.findall(draft)
+    return matches[0].strip() if matches else None
+
+
 def generate_questions_node(state: "PRDState") -> dict:
     import time
     ctx = _log_ctx(state, "generate_questions_node")
@@ -2899,8 +3042,27 @@ def generate_questions_node(state: "PRDState") -> dict:
         }, "", section.title if section else "Unknown", state["section_index"], state.get("iteration", 0), event_type="elicit")
     
     base_prompt = _build_elicitor_prompt_context(state, section, bridge_output)
-    
-    if confidence == "STRONG":
+
+    # ── Highest priority: draft marker resolution (B1-B4 per spec) ───────────
+    # If the current section draft explicitly flags an unresolved item, that
+    # marker becomes the question source — overriding A/B confidence routing.
+    draft_marker = _extract_draft_markers(section.id, state.get("prd_sections", {}))
+    if draft_marker:
+        lane_instruction = (
+            f"\n\nDRAFT MARKER RESOLUTION: The current section draft explicitly marks "
+            f"this as unresolved: '{draft_marker}'. "
+            f"Generate exactly ONE natural-language question that names this specific "
+            f"missing detail and asks the user to provide it directly. "
+            f"Do NOT produce a vague or generic prompt. "
+            f"Do NOT ask the user to open any panel or draft. "
+            f"The question must be answerable in one reply without further context."
+        )
+        system_prompt = base_prompt + lane_instruction
+        active_lane = "draft_marker"
+        log_event(**ctx, level="INFO", event_type="draft_marker_lane_activated",
+                  message=f"Draft marker found, overriding A/B selection: '{draft_marker}'",
+                  marker=draft_marker, section_id=section.id)
+    elif confidence == "STRONG":
         # Lane A: anchor the LLM to a specific validated target
         lane_instruction = (
             f"\n\nTARGET LOCK: The specific detail still missing is: '{target}'. "
@@ -2925,7 +3087,7 @@ def generate_questions_node(state: "PRDState") -> dict:
             )
         system_prompt = base_prompt + lane_instruction
         active_lane = "B"
-    
+
     generation_status = "question_generated"
     rejection_reasons = []
     

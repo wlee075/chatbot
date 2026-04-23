@@ -15,6 +15,7 @@ from langgraph.types import Command
 from config.sections import PRD_SECTIONS
 from graph.builder import build_graph
 from prompts.templates import DEFAULT_MAX_SECTION_ITERATIONS
+from utils.progress_rail import compute_progress_data
 import warnings
 
 # Suppress Checkpointer unregistered type warnings for previous Enum states inside old SQLite streams
@@ -237,6 +238,183 @@ def _display_section_title(raw: str) -> str:
     if low in {"headliner", "headliner paragraph", "tldr", "tl;dr"}:
         return "Summary"
     return raw
+
+
+# ── Sticky right-side progress rail ───────────────────────────────────────────
+
+def _render_progress_rail(sv: dict) -> None:
+    """Compute progress data and inject a CSS-fixed right-side progress rail.
+
+    Uses position:fixed so it floats independently of scroll position without
+    restructuring the Streamlit column layout. A right-margin is added to the
+    main block-container so content is not obscured.
+    """
+    import html as _html
+    data = compute_progress_data(sv, PRD_SECTIONS)
+    pct         = data["pct"]
+    current     = _html.escape(data["current_title"])
+    checklist   = data["checklist"]
+    still_needed = data["still_needed"]
+
+    # ── Checklist rows ────────────────────────────────────────────────────────
+    rows_html = ""
+    for row in checklist:
+        title = _html.escape(row["title"])
+        if row["status"] == "complete":
+            rows_html += (
+                f'<div class="prd-rail-row prd-rail-done">'
+                f'<span class="prd-rail-icon">✓</span> {title}</div>'
+            )
+        elif row["status"] == "current":
+            rows_html += (
+                f'<div class="prd-rail-row prd-rail-cur">'
+                f'<span class="prd-rail-icon">→</span> <strong>{title}</strong></div>'
+            )
+        else:
+            rows_html += (
+                f'<div class="prd-rail-row prd-rail-pending">'
+                f'<span class="prd-rail-icon">·</span> {title}</div>'
+            )
+
+    # ── Still-needed block ────────────────────────────────────────────────────
+    missing_html = ""
+    if still_needed:
+        items = "".join(
+            f'<div class="prd-rail-missing-item">• {_html.escape(i)}</div>'
+            for i in still_needed
+        )
+        missing_html = (
+            '<div class="prd-rail-missing">'
+            '<div class="prd-rail-missing-hdr">Still needed</div>'
+            + items +
+            '</div>'
+        )
+
+    bar_width = max(0, min(100, pct))  # clamp
+
+    panel = f"""
+<style>
+/* rail panel */
+.prd-rail {{
+    position: fixed;
+    right: 1rem;
+    top: 3.5rem;
+    width: 210px;
+    background: #12121c;
+    border: 1px solid #2d2d44;
+    border-radius: 10px;
+    padding: 14px 14px 12px;
+    z-index: 9000;
+    box-shadow: 0 4px 20px rgba(0,0,0,.45);
+    font-family: system-ui, -apple-system, sans-serif;
+    max-height: calc(100vh - 6rem);
+    overflow-y: auto;
+    scrollbar-width: none;
+}}
+.prd-rail::-webkit-scrollbar {{ display: none; }}
+/* progress area */
+.prd-rail-hdr {{
+    font-size: 10px;
+    font-weight: 700;
+    color: #6b7280;
+    letter-spacing: .07em;
+    text-transform: uppercase;
+    margin-bottom: 7px;
+}}
+.prd-rail-bar-bg {{
+    background: #1f2937;
+    border-radius: 4px;
+    height: 6px;
+    margin-bottom: 4px;
+}}
+.prd-rail-bar-fill {{
+    background: linear-gradient(90deg,#6366f1,#22d3ee);
+    height: 6px;
+    border-radius: 4px;
+    transition: width .4s ease;
+    width: {bar_width}%;
+}}
+.prd-rail-pct {{
+    font-size: 11px;
+    color: #d1d5db;
+    margin-bottom: 10px;
+}}
+/* current badge */
+.prd-rail-badge {{
+    font-size: 11px;
+    color: #a5b4fc;
+    font-weight: 700;
+    background: #1e1b4b;
+    border-radius: 6px;
+    padding: 4px 8px;
+    margin-bottom: 10px;
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}}
+/* checklist */
+.prd-rail-divider {{
+    border-top: 1px solid #2d2d44;
+    margin-bottom: 7px;
+}}
+.prd-rail-row {{
+    font-size: 11px;
+    padding: 2px 0;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}}
+.prd-rail-icon {{ flex-shrink: 0; }}
+.prd-rail-done   {{ color: #22c55e; }}
+.prd-rail-cur    {{ color: #a5b4fc; }}
+.prd-rail-pending {{ color: #4b5563; }}
+/* still needed */
+.prd-rail-missing {{
+    margin-top: 10px;
+    border-top: 1px solid #2d2d44;
+    padding-top: 8px;
+}}
+.prd-rail-missing-hdr {{
+    font-size: 10px;
+    font-weight: 700;
+    color: #6b7280;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+}}
+.prd-rail-missing-item {{
+    font-size: 10px;
+    color: #f59e0b;
+    padding: 1px 0;
+    white-space: normal;
+    line-height: 1.4;
+}}
+/* push main content left so rail does not cover text */
+section[data-testid="stMain"] > div > div.block-container {{
+    padding-right: 230px !important;
+}}
+@media (max-width: 800px) {{
+    .prd-rail {{ display: none; }}
+    section[data-testid="stMain"] > div > div.block-container {{
+        padding-right: 1rem !important;
+    }}
+}}
+</style>
+<div class="prd-rail">
+  <div class="prd-rail-hdr">PRD Progress</div>
+  <div class="prd-rail-bar-bg"><div class="prd-rail-bar-fill"></div></div>
+  <div class="prd-rail-pct">{pct}% complete &nbsp; ({data['completed']} of {data['total']})</div>
+  <span class="prd-rail-badge" title="{current}">→ {current}</span>
+  <div class="prd-rail-divider"></div>
+  {rows_html}
+  {missing_html}
+</div>
+"""
+    st.markdown(panel, unsafe_allow_html=True)
 
 
 def _build_source_message_lookup(chat_history: list[dict], store: dict) -> dict[str, str]:
@@ -676,6 +854,10 @@ def _stream_graph_resume(payload: dict | str) -> None:
 gstate = _get_graph_state() if st.session_state.graph_started else None
 sv: dict = gstate.values if gstate else {}
 
+# ── Sticky right-rail (rendered once per rerun, position:fixed floats over UI) ─
+if st.session_state.graph_started and sv:
+    _render_progress_rail(sv)
+
 # ── Top bar (D-M1): visible only when session is active ───────────────────────
 if st.session_state.graph_started:
     col_title, _sp, col_end, col_new, col_dl = st.columns([4, 1, 1, 1, 1])
@@ -706,13 +888,34 @@ if st.session_state.graph_started:
                 use_container_width=True,
                 type="primary",
             )
-        # PDF download button (U1: only when bytes are present)
-        prd_pdf = sv.get("prd_pdf_bytes", b"")
+        # ── PDF download — always a live snapshot of current session state ────
+        # Regenerated on every Streamlit render pass so the bytes always reflect
+        # the latest confirmed_qa_store and prd_sections, not a stale cached copy.
+        prd_pdf = b""
+        if st.session_state.get("graph_started"):
+            try:
+                from graph.nodes import _render_pdf, _build_section_summaries, _build_executive_summary
+                import datetime as _dt
+                _sections = sv.get("prd_sections", {})
+                _qa = sv.get("confirmed_qa_store", {})
+                _summaries = _build_section_summaries(
+                    _sections if isinstance(_sections, dict) else {},
+                    _qa if isinstance(_qa, dict) else {},
+                )
+                _exec = _build_executive_summary(_summaries, _qa if isinstance(_qa, dict) else {})
+                _ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+                _report_title = (
+                    sv.get("prd_report_title", "")
+                    or "Draft Requirements Report"
+                )
+                prd_pdf = _render_pdf(_report_title, _ts, _exec, _summaries)
+            except Exception:
+                pass  # silently degrade; button hidden if generation fails
+
         if prd_pdf:
-            raw_title = sv.get("prd_report_title", "") or "requirements_report"
-            safe_title = re.sub(r"[^\w\s\-]", "", raw_title).strip().replace(" ", "_")[:60]
+            safe_title = re.sub(r"[^\w\s\-]", "", _report_title).strip().replace(" ", "_")[:60] or "requirements_report"
             st.download_button(
-                label="📅 Download PDF",
+                label="📥 Download PDF",
                 data=prd_pdf,
                 file_name=f"{safe_title}.pdf",
                 mime="application/pdf",

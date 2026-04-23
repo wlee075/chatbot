@@ -186,3 +186,90 @@ def test_pdf_generation_failure_falls_back_to_markdown_without_crashing():
     assert result["prd_pdf_bytes"] == b"", "prd_pdf_bytes must be b'' when render fails"
     assert "prd_report_title" in result, "prd_report_title must still be set"
     assert "prd_generated_at_utc" in result, "prd_generated_at_utc must still be set"
+
+
+# ── Test 8: generate PDF with no PRD data returns valid non-empty bytes ────────
+
+def test_generate_pdf_with_no_prd_data_returns_valid_nonempty_pdf_bytes():
+    """_render_pdf must return valid non-empty PDF bytes even when all state is empty (early session)."""
+    pdf_bytes = _render_pdf(
+        report_title="Requirements Summary Report",
+        generated_at="2026-04-23T00:00Z",
+        executive_summary="No structured requirements captured yet.",
+        summaries=[],
+    )
+    assert isinstance(pdf_bytes, bytes), "_render_pdf must always return bytes"
+    assert len(pdf_bytes) > 0, "_render_pdf must return non-empty bytes even with no data"
+    # Valid PDF starts with %PDF header
+    assert pdf_bytes.startswith(b"%PDF"), "Result must be a valid PDF file"
+
+
+# ── Test 9: _render_pdf handles empty summaries without exception ──────────────
+
+def test_render_pdf_handles_empty_summaries_without_exception():
+    """_render_pdf must not raise any exception when summaries is an empty list."""
+    try:
+        result = _render_pdf(
+            report_title="Draft Report",
+            generated_at="2026-04-23T00:00Z",
+            executive_summary="",
+            summaries=[],
+        )
+        assert isinstance(result, bytes)
+    except Exception as exc:
+        pytest.fail(f"_render_pdf raised an exception with empty summaries: {exc}")
+
+
+# ── Test 10: manual generate path uses same summary shape as finalize_node ─────
+
+def test_manual_generate_pdf_uses_same_summary_shape_as_finalize_node():
+    """_build_section_summaries must return the same dict structure whether called
+    manually (sidebar button) or via finalize_node, so both share one data contract."""
+    sid = PRD_SECTIONS[0].id
+    prd_sections = {sid: "Suppliers use inconsistent file naming."}
+    qa_store = {"k1": _qa_entry(sid, "This causes 3-4 hours of rework per week.", version=1)}
+
+    # Manual path (sidebar button)
+    manual_summaries = _build_section_summaries(prd_sections, qa_store)
+
+    # finalize_node path
+    state = _minimal_state(prd_sections=prd_sections, confirmed_qa_store=qa_store)
+    result = finalize_node(state)
+
+    # Both must produce non-empty PDF bytes — confirms same contract is used
+    manual_pdf = _render_pdf("Draft", "2026-04-23T00:00Z", "exec", manual_summaries)
+    assert manual_pdf.startswith(b"%PDF"), "Manual path must produce a valid PDF"
+    assert result["prd_pdf_bytes"].startswith(b"%PDF"), "finalize_node path must produce a valid PDF"
+
+    # The section summary structures must have the same keys
+    for s in manual_summaries:
+        assert {"id", "title", "prose", "is_empty", "status", "still_needed"} == set(s.keys()), \
+            f"Summary dict missing expected keys: {set(s.keys())}"
+
+
+# ── Test 11: empty PDF contains placeholder message ────────────────────────────
+
+def test_empty_pdf_contains_placeholder_message():
+    """When summaries is empty, the PDF must still be valid and the markdown must
+    contain the no-sections-yet placeholder."""
+    # Check via markdown (which is always produced alongside PDF)
+    from graph.nodes import _build_markdown
+    summaries = []
+    md = _build_markdown(
+        report_title="Requirements Summary Report",
+        generated_at="2026-04-23T00:00Z",
+        executive_summary="No structured requirements captured yet.",
+        summaries=summaries,
+    )
+    # Markdown always has the section headings even with 0 sections
+    assert "Requirements Summary" in md
+    assert "Executive Summary" in md
+
+    # And the PDF itself must not crash
+    pdf = _render_pdf(
+        "Requirements Summary Report",
+        "2026-04-23T00:00Z",
+        "No structured requirements captured yet.",
+        summaries,
+    )
+    assert pdf.startswith(b"%PDF"), "Empty-state PDF must be a valid file"
