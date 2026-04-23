@@ -144,12 +144,19 @@ class TestClassifyTargetConfidence:
         assert "synthetic" in reason.lower() or "stale" in reason.lower()
 
     def test_empty_nothing_left(self):
-        """D4: No remaining subparts → EMPTY"""
+        """D4: EMPTY only when ALL canonical components are resolved in QA store.
+        With rehydration, empty remaining_subparts + empty QA store = MODERATE (all components recovered)."""
         section = FakeSection()
+        # To truly get EMPTY, ALL section components must be resolved
         state = {
             "remaining_subparts": [],
             "concept_conflicts": [],
-            "confirmed_qa_store": {},
+            "confirmed_qa_store": {
+                "q1": {"section_id": "problem_statement", "resolved_subparts": ["who experiences the problem"]},
+                "q2": {"section_id": "problem_statement", "resolved_subparts": ["what the problem specifically is"]},
+                "q3": {"section_id": "problem_statement", "resolved_subparts": ["why it matters (business or user impact)"]},
+                "q4": {"section_id": "problem_statement", "resolved_subparts": ["what happens if it is not solved"]},
+            },
         }
         confidence, target, candidates, reason = _classify_target_confidence(state, section)
         assert confidence == "EMPTY"
@@ -559,7 +566,7 @@ class TestSadPath:
         mock_build_prompt, mock_invoke, mock_normalize, mock_construct,
         mock_dup, mock_package
     ):
-        """When remaining_subparts are all in confirmed_qa_store, classifier
+        """When ALL section components are resolved in QA store, classifier
         returns EMPTY, and Lane B inference fires."""
         mock_section.return_value = FakeSection()
         resp = _llm_response("Is there anything else about this problem?")
@@ -583,10 +590,18 @@ class TestSadPath:
                     "section_id": "problem_statement",
                     "resolved_subparts": ["what the problem specifically is"],
                 },
+                "q3": {
+                    "section_id": "problem_statement",
+                    "resolved_subparts": ["why it matters (business or user impact)"],
+                },
+                "q4": {
+                    "section_id": "problem_statement",
+                    "resolved_subparts": ["what happens if it is not solved"],
+                },
             },
         ))
 
-        # Lane B inference mode should be used
+        # Lane B inference mode should be used (all components resolved)
         prompt_arg = mock_invoke.call_args[0][0]
         assert "INFERENCE MODE" in prompt_arg
 
@@ -753,3 +768,129 @@ class TestProductMappingEndToEnd:
             f"System repeated the generic problem question: '{questions_arg}'"
         assert questions_arg and len(questions_arg.strip()) > 0, \
             "Output must be non-empty"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Canonical Registry Rehydration Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCanonicalRehydration:
+    """Tests that _classify_target_confidence rehydrates from the canonical
+    section registry when remaining_subparts is empty or fully resolved."""
+
+    def test_classify_target_confidence_rehydrates_from_canonical_registry_when_remaining_subparts_empty(self):
+        """When remaining_subparts is empty and QA store has partial resolution,
+        rehydration must recover unresolved canonical targets."""
+        section = FakeSection()
+        state = {
+            "remaining_subparts": [],  # empty — starvation scenario
+            "concept_conflicts": [],
+            "confirmed_qa_store": {
+                "q1": {
+                    "section_id": "problem_statement",
+                    "resolved_subparts": ["who experiences the problem"],
+                },
+            },
+        }
+        confidence, target, candidates, reason = _classify_target_confidence(state, section)
+        
+        # Must NOT be EMPTY — 3 canonical components remain unresolved
+        assert confidence != "EMPTY", f"Expected rehydration to recover targets, got EMPTY: {reason}"
+        # Must indicate rehydration occurred
+        assert "REHYDRATED" in reason, f"Expected rehydration telemetry, got: {reason}"
+        # Should be MODERATE (3 candidates)
+        assert confidence == "MODERATE"
+        assert len(candidates) == 3
+
+    def test_empty_remaining_subparts_does_not_force_empty_confidence_when_canonical_targets_remain(self):
+        """Even with zero remaining_subparts, if canonical targets exist that
+        are not yet resolved in QA store, confidence must not be EMPTY."""
+        section = FakeSection()
+        state = {
+            "remaining_subparts": [],
+            "concept_conflicts": [],
+            "confirmed_qa_store": {},  # nothing resolved yet
+        }
+        confidence, target, candidates, reason = _classify_target_confidence(state, section)
+        # All 4 components should be recovered
+        assert confidence == "MODERATE", f"Expected MODERATE (4 unresolved), got {confidence}"
+        assert len(candidates) == 4
+        assert "REHYDRATED" in reason
+
+    def test_parser_fallback_does_not_starve_future_target_selection(self):
+        """After parser fallback fires, the subparts written to state
+        must be canonical (not phantom), enabling future target selection."""
+        from graph.nodes import _normalize_generated_question
+
+        state = {
+            "remaining_subparts": [],  # empty — simulating starvation
+            "recent_questions": [],
+            "user_facing_gap_reason": "",
+            "question_status": "OPEN",
+            "section_index": 0,
+            "confirmed_qa_store": {
+                "q1": {
+                    "section_id": "problem_statement",
+                    "resolved_subparts": ["who experiences the problem"],
+                },
+            },
+        }
+        ctx = {"thread_id": "t1", "run_id": "r1", "node_name": "test"}
+
+        with patch("graph.nodes.log_event"):
+            with patch("graph.nodes._get_llm", return_value=MagicMock(model="test")):
+                with patch("graph.nodes.get_section_by_index", return_value=FakeSection()):
+                    norm_response, _ = _normalize_generated_question(
+                        "Some raw LLM string", state, ctx
+                    )
+
+        # Subparts must be canonical, not phantom
+        subparts = norm_response.get("subparts", [])
+        assert "clarification" not in subparts, "Phantom blocker must not appear"
+        # Subparts should be derived from section registry minus resolved
+        assert len(subparts) > 0, "Parser fallback must seed canonical subparts"
+        # Verify they're actual section components
+        for sp in subparts:
+            assert sp in FakeSection().expected_components, f"'{sp}' is not a canonical component"
+
+    @_node_test_patches
+    def test_product_mapping_case_advances_to_next_canonical_component_after_problem_answer(
+        self, mock_section, mock_ctx, mock_log, mock_bridge,
+        mock_repair, mock_conflict, mock_branch,
+        mock_build_prompt, mock_invoke, mock_normalize, mock_construct,
+        mock_dup, mock_package
+    ):
+        """After the user answers the 'problem' question, the system must
+        advance to the next unresolved canonical component, not repeat."""
+        mock_section.return_value = FakeSection()
+        # LLM returns a good focused question about the next component
+        next_q = "Who are the primary users affected by this problem?"
+        resp = _llm_response(next_q)
+        mock_invoke.return_value = (resp, 0.5)
+        mock_normalize.return_value = (resp, "")
+        mock_construct.return_value = next_q
+        mock_dup.return_value = (True, "", "")
+        mock_package.return_value = {"current_questions": next_q}
+
+        state = _make_state(
+            remaining_subparts=[],  # empty — starvation scenario post truth_commit
+            recent_questions=[
+                "I'm missing one key piece of context: what specific problem are you trying to solve here?"
+            ],
+            confirmed_qa_store={
+                "q1": {
+                    "section_id": "problem_statement",
+                    "questions": "I'm missing one key piece of context: what specific problem are you trying to solve here?",
+                    "answer": "We need to automate product mapping between our ERP and e-commerce platform.",
+                    "resolved_subparts": ["who experiences the problem"],
+                }
+            },
+        )
+
+        generate_questions_node(state)
+
+        # The prompt must contain FOCUS CANDIDATES (not INFERENCE MODE)
+        # because rehydration recovered 3 unresolved canonical components
+        prompt_arg = mock_invoke.call_args[0][0]
+        assert "FOCUS CANDIDATES" in prompt_arg or "INFERENCE MODE" not in prompt_arg or "MODERATE" in str(mock_log.call_args_list), \
+            f"Expected FOCUS CANDIDATES (rehydrated targets), but got prompt without them"

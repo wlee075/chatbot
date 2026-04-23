@@ -1916,12 +1916,29 @@ def _normalize_generated_question(response: dict | str, state: "PRDState", ctx: 
                 preserved_type = "BINARY_CLARIFICATION"
         
         # Preserve validated unresolved blockers from state — never inject phantom subparts.
-        # Filter out any non-semantic placeholders that may have leaked in from prior fallbacks.
+        # If remaining_subparts is empty, seed from canonical unresolved components (P3).
         PHANTOM_SUBPARTS = {"clarification", "fallback", "unknown"}
         validated_subparts = [
             s for s in state.get("remaining_subparts", [])
             if s not in PHANTOM_SUBPARTS
         ]
+        # Canonical seeding: if no valid subparts, derive from section registry
+        if not validated_subparts:
+            try:
+                _section = get_section_by_index(state.get("section_index", 0))
+                _qa_store = state.get("confirmed_qa_store", {})
+                _resolved = set()
+                for _v in _qa_store.values():
+                    if _v.get("section_id") == _section.id and not _v.get("contradiction_flagged"):
+                        for _sp in _v.get("resolved_subparts", []):
+                            _resolved.add(_sp)
+                            _resolved.add(_sp.lower().replace(" ", "_"))
+                for _comp in _section.expected_components:
+                    _comp_norm = _comp.lower().replace(" ", "_")
+                    if _comp not in _resolved and _comp_norm not in _resolved:
+                        validated_subparts.append(_comp)
+            except (IndexError, AttributeError):
+                pass
         response = {
             "question_id": f"fallback_{int(time.monotonic())}",
             "single_next_question": fallback_msg,
@@ -1938,6 +1955,22 @@ def _normalize_generated_question(response: dict | str, state: "PRDState", ctx: 
             s for s in state.get("remaining_subparts", [])
             if s not in PHANTOM_SUBPARTS
         ]
+        if not validated_subparts:
+            try:
+                _section = get_section_by_index(state.get("section_index", 0))
+                _qa_store = state.get("confirmed_qa_store", {})
+                _resolved = set()
+                for _v in _qa_store.values():
+                    if _v.get("section_id") == _section.id and not _v.get("contradiction_flagged"):
+                        for _sp in _v.get("resolved_subparts", []):
+                            _resolved.add(_sp)
+                            _resolved.add(_sp.lower().replace(" ", "_"))
+                for _comp in _section.expected_components:
+                    _comp_norm = _comp.lower().replace(" ", "_")
+                    if _comp not in _resolved and _comp_norm not in _resolved:
+                        validated_subparts.append(_comp)
+            except (IndexError, AttributeError):
+                pass
         response = {
             "question_id": "fallback_error",
             "single_next_question": fallback_msg,
@@ -2233,6 +2266,10 @@ def _classify_target_confidence(state: "PRDState", section) -> tuple[str, str | 
     """
     Deterministic target selection for the two-lane question generation architecture.
     
+    Uses remaining_subparts when valid, but REHYDRATES from the section's canonical
+    expected_components registry when remaining_subparts is empty or fully resolved.
+    This prevents starvation after parser fallback or blocker pipeline gaps.
+    
     Returns:
         (confidence, target, candidates, reason)
         - confidence: "STRONG" | "MODERATE" | "WEAK" | "EMPTY"
@@ -2246,50 +2283,76 @@ def _classify_target_confidence(state: "PRDState", section) -> tuple[str, str | 
     
     # Build canonical blocker registry from section expected_components
     canonical_components = set()
+    canonical_components_original = list(section.expected_components)  # preserve order
     for comp in section.expected_components:
-        # Normalize: "what problem is being solved" → "what_problem_is_being_solved"
         canonical_components.add(comp.lower().replace(" ", "_"))
-        canonical_components.add(comp)  # Also keep original form
+        canonical_components.add(comp)
     
     # Collect already-resolved subparts from the QA store for this section
+    # Normalize consistently: both original and underscore forms
     resolved_in_store = set()
     for v in qa_store.values():
         if v.get("section_id") == section.id and not v.get("contradiction_flagged"):
             for sp in v.get("resolved_subparts", []):
                 resolved_in_store.add(sp)
+                resolved_in_store.add(sp.lower().replace(" ", "_"))
+                resolved_in_store.add(sp.lower())
     
     # Filter remaining subparts: remove already resolved ones
-    unresolved = [s for s in remaining if s not in resolved_in_store]
+    unresolved = [s for s in remaining if s not in resolved_in_store
+                  and s.lower().replace(" ", "_") not in resolved_in_store]
+    
+    # ── Canonical Rehydration (F1/F2) ────────────────────────────────────────
+    # When remaining_subparts is empty or fully resolved, rehydrate from the
+    # section's canonical expected_components minus what's already resolved.
+    # This is RECOVERY, not blanket replacement (T3).
+    rehydrated = False
+    if not unresolved:
+        rehydrated_candidates = []
+        for comp in canonical_components_original:
+            comp_norm = comp.lower().replace(" ", "_")
+            if (comp not in resolved_in_store
+                    and comp_norm not in resolved_in_store
+                    and comp.lower() not in resolved_in_store):
+                rehydrated_candidates.append(comp)
+        if rehydrated_candidates:
+            unresolved = rehydrated_candidates
+            rehydrated = True
     
     # Separate canonical from synthetic
     canonical_unresolved = [s for s in unresolved if not _is_synthetic_blocker(s, canonical_components)]
     synthetic_unresolved = [s for s in unresolved if _is_synthetic_blocker(s, canonical_components)]
     
+    # Build reason prefix for telemetry (T2)
+    rehydration_note = ""
+    if rehydrated:
+        rehydration_note = f" [REHYDRATED from registry: {len(canonical_unresolved)} canonical, {len(synthetic_unresolved)} synthetic recovered]"
+    
     # D1: STRONG — one active conflict
     if conflicts:
         conflict_target = conflicts[0].get("surface", conflicts[0].get("concept_key", "concept"))
         return ("STRONG", conflict_target, [],
-                f"Active conflict on '{conflict_target}'")
+                f"Active conflict on '{conflict_target}'{rehydration_note}")
     
     # D1: STRONG — exactly one canonical unresolved blocker
     if len(canonical_unresolved) == 1:
         target = canonical_unresolved[0]
         return ("STRONG", target, [],
-                f"Exactly one canonical unresolved blocker: '{target}'")
+                f"Exactly one canonical unresolved blocker: '{target}'{rehydration_note}")
     
     # D2: MODERATE — multiple canonical candidates
     if len(canonical_unresolved) > 1:
         return ("MODERATE", None, canonical_unresolved,
-                f"Multiple canonical candidates remain: {canonical_unresolved}")
+                f"Multiple canonical candidates remain: {canonical_unresolved}{rehydration_note}")
     
     # D3: WEAK — only synthetic/stale blockers remain
     if synthetic_unresolved:
         return ("WEAK", None, synthetic_unresolved,
-                f"Only synthetic/stale blockers remain: {synthetic_unresolved}")
+                f"Only synthetic/stale blockers remain: {synthetic_unresolved}{rehydration_note}")
     
-    # D4: EMPTY — nothing left
+    # D4: EMPTY — truly nothing left (all components resolved)
     return ("EMPTY", None, [],
-            "No unresolved candidates in state")
+            f"All section components resolved in QA store{rehydration_note}")
 
 def generate_questions_node(state: "PRDState") -> dict:
     import time
