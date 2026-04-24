@@ -51,13 +51,10 @@ if "thread_id" not in st.session_state:
 def _get_graph():
     return build_graph(MemorySaver())
 
-
 graph = _get_graph()
-
 
 def _config() -> dict:
     return {"configurable": {"thread_id": st.session_state.thread_id}}
-
 
 def _get_graph_state():
     try:
@@ -76,7 +73,6 @@ def _get_display_image_summary(raw_block: str, ctx_hist: dict | None = None) -> 
         return m.group(1).strip()
     return raw_block.strip()
 
-
 # ── Gemini Vision helper (D-M3) ───────────────────────────────────────────────
 _VISION_PROMPT = (
     "Describe this image in plain English. "
@@ -85,7 +81,6 @@ _VISION_PROMPT = (
     "If the image contains none of those (e.g. meme, selfie, pet photo) "
     "respond with exactly: IRRELEVANT"
 )
-
 
 def _describe_image(file_bytes: bytes, mime_type: str) -> str | None:
     """Call Gemini Vision. Returns plain-text description or None if irrelevant."""
@@ -102,7 +97,6 @@ def _describe_image(file_bytes: bytes, mime_type: str) -> str | None:
     ])
     text = response.content.strip()
     return None if text.upper().startswith("IRRELEVANT") else text or None
-
 
 # ── Initial state builder (D-M2) ──────────────────────────────────────────────
 def _build_submit_payload(user_input: str, stashed_upload: dict | None, active_ref: dict | None = None) -> dict | None:
@@ -192,7 +186,6 @@ def _build_initial_state(image_context: list[str]) -> dict:
         "rebuild_count": 0,
     }
 
-
 # ── Placeholder detector ───────────────────────────────────────────────────────
 _PLACEHOLDER_RE = re.compile(
     r"\b[XYZ]\b"
@@ -230,7 +223,6 @@ _INTERNAL_TERM_REPLACEMENTS: dict[str, str] = {
     "concept_key": "source reference",
 }
 
-
 def _display_section_title(raw: str) -> str:
     """Map internal section names to user-facing labels."""
     if not raw:
@@ -239,7 +231,6 @@ def _display_section_title(raw: str) -> str:
     if low in {"headliner", "headliner paragraph", "tldr", "tl;dr"}:
         return "Summary"
     return raw
-
 
 # ── Compact timeline bar (above the input box) ──────────────────────────────
 
@@ -364,10 +355,6 @@ def _render_timeline_bar(sv: dict) -> None:
 """
     st.markdown(bar, unsafe_allow_html=True)
 
-
-
-
-
 def _build_source_message_lookup(chat_history: list[dict], store: dict) -> dict[str, str]:
     """Best-effort mapping from concept_key to user message anchor id."""
     user_msgs: list[tuple[int, str]] = [
@@ -395,7 +382,6 @@ def _build_source_message_lookup(chat_history: list[dict], store: dict) -> dict[
             used.add(best_idx)
             out[concept_key] = f"msg_{best_idx}"
     return out
-
 
 # ── Inject citation click handler + hover tooltip (once per session) ──────────────────────────
 _CITATION_HANDLER_JS = """
@@ -511,7 +497,6 @@ def _present_content(content: str, source_lookup: dict[str, str] | None = None, 
 
     return text
 
-
 def _find_placeholders(text: str) -> list[str]:
     found = []
     for pattern in (_PLACEHOLDER_RE, _PLACEHOLDER_CONTEXT_RE):
@@ -520,7 +505,6 @@ def _find_placeholders(text: str) -> list[str]:
             found.append(f"…{snippet}…")
     return found
 
-
 def _extract_reflection_items(reflection_text: str, label: str) -> list[str]:
     pattern = re.compile(
         rf"^\s*[-•*]?\s*{re.escape(label)}:\s*(.+?)\s*$",
@@ -528,13 +512,11 @@ def _extract_reflection_items(reflection_text: str, label: str) -> list[str]:
     )
     return [match.group(1).strip() for match in pattern.finditer(reflection_text or "")]
 
-
 def _extract_verdict_reason(reflection_text: str) -> str:
     match = re.search(r"VERDICT:\s*REWORK\s*-\s*(.+)$", reflection_text or "", re.IGNORECASE | re.MULTILINE)
     if match:
         return match.group(1).strip().rstrip(".") + "."
     return ""
-
 
 def _review_quality_checks(msg: dict) -> list[str]:
     rubric_scores = msg.get("rubric_scores", {}) or {}
@@ -551,7 +533,6 @@ def _review_quality_checks(msg: dict) -> list[str]:
             passed.append(label)
     return passed
 
-
 def _minor_wording_notes(msg: dict) -> list[str]:
     user_gaps = (msg.get("user_gaps") or msg.get("requirement_gaps") or "").splitlines()
     notes: list[str] = []
@@ -562,7 +543,6 @@ def _minor_wording_notes(msg: dict) -> list[str]:
         if re.search(r"wording|phrase|phrasing|tone|label|terminology|rename", stripped, re.IGNORECASE):
             notes.append(stripped)
     return notes[:3]
-
 
 def _build_review_summary(msg: dict) -> dict[str, object]:
     reflection_text = msg.get("content", "") or ""
@@ -606,9 +586,7 @@ def _build_review_summary(msg: dict) -> dict[str, object]:
         "confidence": msg.get("confidence", -1.0),
     }
 
-
 _SHOW_INTERNAL_REVIEW_DEBUG = os.getenv("SHOW_INTERNAL_REVIEW_DEBUG") == "1"
-
 
 # ── Streaming helper (Step 7) ─────────────────────────────────────────────────
 _STREAMING_NODES = frozenset({"generate_questions", "discovery_questions", "interpret_and_echo"})
@@ -677,7 +655,6 @@ def _build_status_card(completed: list[str], current: str) -> str:
     lines.append("</div>")
     return "\n".join(lines)
 
-
 def _thinking_text(elapsed: float) -> str:
     """Return the appropriate thinking-stage label for elapsed seconds."""
     label = _THINKING_STAGES[0][1]
@@ -690,7 +667,6 @@ def _thinking_text(elapsed: float) -> str:
 _REFERENCE_LABELS: dict[str, str] = {
     "REPLY_TO_MESSAGE": "Replying to earlier message",
 }
-
 
 def _render_message_actions(msg_id: str, content: str, role: str, msg_type: str) -> None:
     """
@@ -723,7 +699,6 @@ def _render_message_actions(msg_id: str, content: str, role: str, msg_type: str)
                 "source_message_role": role,
             }
             st.rerun()
-
 
 def _stream_graph_resume(payload: dict | str) -> None:
     """
@@ -1009,7 +984,6 @@ if st.session_state.graph_started:
                 )
 
     st.divider()
-
 
     # ── PRD Progress panel ────────────────────────────────────────────────────
     # Sticky bar: section badges + active section name label.
@@ -1478,6 +1452,240 @@ if st.session_state.graph_started and st.session_state.get("active_reference"):
             st.session_state.active_reference = None
             st.rerun()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Unified multimodal composer CSS + helper
+# ─────────────────────────────────────────────────────────────────────────────
+_COMPOSER_CSS = """<style>
+/* ── Voice confirmation card ──────────────────────────────────── */
+.transcript-card {
+    background: #f0f4ff; border: 1px solid #b3c6f7;
+    border-radius: 12px; padding: 16px 18px 12px; margin-bottom: 10px;
+}
+.transcript-card-header {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 0.92rem; font-weight: 600; color: #2d3748; margin-bottom: 10px;
+}
+
+/* ═══════════════════════════════════════
+   COMPOSER BAR
+   [ + upload ] [ text input flex:1 ] [ 🎙️ mic ] [ → send ]
+   Built with st.form + st.columns inside bottom().
+   st.audio_input is NEVER rendered in this bar.
+   ═══════════════════════════════════════ */
+
+/* 1. Bottom strip */
+div[data-testid="stBottom"] > div {
+    padding: 8px 16px 10px !important;
+    background: #ffffff !important;
+    border-top: 1px solid #e2e8f0 !important;
+}
+/* 2. Form: no chrome */
+div[data-testid="stBottom"] [data-testid="stForm"] {
+    border: none !important; background: transparent !important;
+    padding: 0 !important; max-width: 820px !important; margin: 0 auto !important;
+}
+/* 3. Columns row → the pill bar visual container */
+div[data-testid="stBottom"] [data-testid="stHorizontalBlock"] {
+    background: #f8fafc !important;
+    border: 1.5px solid #dde1e9 !important;
+    border-radius: 28px !important;
+    padding: 4px 6px 4px 8px !important;
+    align-items: center !important;
+    gap: 8px !important;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.05) !important;
+}
+
+/* ── Col 0: upload — HIDDEN ────────────────────────────────────── */
+div[data-testid="stBottom"] [data-testid="stFileUploader"] { display: none !important; }
+
+/* Hide all file uploader chrome — leave only the browse button */
+div[data-testid="stBottom"] [data-testid="stFileUploaderDropzone"] {
+    border: none !important; background: transparent !important;
+    padding: 0 !important; min-height: 0 !important; min-width: 0 !important;
+}
+div[data-testid="stBottom"] [data-testid="stFileUploaderDropzoneInstructions"] {
+    display: none !important;
+}
+div[data-testid="stBottom"] [data-testid="stFileUploader"] [class*="uploadedFile"] {
+    display: none !important;
+}
+/* Upload button: hide native "Upload"/"Browse files" text, show icon via ::before */
+div[data-testid="stBottom"] [data-testid="stFileUploader"] button {
+    background: transparent !important; border: none !important;
+    border-radius: 50% !important; width: 40px !important; height: 40px !important;
+    padding: 0 !important;
+    font-size: 0 !important; color: transparent !important;  /* hide label text */
+    overflow: visible !important; position: relative !important;
+    cursor: pointer !important;
+}
+div[data-testid="stBottom"] [data-testid="stFileUploader"] button::before {
+    content: "📎";
+    font-size: 1.2rem; color: #6b7280;
+    position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    display: block;
+}
+div[data-testid="stBottom"] [data-testid="stFileUploader"] button:hover::before {
+    color: #4f46e5;
+}
+
+/* ── Col 1: text input ──────────────────────────────────────────── */
+div[data-testid="stBottom"] [data-testid="stTextInput"] input {
+    border: none !important; box-shadow: none !important;
+    background: transparent !important; outline: none !important;
+    font-size: 0.94rem !important; padding: 8px 4px !important;
+}
+div[data-testid="stBottom"] [data-testid="stTextInputRootElement"] {
+    border: none !important; box-shadow: none !important; background: transparent !important;
+}
+
+/* ── Col 2: mic button (custom form_submit_button) ──────────────────────── */
+/* Target specifically the 3rd column child = mic slot */
+div[data-testid="stBottom"] [data-testid="stHorizontalBlock"] > div:nth-child(3) button {
+    background: transparent !important;
+    border: 1.5px solid #dde1e9 !important;
+    border-radius: 50% !important;
+    width: 40px !important; height: 40px !important;
+    padding: 0 !important; font-size: 1.15rem !important;
+    color: #6b7280 !important; cursor: pointer !important;
+    display: flex !important; align-items: center !important; justify-content: center !important;
+}
+div[data-testid="stBottom"] [data-testid="stHorizontalBlock"] > div:nth-child(3) button:hover {
+    background: #fef3c7 !important; border-color: #f59e0b !important; color: #d97706 !important;
+}
+
+/* ── Col 3: send button ────────────────────────────────────────────── */
+/* Target specifically the 4th column child = send slot */
+div[data-testid="stBottom"] [data-testid="stHorizontalBlock"] > div:nth-child(4) button {
+    background: #6366f1 !important; color: #fff !important;
+    border: none !important; border-radius: 50% !important;
+    width: 40px !important; height: 40px !important;
+    padding: 0 !important; font-size: 1rem !important;
+    display: flex !important; align-items: center !important; justify-content: center !important;
+    cursor: pointer !important;
+}
+div[data-testid="stBottom"] [data-testid="stHorizontalBlock"] > div:nth-child(4) button:hover {
+    background: #4f46e5 !important; box-shadow: 0 2px 8px rgba(99,102,241,0.4) !important;
+}
+
+/* ── Mic capture card (rendered ABOVE composer, outside bottom()) ────────── */
+.mic-capture-card {
+    background: #f8faff; border: 1.5px solid #c7d7f9;
+    border-radius: 14px; padding: 14px 18px 12px;
+    margin: 0 auto 8px; max-width: 820px;
+}
+.mic-capture-title {
+    font-size: 0.88rem; font-weight: 600; color: #3730a3; margin-bottom: 10px;
+    display: flex; align-items: center; gap: 6px;
+}
+
+/* ── Responsive ───────────────────────────────────────────────── */
+@media (max-width: 768px) {
+    div[data-testid="stBottom"] > div { padding: 6px 12px 8px !important; }
+    div[data-testid="stBottom"] [data-testid="stHorizontalBlock"] { gap: 5px !important; padding: 3px 5px 3px 8px !important; }
+}
+@media (max-width: 480px) {
+    div[data-testid="stBottom"] > div { padding: 5px 8px 7px !important; }
+    div[data-testid="stBottom"] [data-testid="stHorizontalBlock"] > div:nth-child(3) button,
+    div[data-testid="stBottom"] [data-testid="stHorizontalBlock"] > div:nth-child(4) button {
+        width: 36px !important; height: 36px !important; font-size: 0.95rem !important;
+    }
+}
+</style>"""
+
+def _render_unified_composer(placeholder: str, key_prefix: str) -> dict:
+    """Fixed-bottom composer: [ + upload ] [ text input flex:1 ] [ 🎙️ mic ] [ → send ]
+
+    The mic button is a plain form_submit_button — clicking it sets a session-state
+    flag and reruns, which shows a separate audio-capture card above the composer.
+    st.audio_input is NEVER rendered inside the composer bar itself.
+
+    Returns {"text": str|None, "audio_bytes": bytes|None, "uploaded_file": obj|None}.
+    """
+    from streamlit_extras.bottom_container import bottom
+
+    result: dict = {"text": None, "audio_bytes": None, "uploaded_file": None}
+
+    st.markdown(_COMPOSER_CSS, unsafe_allow_html=True)
+
+    # ── Mic capture overlay (above composer, outside bottom()) ────────────────────
+    _mic_active = st.session_state.get(f"{key_prefix}_mic_active", False)
+    if _mic_active:
+        st.markdown("""<style>
+        .mic-capture-card div[data-testid="stAudioInput"] label,
+        .mic-capture-card div[data-testid="stAudioInput"] input {display:none !important;}</style>""", unsafe_allow_html=True)
+        # st.markdown('<div class="mic-capture-card">', unsafe_allow_html=True)
+        # st.markdown('<div class="mic-capture-title">🎙️ Speak now — click the mic to start, then confirm.</div>', unsafe_allow_html=True)
+        _audio_obj = st.audio_input(
+            "Record your answer",
+            key=f"{key_prefix}_audio_capture",
+            label_visibility="collapsed",
+        )
+        _col_ok, _col_cancel = st.columns([3, 1])
+        with _col_ok:
+            _ok = st.button(
+                "✅ Use this recording",
+                key=f"{key_prefix}_audio_ok",
+                disabled=(_audio_obj is None),
+                use_container_width=True,
+            )
+        with _col_cancel:
+            _cancel = st.button("✕ Cancel", key=f"{key_prefix}_audio_cancel", use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        if _cancel:
+            st.session_state[f"{key_prefix}_mic_active"] = False
+            st.session_state.pop(f"{key_prefix}_audio_capture", None)
+            st.rerun()
+
+        if _ok and _audio_obj is not None:
+            result["audio_bytes"] = _audio_obj.getvalue()
+            # Clear capture widget so it resets on next rerun
+            st.session_state[f"{key_prefix}_mic_active"] = False
+            st.session_state.pop(f"{key_prefix}_audio_capture", None)
+            return result
+
+    # ── Composer bar (always visible at bottom) ────────────────────────────────
+    with bottom():
+        with st.form(key=f"{key_prefix}_composer_form", border=False, enter_to_submit=True):
+            c_add, c_text, c_mic, c_send = st.columns(
+                [1, 10, 1, 1], gap="small", vertical_alignment="center"
+            )
+
+            with c_add:
+                _up = st.file_uploader(
+                    "Attach image",
+                    key=f"{key_prefix}_upload",
+                    type=["png", "jpg", "jpeg", "webp"],
+                    label_visibility="collapsed",
+                    accept_multiple_files=False,
+                )
+            with c_text:
+                _text_val = st.text_input(
+                    "Message",
+                    key=f"{key_prefix}_text",
+                    label_visibility="collapsed",
+                    placeholder=placeholder,
+                )
+            # Declare send BEFORE mic so Enter-to-submit triggers send, not mic
+            with c_send:
+                _sent = st.form_submit_button("→", use_container_width=True)
+            with c_mic:
+                _mic_clicked = st.form_submit_button("🎙️", use_container_width=True)
+
+    # ── Handle results ────────────────────────────────────────────────────────
+    if _mic_clicked:
+        st.session_state[f"{key_prefix}_mic_active"] = True
+        st.rerun()
+
+    if _sent:
+        if _text_val and _text_val.strip():
+            result["text"] = _text_val.strip()
+        if _up is not None:
+            result["uploaded_file"] = _up
+
+    return result
+
 # ── Compact timeline bar: rendered once per rerun above the chat composer ─────────────
 if st.session_state.graph_started and sv:
     _render_timeline_bar(sv)
@@ -1488,13 +1696,127 @@ if True:
         if is_waiting:
             user_input = None
             
-            # Ensure no committed image summaries are floated near the composer. Unsent files are previewed natively by st.chat_input.
-            placeholder = (
+            # ── needs_confirmation card (low-confidence voice) ───────────────
+            _voice_result = st.session_state.get("voice_confirmation_state")
+            if _voice_result is not None:
+                st.markdown(_COMPOSER_CSS, unsafe_allow_html=True)
+                _vc_text = _voice_result.get("normalized_text", "") or _voice_result.get("raw_transcript", "")
+                _vc_conf = _voice_result.get("confidence", -1.0)
+                _vc_needs_warn = _voice_result.get("requires_confirmation", False)
+
+                st.markdown('<div class="transcript-card">', unsafe_allow_html=True)
+                st.markdown('<div class="transcript-card-header">🎙️ Review your voice answer</div>', unsafe_allow_html=True)
+                if _vc_conf >= 0:
+                    _badge = "#22c55e" if _vc_conf >= 0.85 else "#f59e0b"
+                    st.markdown(
+                        f'<span style="font-size:0.78rem;background:{_badge}22;color:{_badge};'
+                        f'border:1px solid {_badge}66;border-radius:99px;padding:1px 8px;font-weight:600;">'
+                        f'Confidence: {int(_vc_conf * 100)}%</span>',
+                        unsafe_allow_html=True,
+                    )
+                if _vc_needs_warn:
+                    _warn_map = {
+                        "low_confidence": "⚠️ Some words may have been misheard — please check below.",
+                        "critical_span_unclear": "⚠️ A number or key term was unclear — verify before confirming.",
+                        "empty_transcript": "⚠️ Transcript is empty — please re-record or type.",
+                    }
+                    st.warning(_warn_map.get(_voice_result.get("failure_reason", ""), "⚠️ Please review before confirming."))
+                _edited_text = st.text_area(
+                    "Transcript", value=_vc_text, key="voice_transcript_edit",
+                    height=100, label_visibility="collapsed",
+                    placeholder="Your transcribed answer — edit if needed…",
+                )
+                st.markdown('</div>', unsafe_allow_html=True)
+                _cc1, _cc2, _cc3 = st.columns([2, 2, 1])
+                with _cc1:
+                    _do_confirm = st.button("✅ Confirm & Send", key="voice_confirm_btn", use_container_width=True)
+                with _cc2:
+                    _do_edit = st.button("✏️ Edit & Send", key="voice_edit_btn", use_container_width=True)
+                with _cc3:
+                    _do_cancel = st.button("✕", key="voice_cancel_btn", use_container_width=True)
+
+                if _do_cancel:
+                    st.session_state.voice_confirmation_state = None
+                    st.rerun()
+
+                _submit_text = None
+                if _do_confirm and _vc_text.strip():
+                    _submit_text = _vc_text.strip()
+                elif _do_edit and _edited_text.strip():
+                    _submit_text = _edited_text.strip()
+
+                if _submit_text:
+                    _vc_ref = st.session_state.get("active_reference")
+                    if _vc_ref:
+                        _vc_payload = {
+                            "event_type": _vc_ref["event_type"], "content": _submit_text,
+                            "target_message_id": _vc_ref["target_message_id"],
+                            "target_content": _vc_ref.get("target_content", "")[:100],
+                            "source_message_role": _vc_ref.get("source_message_role", ""),
+                            "ui_action_label": _vc_ref.get("label", ""),
+                        }
+                        st.session_state.active_reference = None
+                    else:
+                        _vc_payload = {"event_type": "ANSWER", "content": _submit_text}
+                    st.session_state.voice_confirmation_state = None
+                    st.session_state._pending_payload = _vc_payload
+                    st.session_state._pending_user_msg = "🎙️ " + _submit_text
+                    st.rerun()
+
+            # ── Unified multimodal composer (text + image + mic) ─────────────
+            _placeholder = (
                 "Reply, correct, or clarify…"
-                if active_ref else "Type your answer and press Enter…"
+                if active_ref else "Type your answer or attach an image…"
             )
-            user_input_obj = st.chat_input(placeholder, accept_file=True, file_type=["png", "jpg", "jpeg", "webp"])
-                
+            _mm = _render_unified_composer(_placeholder, "active")
+
+            # Audio path
+            if _mm["audio_bytes"]:
+                with st.spinner("Transcribing…"):
+                    from utils.voice_dictation_pipeline import process_voice_input as _pvr
+                    _vr = _pvr(
+                        _mm["audio_bytes"], mime_type="audio/wav",
+                        session_id=st.session_state.thread_id,
+                        turn_id=(sv.get("run_id", "") if sv else ""),
+                    )
+                if _vr["status"] == "failed":
+                    st.error(
+                        "❌ Transcription failed — "
+                        + _vr["failure_reason"].replace("_", " ")
+                        + ". Please try again or type."
+                    )
+                elif _vr["status"] == "transcribed":
+                    _vt_text = _vr.get("handoff_text", "").strip()
+                    if _vt_text:
+                        _vt_ref = st.session_state.get("active_reference")
+                        if _vt_ref:
+                            _vt_payload = {
+                                "event_type": _vt_ref["event_type"],
+                                "content": _vt_text,
+                                "target_message_id": _vt_ref["target_message_id"],
+                                "target_content": _vt_ref.get("target_content", "")[:100],
+                                "source_message_role": _vt_ref.get("source_message_role", ""),
+                                "ui_action_label": _vt_ref.get("label", ""),
+                            }
+                            st.session_state.active_reference = None
+                        else:
+                            _vt_payload = {"event_type": "ANSWER", "content": _vt_text}
+                        st.session_state._pending_payload = _vt_payload
+                        st.session_state._pending_user_msg = "🎙️ " + _vt_text
+                        st.rerun()
+                elif _vr["status"] == "needs_confirmation":
+                    st.session_state.voice_confirmation_state = _vr
+                    st.rerun()
+                user_input_obj = None
+
+            # Text / image path
+            else:
+                from types import SimpleNamespace as _SNS
+                user_input_obj = _SNS(
+                    text=_mm["text"] or "",
+                    files=[_mm["uploaded_file"]] if _mm["uploaded_file"] else [],
+                ) if (_mm["text"] or _mm["uploaded_file"]) else None
+            
         elif sv.get("is_complete", False):
             st.chat_input("Session complete — see download in chat above.", disabled=True)
             user_input_obj = None
@@ -1581,37 +1903,63 @@ if True:
 
     else:
         # Landing: first message initialises the graph (D-M2)
-        user_input_obj = st.chat_input("What are you building?", accept_file=True, file_type=["png", "jpg", "jpeg", "webp"])
-        
-        user_input = getattr(user_input_obj, "text", "") if hasattr(user_input_obj, "text") else (user_input_obj if isinstance(user_input_obj, str) else "")
-        uploaded_files_list = []
-        if isinstance(user_input_obj, dict):
-            files = user_input_obj.get("files", [])
-            user_input = user_input_obj.get("text", "")
-        else:
-            files = getattr(user_input_obj, "files", []) if hasattr(user_input_obj, "files") else []
-            
-        if files:
-            import uuid
-            uploaded_img = files[0]
-            mime = uploaded_img.type or "image/png"
-            stashed_upload = {
-                "file_id": f"file_{uuid.uuid4().hex[:8]}",
-                "filename": uploaded_img.name,
-                "size_bytes": uploaded_img.size,
-                "mime_type": mime,
-                "bytes": uploaded_img.read()
-            }
-        else:
-            stashed_upload = None
+        _l_mm = _render_unified_composer("Describe what you’re building…", "landing")
 
-        has_text_input = bool(user_input and user_input.strip())
-        has_files = bool(stashed_upload)
-        
-        if has_text_input or has_files:
-            content_val = user_input if has_text_input else "[Image Uploaded]"
-            payload = _build_submit_payload(user_input, stashed_upload)
-            
+        # Audio path
+        if _l_mm["audio_bytes"]:
+            with st.spinner("Transcribing…"):
+                from utils.voice_dictation_pipeline import process_voice_input as _pvr
+                _l_vr = _pvr(
+                    _l_mm["audio_bytes"], mime_type="audio/wav",
+                    session_id=st.session_state.thread_id, turn_id="landing",
+                )
+            if _l_vr["status"] == "failed":
+                st.error(
+                    "❌ Transcription failed — "
+                    + _l_vr["failure_reason"].replace("_", " ")
+                    + ". Please try again or type."
+                )
+            elif _l_vr["status"] == "transcribed":
+                _lvt_text = _l_vr.get("handoff_text", "").strip()
+                if _lvt_text:
+                    _lvt_payload = _build_submit_payload(_lvt_text, None)
+                    if _lvt_payload:
+                        try:
+                            graph.invoke(
+                                _build_initial_state(list(st.session_state.image_context_buffer)),
+                                _config(),
+                            )
+                        except Exception as exc:
+                            st.error(f"Could not start session: {exc}")
+                            st.stop()
+                        st.session_state.graph_started = True
+                        st.session_state.image_context_buffer = []
+                        st.session_state._pending_payload = _lvt_payload
+                        st.session_state._pending_user_msg = "🎙️ " + _lvt_text
+                        st.rerun()
+            elif _l_vr["status"] == "needs_confirmation":
+                st.session_state.voice_confirmation_state = _l_vr
+                st.session_state["_voice_from_landing"] = True
+                st.rerun()
+
+        # Text / image path
+        elif _l_mm["text"] or _l_mm["uploaded_file"]:
+            user_input = _l_mm["text"] or ""
+            _l_stash   = None
+            if _l_mm["uploaded_file"]:
+                import uuid as _uuid
+                _l_uf = _l_mm["uploaded_file"]
+                _l_stash = {
+                    "file_id":    f"file_{_uuid.uuid4().hex[:8]}",
+                    "filename":   _l_uf.name,
+                    "size_bytes": _l_uf.size,
+                    "mime_type":  _l_uf.type or "image/png",
+                    "bytes":      _l_uf.read(),
+                }
+                st.session_state.image_context_buffer = (
+                    st.session_state.get("image_context_buffer", []) + [_l_stash]
+                )
+            payload = _build_submit_payload(user_input or "[Image Uploaded]", _l_stash)
             if payload:
                 try:
                     graph.invoke(
@@ -1623,7 +1971,6 @@ if True:
                     st.stop()
                 st.session_state.graph_started = True
                 st.session_state.image_context_buffer = []
-                
                 st.session_state._pending_payload = payload
-                st.session_state._pending_user_msg = content_val
+                st.session_state._pending_user_msg = user_input or "[Image Uploaded]"
                 st.rerun()

@@ -225,9 +225,14 @@ def _qa_texts_for_sections(
     results: list[tuple[str, str]] = []
     seen: set[str] = set()
 
+    # Read-time evidence contamination guard: strip conversational filler from
+    # stored answers so that contaminated legacy entries do not pollute signal.
+    from utils.filler_sanitizer import sanitize_answer as _sanitize_answer
+
     # Primary: confirmed QA pairs (correction-precedence applied)
     for src, entry in _best.items():
         answer = str(entry.get("answer", "") or entry.get("value", "") or "")
+        answer = _sanitize_answer(answer) or answer  # fall back to raw if sanitizer returns empty
         question = str(entry.get("question", "") or entry.get("questions", "") or "")
         text = f"{question} {answer}".strip()
         if text and text not in seen:
@@ -925,14 +930,103 @@ def _infer_key_stakeholders(state: dict) -> dict:
 # Reads confirmed QA evidence from headliner, elevator_pitch, key_stakeholders,
 # and problem_statement, then builds a synthesis confirm/correct candidate.
 # Does NOT ask a blank field-label question; instead confirms what is already known.
+#
+# Evidence-type taxonomy (enforced at candidate-construction time):
+#   workflow   — describes what people do today: who, how often, with what tools
+#   pain       — describes failure, delay, error, or impact of the current process
+#   stakeholder — describes roles, teams, organizational structure
+#   metric     — numbers, percentages, durations, counts
+#   other      — everything else
+#
+# Background boundary rule:
+#   Primary candidate must come from workflow-typed evidence ONLY.
+#   Pain and stakeholder facts may appear as supporting context but MUST NOT be
+#   used as the main summary predicate.
 
 _BACKGROUND_EVIDENCE_SECTIONS = frozenset({
     "headliner", "elevator_pitch", "key_stakeholders", "problem_statement"
 })
 
+# ── Evidence-type classifiers ─────────────────────────────────────────────────
+
+_BG_WORKFLOW_RE = re.compile(
+    r"\b(every (morning|day|week)|start(s)? by|begin(s)? by|open(s)?"
+    r"|filter(s)?|match(es)?|manual(ly)?|spreadsheet|upload|download|review|check|export"
+    r"|batch|process(es)?|run(s)? the|workflow|current(ly)?|right now|today"
+    r"|each (day|morning|shift|week)|submit(s)?|verif(y|ies)|cross.check|reconcil"
+    r"|step(s)?|perform(s)?|execut(e|es|ing))",
+    re.IGNORECASE,
+)
+
+_BG_PAIN_RE = re.compile(
+    r"\b(dela(y|yed|ys)|error(s)?|mis(s|take|match)|fail(s|ure)?|broken"
+    r"|time.to.market|burnout|frustrat|manual burden|overhead|backlog"
+    r"|inefficien(t|cy)|wasted|too slow|too long|problem|issue|pain)",
+    re.IGNORECASE,
+)
+
+_BG_STAKEHOLDER_RE = re.compile(
+    r"\b(manager|lead|director|coordinator|analyst|specialist|operator"
+    r"|supervisor|role|persona|stakeholder|operations team|ops team"
+    r"|engineering|product team|sales team|finance|legal|compliance)",
+    re.IGNORECASE,
+)
+
+_BG_METRIC_RE = re.compile(
+    r"\b(\d+\s*(min|sec|hour|hr|day|week|month|%|percent|product|sku|row|record"
+    r"|item|case|order|ticket))\b|per (day|week|month|shift|batch)",
+    re.IGNORECASE,
+)
+
+# Verb guard — a string with no finite verb is a fragment, not a sentence
+_BG_VERB_RE = re.compile(
+    r"\b(is|are|was|were|has|have|had|do|does|did|can|could|will|would|shall|should"
+    r"|may|might|must|start|begin|open|filter|match|run|process|review|check"
+    r"|upload|download|perform|execute|submit|verify|reconcile|work|use|take|make"
+    r"|spend|need|require|include|contain|show|involve|allow|help|create"
+    r"|generate|build|provide|support|enable|ensure|reduce|increase|improve)",
+    re.IGNORECASE,
+)
+
+# Isolated pain-label fragment detector (text that BEGINS with a pain noun alone)
+_BG_PAIN_LABEL_RE = re.compile(
+    r"^(Delayed|Error(s)?|Fail(ure)?|Miss(es)?|Problem(s)?|Issue(s)?|Pain"
+    r"|Overhead|Backlog|Burnout|Inaccurac\w+|Inconsisten\w+)[\s:;,.]",
+    re.IGNORECASE,
+)
+
+
+def _bg_classify_evidence_type(text: str) -> str:
+    """Return dominant evidence type: workflow > metric > pain > stakeholder > other."""
+    if _BG_WORKFLOW_RE.search(text):
+        return "workflow"
+    if _BG_METRIC_RE.search(text):
+        return "metric"
+    if _BG_PAIN_RE.search(text):
+        return "pain"
+    if _BG_STAKEHOLDER_RE.search(text):
+        return "stakeholder"
+    return "other"
+
+
+def _bg_is_sentence_safe(text: str) -> bool:
+    """True if text has ≥6 words and contains a finite verb."""
+    return len(text.split()) >= 6 and bool(_BG_VERB_RE.search(text))
+
+
+def _bg_is_pain_label_fragment(text: str) -> bool:
+    """True if text begins with an isolated pain label — e.g. 'Delayed time-to-market'."""
+    return bool(_BG_PAIN_LABEL_RE.match(text.strip()))
+
 
 def _infer_background_synthesis(state: dict) -> dict:
     """Synthesise a confirm/correct Background question from prior evidence.
+
+    Evidence-type filtering enforced:
+      - Primary candidate uses workflow-typed sentences only (sentence-safe).
+      - Pain and stakeholder-only facts are demoted to supporting context only.
+      - Fragment-only inputs are rejected before candidate construction.
+      - The formatter receives a normalized summary_text, not raw joined fragments.
 
     Returns
     -------
@@ -940,13 +1034,7 @@ def _infer_background_synthesis(state: dict) -> dict:
     """
     qa_store: dict = state.get("confirmed_qa_store") or {}
 
-    # Collect plain-English evidence snippets from upstream sections
-    evidence_facts: list[str] = []
-    evidence_sources: list[str] = []
-
-    # Collect evidence snippets from upstream sections.
-    # Correction-precedence: when multiple entries share a section_id, use the
-    # highest-version (most recent) one. User corrections MUST win over stale writes.
+    # ── Collect best (correction-precedence) entries from upstream sections ──
     _best_by_section: dict[str, dict] = {}
     for entry in qa_store.values():
         if entry.get("contradiction_flagged"):
@@ -958,13 +1046,47 @@ def _infer_background_synthesis(state: dict) -> dict:
         if existing is None or (entry.get("version", 0) or 0) >= (existing.get("version", 0) or 0):
             _best_by_section[sid] = entry
 
+    # ── Tag each sentence with its evidence_type ──────────────────────────────
+    tagged_facts: list[dict] = []
+    evidence_sources: list[str] = []
+
     for sid, entry in _best_by_section.items():
-        # Read 'answer' — the canonical field (never 'user_answer')
         answer: str = str(entry.get("answer") or "").strip()
-        if answer and len(answer) > 15:
-            evidence_facts.append(answer[:180])
-            if sid not in evidence_sources:
-                evidence_sources.append(sid)
+        if not answer or len(answer) < 10:
+            continue
+        # Split into sentences and classify each independently
+        sentences = re.split(r'(?<=[.?!])\s+', answer.replace('\n', ' '))
+        for sent in sentences:
+            sent = sent.strip()
+            if len(sent) < 10:
+                continue
+            ev_type = _bg_classify_evidence_type(sent)
+            is_safe = _bg_is_sentence_safe(sent)
+            is_pain_frag = _bg_is_pain_label_fragment(sent)
+            tagged_facts.append({
+                "text": sent[:250],
+                "evidence_type": ev_type,
+                "source_section": sid,
+                "is_sentence_safe": is_safe,
+                "is_pain_label_fragment": is_pain_frag,
+            })
+        if sid not in evidence_sources:
+            evidence_sources.append(sid)
+
+    # ── Pre-format candidate log ──────────────────────────────────────────────
+    _log.info(
+        "background_pre_format_candidate_log",
+        extra={
+            "event_type": "background_pre_format_candidate_log",
+            "total_tagged_facts":   len(tagged_facts),
+            "workflow_count":       sum(1 for f in tagged_facts if f["evidence_type"] == "workflow"),
+            "pain_count":           sum(1 for f in tagged_facts if f["evidence_type"] == "pain"),
+            "stakeholder_count":    sum(1 for f in tagged_facts if f["evidence_type"] == "stakeholder"),
+            "sentence_safe_count":  sum(1 for f in tagged_facts if f["is_sentence_safe"]),
+            "pain_label_fragments": [f["text"][:80] for f in tagged_facts if f["is_pain_label_fragment"]],
+            "evidence_sources":     evidence_sources,
+        },
+    )
 
     has_explicit = bool(
         any(
@@ -973,17 +1095,43 @@ def _infer_background_synthesis(state: dict) -> dict:
         )
     )
 
-    # Not enough evidence → SEED with a simple workflow opener
-    if len(evidence_facts) < 2:
+    # ── Background boundary: select workflow-typed, sentence-safe facts only ──
+    workflow_facts = [
+        f for f in tagged_facts
+        if f["evidence_type"] == "workflow"
+        and f["is_sentence_safe"]
+        and not f["is_pain_label_fragment"]
+    ]
+
+    # Fallback pool: metric + 'other' that are sentence-safe (no pain/stakeholder-only)
+    fallback_facts = [
+        f for f in tagged_facts
+        if f["evidence_type"] in ("metric", "other")
+        and f["is_sentence_safe"]
+        and not f["is_pain_label_fragment"]
+    ]
+
+    primary_facts = workflow_facts or fallback_facts
+
+    # ── Not enough evidence → SEED with workflow opener ───────────────────────
+    if not primary_facts:
         seed_hint = (
             "Walk me through what the current workflow looks like — who does what, "
             "how often, and where the most friction shows up."
+        )
+        _log.info(
+            "background_inference_fallback",
+            extra={
+                "event_type": "background_inference_fallback",
+                "reason": "no_workflow_sentence_safe_facts",
+                "total_tagged": len(tagged_facts),
+            },
         )
         return {
             "has_explicit_answers":     has_explicit,
             "inference_available":      False,
             "candidate_items":          [],
-            "evidence":                 evidence_facts,
+            "evidence":                 [f["text"] for f in tagged_facts[:3]],
             "evidence_sources":         evidence_sources,
             "confidence":               "low",
             "seed_context_hint":        seed_hint,
@@ -992,22 +1140,40 @@ def _infer_background_synthesis(state: dict) -> dict:
             "has_conflict":             False,
         }
 
-    # ≥2 facts — build a synthesis confirm/correct candidate
-    # Truncate each fact to keep the question readable
-    short_facts = [f[:120] for f in evidence_facts[:4]]
-    joined = "; ".join(short_facts)
+    # ── Build normalized candidate from workflow sentences (≤2 clauses) ───────
+    best_facts = primary_facts[:2]
+    summary_texts = [f["text"][:160] for f in best_facts]
+
+    if len(summary_texts) == 1:
+        summary_text = summary_texts[0]
+    else:
+        # Join exactly 2 clauses with ', and' — never semicolons, never 3+
+        summary_text = f"{summary_texts[0]}, and {summary_texts[1].lower()}"
+
     candidate = (
-        f"From what you've shared, here's my read of the current state: {joined}. "
-        f"Is that an accurate picture, or what would you add or correct?"
+        f"From what you've shared, the current workflow seems to be: "
+        f"{summary_text}. "
+        f"Is that an accurate picture of today's process, or would you add or correct anything?"
     )
 
-    confidence = "high" if len(evidence_facts) >= 3 else "medium"
+    confidence = "high" if len(primary_facts) >= 3 else "medium"
+
+    _log.info(
+        "background_candidate_selected",
+        extra={
+            "event_type":          "background_candidate_selected",
+            "summary_text":        summary_text[:200],
+            "evidence_types_used": [f["evidence_type"] for f in best_facts],
+            "source_sections":     [f["source_section"] for f in best_facts],
+            "confidence":          confidence,
+        },
+    )
 
     return {
         "has_explicit_answers":     has_explicit,
         "inference_available":      True,
         "candidate_items":          [candidate],
-        "evidence":                 evidence_facts,
+        "evidence":                 [f["text"] for f in tagged_facts[:4]],
         "evidence_sources":         evidence_sources,
         "confidence":               confidence,
         "seed_context_hint":        "",

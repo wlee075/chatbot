@@ -212,6 +212,23 @@ def _merge_dicts(a: dict, b: dict) -> dict:
     return {**a, **b}
 
 
+class SectionGapEntry(TypedDict):
+    """One structured gap in a PRD section.
+
+    Written by reflect_node; read by _classify_target_confidence and
+    advance_section_node.  Never written by the composer or draft renderer.
+    The composer MAY render these as '[NEEDS CLARIFICATION: ...]' markers in
+    the draft — those markers are output-only and never read by routing code.
+    """
+    gap_id: str           # UUID — stable across turns
+    section_id: str       # PRD section this gap belongs to
+    component: str        # "baseline" | "target" | "measurement_method" | "timeline" | "owner" | "validation_plan" | "other"
+    question: str         # exact question to present to the user
+    severity: str         # "blocking" | "optional"
+    source: str           # "reflect_node" | "metric_validator" | "section_rule"
+    resolved: bool        # True once the user has provided an accepted answer
+
+
 class PRDState(TypedDict):
     # ── Session identity ─────────────────────────────────────────────────────
     thread_id: str   # stable session identifier (set once per Streamlit session)
@@ -411,7 +428,14 @@ class PRDState(TypedDict):
     generation_reason: str
     selected_candidate_id: str
     duplicate_details: dict
-    
+
+    # ── Section-target consistency stamp (question_target_section_consistency_guard) ──
+    # Written by generate_questions_node on every exit path.
+    # Records the section_id that the orchestrator/two-lane path intended as the question target.
+    # May differ from the active section_index when the orchestrator jumps ahead.
+    # Routing guards and advance_section_node compare this against the active section.id.
+    last_question_target_section_id: str
+
     # Track terminal state for routing and UI evaluation rendering exclusively
     response_type: str
 
@@ -491,3 +515,25 @@ class PRDState(TypedDict):
     prd_report_title: str          # e.g. "Requirements Summary — Adaptive Matching"
     prd_generated_at_utc: str      # ISO-8601 UTC timestamp set once by finalize_node
     prd_pdf_bytes: bytes           # rendered PDF binary; b"" if render fails
+
+    # ── NeMo Guardrails gateway fields ────────────────────────────────────────
+    # Set by nemo_guardrails_gateway_node each turn before any section mutation.
+    message_class: str              # 9-class label (e.g. "valid_answer", "task_request")
+    gateway_allow_commit: bool      # may this answer be written to confirmed_qa_store?
+    gateway_allow_section_complete: bool  # may this answer complete the current section?
+    gateway_allow_advance: bool     # may the workflow advance to the next section?
+    gateway_route_to: str           # the node the router should send to
+    is_user_correction: bool        # correction evidence gets highest priority
+    is_tentative_answer: bool       # stored as tentative; cannot complete section
+    cross_section_target: str | None  # section_id where cross-section evidence belongs
+    guardrail_reason: str           # human-readable reason for the classification
+    guardrail_confidence: float     # 0.0–1.0 from the gateway classifier
+    guardrail_source: str           # "FAST_REGEX" | "LLM" | "SAFE_FALLBACK"
+
+    # ── Structured gap state (section completion blocking) ──────────────────
+    # Source of truth for unresolved blocking gaps per section.
+    # Orchestrator reads this; composer renders from this; routing NEVER reads draft text.
+    # Schema: {section_id: [SectionGapEntry, ...]}
+    # Uses _merge_dicts so individual sections can be updated independently.
+    section_gap_state: Annotated[dict, _merge_dicts]
+

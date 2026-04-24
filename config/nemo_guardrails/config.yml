@@ -1,0 +1,31 @@
+# NeMo Guardrails — PRD Gateway Config
+#
+# Purpose: Intent classification gateway for the PRD information-gathering chatbot.
+# The chatbot stays in information-gathering mode regardless of user requests.
+# Task requests (code, PDF, drafting, export) are classified and blocked here.
+#
+# Classification approach:
+#   Default: fastembed (embedding similarity, no extra LLM call)
+#   Fallback: LLM (only when embedding confidence is ambiguous)
+#
+# NOTE: No 'models' block here. The app's existing LLM (Gemini) is injected
+# into LLMRails(config, llm=...) at runtime to avoid double initialization.
+
+# Colang version: 1.0 for intent-based dialog flows with define user / define flow
+colang_version: "1.0"
+
+# Embedding model for fastembed-based intent matching.
+# fastembed is installed and provides zero-cost, zero-LLM-call intent classification.
+embedding_search_provider:
+  name: fastembed
+  parameters:
+    embedding_model: BAAI/bge-small-en-v1.5
+
+# Rails: input + dialog only (no output rail to avoid double LLM calls)
+rails:
+  input:
+    flows:
+      - classify prd gateway intent
+  dialog:
+    single_call:
+      enabled: false

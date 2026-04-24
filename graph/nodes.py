@@ -14,6 +14,7 @@ OVERALL SCORE	LLM says PASS	System enforces
 '''
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -21,6 +22,9 @@ import uuid
 import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
+
+# Module-level logger — used by helpers that do not have access to ctx/log_event
+_log = logging.getLogger("nodes")
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -3175,7 +3179,7 @@ def _evaluate_duplicate_candidate(candidate_q_text: str, candidate_subparts: lis
 
     return True, "", ""
 
-def _package_generated_question_result(response: dict, questions: str, current_question_object: dict, state: "PRDState", section, ctx: dict, system_prompt: str, override_status: str = None, duplicate_details: dict = None) -> dict:
+def _package_generated_question_result(response: dict, questions: str, current_question_object: dict, state: "PRDState", section, ctx: dict, system_prompt: str, override_status: str = None, duplicate_details: dict = None, question_target_section_id: str = None) -> dict:
     import time
     qa_store = state.get("confirmed_qa_store", {})
     triage = state.get("triage_decision", "")
@@ -3228,6 +3232,9 @@ def _package_generated_question_result(response: dict, questions: str, current_q
 
     status = override_status if override_status else ("no_question_available" if not questions else "question_generated")
     dup_details = duplicate_details or {"total_candidates_evaluated": 1, "rejection_reasons": []}
+    # Stamp: use explicit override if supplied (mismatch-clarify exits pass the orch target);
+    # otherwise fall back to section.id (the typical generated-question path).
+    _stamp = question_target_section_id if question_target_section_id else (section.id if section else "")
     return _enforce_visibility({
         "generation_status": status,
         "generation_reason": "Generator flow completed",
@@ -3237,7 +3244,7 @@ def _package_generated_question_result(response: dict, questions: str, current_q
         "content_segments": provenance_segments,
         "current_question_object": current_question_object,
         "remaining_subparts": [s for s in current_question_object.get("subparts", []) if s not in {"clarification", "fallback", "unknown"}],
-        
+
         "active_question_id": response.get("question_id", ""),
         "active_question_type": response.get("question_type", "OPEN_ENDED"),
         "active_question_options": response.get("options", []),
@@ -3245,8 +3252,9 @@ def _package_generated_question_result(response: dict, questions: str, current_q
         "resolved_option_id": "",
         "answered_at": "",
         "recent_questions": state.get("recent_questions", []) + [current_question_object["question_text"]],
-        
+
         "repair_instruction": "",
+        "last_question_target_section_id": _stamp,
     }, questions, section.title if section else "Unknown", state["section_index"], state.get("iteration", 0), event_type="elicit")
 
 def _is_synthetic_blocker(blocker: str, canonical_set: set[str]) -> bool:
@@ -3365,6 +3373,20 @@ def _classify_target_confidence(state: "PRDState", section) -> tuple[str, str | 
     # If the registry is empty (e.g. MagicMock, missing config), Lane B inference
     # should still fire because we cannot confirm the section is actually done.
     if canonical_components_original:
+        # ── Structured gap guard — orchestrator reads section_gap_state ONLY ────────
+        # Do NOT inspect prd_sections draft text or [NEEDS CLARIFICATION] strings.
+        _section_gaps = state.get("section_gap_state", {}).get(section.id, [])
+        _blocking = [
+            g for g in _section_gaps
+            if not g.get("resolved") and g.get("severity") == "blocking"
+        ]
+        if _blocking:
+            first_gap = _blocking[0]
+            return (
+                "STRONG", first_gap.get("component", "gap"), [],
+                f"Unresolved blocking gap: {first_gap.get('question', '')[:120]}",
+                "UNRESOLVED_GAP",
+            )
         return ("EMPTY", None, [],
                 f"All section components resolved in QA store{rehydration_note}",
                 "SECTION_COMPLETE")
@@ -3397,6 +3419,49 @@ def _extract_draft_markers(section_id: str, prd_sections: dict) -> "str | None":
 
 
 # ── Orchestrator prompt helpers (Steps 3–4) ───────────────────────────────────
+
+def _build_safe_clarification_question(section_id: str, section_title: str) -> str:
+    """Return a pre-built safe clarification question for a given section.
+
+    Called when the deterministic formatter rejects ALL candidates (e.g. because
+    they are corrupted fragments).  Must NOT call log_event — has no ctx.
+    The caller logs the safe_clarify event with full ctx.
+
+    Contract: Always returns a coherent, grammatical sentence (never empty).
+    """
+    _SAFE_QUESTIONS: dict[str, str] = {
+        "key_stakeholders": (
+            "I have some stakeholder information, but I want to make sure I have it right. "
+            "Who is the daily hands-on user, who owns the process day-to-day, "
+            "and who has sign-off authority?"
+        ),
+        "background": (
+            "Walk me through what the current workflow looks like \u2014 "
+            "who does what, how often, and where the most friction shows up."
+        ),
+        "problem_statement": (
+            "What's the most pressing operational pain you're trying to solve? "
+            "Describe the failure and its impact in concrete terms."
+        ),
+        "goals": (
+            "What would a successful outcome look like six months from now? "
+            "What would the team be able to do that they can't do today?"
+        ),
+        "non_goals": (
+            "Are there any related problems or features that are explicitly out of scope "
+            "for this phase? What are you deliberately not trying to solve?"
+        ),
+        "success_metrics": (
+            "How will you know if the solution is working? "
+            "What numbers or outcomes would you measure?"
+        ),
+    }
+    return _SAFE_QUESTIONS.get(
+        section_id,
+        f"I need to confirm a few details about {section_title}. "
+        f"Could you describe the current state and what you\u2019re hoping to change?",
+    )
+
 
 def _format_deterministic_propose_question(plan: dict, section) -> str:
     """Build a confirm/correct question directly from orchestrator candidate_items.
@@ -3471,22 +3536,19 @@ def _format_deterministic_propose_question(plan: dict, section) -> str:
     raw_labels = [_label(c) for c in candidates[:3]]
     labels     = [lb for lb in raw_labels if lb]
 
-    log_event(
-        thread_id="", run_id="", node_name="deterministic_formatter",
-        level="INFO", event_type="deterministic_formatter_candidate_sanitization",
-        message="Candidate sanitization results",
-        section_id=section_id, action=action,
-        raw_count=len(raw_labels), clean_count=len(labels),
-        discarded_count=len(raw_labels) - len(labels),
-        clean_previews=[lb[:80] for lb in labels],
+    _log.info(
+        "deterministic_formatter_candidate_sanitization: section=%s action=%s "
+        "raw=%d clean=%d discarded=%d previews=%s",
+        section_id, action,
+        len(raw_labels), len(labels), len(raw_labels) - len(labels),
+        [lb[:80] for lb in labels],
     )
 
     if not labels:
-        log_event(
-            thread_id="", run_id="", node_name="deterministic_formatter",
-            level="WARNING", event_type="deterministic_formatter_all_candidates_rejected",
-            message="All candidates rejected by corruption guards — returning empty (LLM fallback)",
-            section_id=section_id,
+        _log.warning(
+            "deterministic_formatter_all_candidates_rejected: "
+            "section=%s — all candidates rejected by corruption guards, returning empty",
+            section_id,
         )
         return ""
 
@@ -3502,11 +3564,9 @@ def _format_deterministic_propose_question(plan: dict, section) -> str:
             f"{body}. "
             f"Is that the right picture, or would you frame it differently?"
         )
-        log_event(
-            thread_id="", run_id="", node_name="deterministic_formatter",
-            level="INFO", event_type="deterministic_formatter_propose_one_assembled",
-            message="PROPOSE_ONE assembled (clean synthesis)",
-            section_id=section_id, synthesis_preview=synthesis[:120],
+        _log.info(
+            "deterministic_formatter_propose_one_assembled: section=%s preview=%r",
+            section_id, synthesis[:120],
         )
         return synthesis
 
@@ -3519,12 +3579,9 @@ def _format_deterministic_propose_question(plan: dict, section) -> str:
         f"for {section_title}:\n{bullets}\n\n"
         f"Does that capture it, or is something missing or off?"
     )
-    log_event(
-        thread_id="", run_id="", node_name="deterministic_formatter",
-        level="INFO", event_type="deterministic_formatter_propose_list_assembled",
-        message="PROPOSE_LIST assembled (clean synthesis)",
-        section_id=section_id, bullet_count=len(labels),
-        synthesis_preview=synthesis[:120],
+    _log.info(
+        "deterministic_formatter_propose_list_assembled: section=%s bullets=%d preview=%r",
+        section_id, len(labels), synthesis[:120],
     )
     return synthesis
 
@@ -3556,17 +3613,11 @@ def _inject_orch_candidates(base_prompt: str, plan: dict) -> str:
 
     candidates_block = "\n".join(f"  - {_to_label(c)}" for c in candidates[:3])
 
-    event_type = (
-        "orchestrator_pain_points_prompt_override_applied"
-        if section_id == "pain_points"
-        else "orchestrator_prompt_override_applied"
-    )
-    log_event(
-        event_type=event_type,
-        section_id=section_id,
-        action=plan.get("recommended_action", ""),
-        candidate_count=len(candidates),
-        level="INFO",
+    # Note: do NOT call log_event here — this helper has no ctx (thread_id/run_id).
+    # The caller always logs the injection event with full ctx immediately after this call.
+    _log.info(
+        "_inject_orch_candidates: section=%s candidates=%d action=%s",
+        section_id, len(candidates), plan.get("recommended_action", ""),
     )
 
     constraint = (
@@ -3675,6 +3726,13 @@ def _package_no_question_result(
             "answered_at": "",
             "recent_questions": state.get("recent_questions", []),
             "repair_instruction": "",
+            # Stamp section.id (the active section) so any stale cross-section target
+            # from a previous turn is cleared.  "No question needed" means the orchestrator
+            # is satisfied with the CURRENT section — it is the effective target.
+            # Without this, a stale stamp from a prior section (e.g. "background") would
+            # cause advance_section_node to block on every ITER_CAP, producing an
+            # infinite loop → GraphRecursionError.
+            "last_question_target_section_id": section.id if section else "",
         },
         ux_msg,
         section.title if section else "Unknown",
@@ -3682,6 +3740,7 @@ def _package_no_question_result(
         state.get("iteration", 0),
         event_type="elicit",
     )
+
 
 
 def generate_questions_node(state: "PRDState") -> dict:
@@ -3755,10 +3814,75 @@ def generate_questions_node(state: "PRDState") -> dict:
             feature_framing=orch_plan.get("feature_framing_detected", False),
         )
 
-        # Step 4: NO_QUESTION_NEEDED — return visible informational UX turn
+        # Step 4: NO_QUESTION_NEEDED — return visible informational UX turn.
+        # GUARD: must not fire when there are unresolved blocking gaps in section_gap_state.
+        # The orchestrator can only declare 'no question needed' if the structured gap
+        # model agrees — i.e., there are no remaining blocking gaps requiring clarification.
         if orch_action == ACTION_NO_QUESTION_NEEDED and is_live:
-            ux_msg = orch_plan.get("reasoning_summary", f"I've captured enough for {section.title}.")
-            return _package_no_question_result(state, section, ctx, orch_plan, ux_msg)
+            _orch_section_gaps = state.get("section_gap_state", {}).get(
+                section.id if section else "", []
+            )
+            _orch_blocking_gaps = [
+                g for g in _orch_section_gaps
+                if not g.get("resolved") and g.get("severity") == "blocking"
+            ]
+            if _orch_blocking_gaps:
+                # Structured gap overrides NO_QUESTION_NEEDED — fall through so
+                # _classify_target_confidence returns UNRESOLVED_GAP and the
+                # gap_question early-exit path handles it correctly.
+                log_event(
+                    **ctx, level="WARNING",
+                    event_type="no_question_needed_overridden_by_gap",
+                    message="NO_QUESTION_NEEDED overridden — unresolved blocking gaps remain",
+                    section_id=section.id if section else "",
+                    blocked_by=[g.get("component") for g in _orch_blocking_gaps],
+                )
+                # Do NOT return — let gap_question path handle it below.
+            else:
+                ux_msg = orch_plan.get("reasoning_summary", f"I've captured enough for {section.title} based on what you shared.")
+                # ── question_target_section_consistency_guard ───────────────────────────
+                # NO_QUESTION_NEEDED from orchestrator: same guard applies.
+                # If the orchestrator decided no question is needed for a DIFFERENT section
+                # than the active UI section, do not treat it as completing the active section.
+                _orch_nqn_target = orch_plan.get("target_section_id", section.id if section else "")
+                _nqn_active = section.id if section else ""
+                _nqn_cross = bool(state.get("cross_section_target"))
+                if _orch_nqn_target and _orch_nqn_target != _nqn_active and not _nqn_cross:
+                    try:
+                        from config.sections import get_section_by_id as _get_sec_by_id
+                        _nqn_tgt_title = _get_sec_by_id(_orch_nqn_target).title
+                    except Exception:
+                        _nqn_tgt_title = _orch_nqn_target
+                    _nqn_mismatch_q = (
+                        f"I want to make sure I capture that in the right place. "
+                        f"Were you describing **{_nqn_tgt_title}** or **{section.title if section else _nqn_active}**?"
+                    )
+                    log_event(
+                        **ctx, level="WARNING",
+                        event_type="section_target_mismatch_blocked",
+                        message=(
+                            f"NO_QUESTION_NEEDED blocked: orchestrator target '{_orch_nqn_target}' "
+                            f"!= active section '{_nqn_active}'. Emitting clarification."
+                        ),
+                        orchestrator_target=_orch_nqn_target,
+                        active_section_id=_nqn_active,
+                    )
+                    _nqn_q_id = f"mismatch_clarify_{_orch_nqn_target}_vs_{_nqn_active}"
+                    # Return here — skip the no-question path entirely.
+                    # base_prompt may not be initialised yet at this point in the function,
+                    # so provide a safe empty string sentinel.
+                    return _package_generated_question_result(
+                        {"question_id": _nqn_q_id, "subparts": []},
+                        _nqn_mismatch_q,
+                        {"question_id": _nqn_q_id, "question_text": _nqn_mismatch_q, "subparts": []},
+                        state, section, ctx, "",  # base_prompt not yet built here
+                        override_status="section_target_mismatch_clarify",
+                        duplicate_details={"total_candidates_evaluated": 0, "rejection_reasons": []},
+                        question_target_section_id=_orch_nqn_target,
+                    )
+                # ── end guard ─────────────────────────────────────────────────────────────
+                return _package_no_question_result(state, section, ctx, orch_plan, ux_msg)
+
 
         # Override dispatch — assigns prompt override type before LLM call.
         # PROPOSE:  only when is_live (proposes inferred candidates — live sections only).
@@ -3803,6 +3927,14 @@ def generate_questions_node(state: "PRDState") -> dict:
         _orch_base_prompt_override = None
         orch_plan = {}
 
+    # ── Section-target consistency: resolve orchestrator intended target ────────────────────
+    # orch_plan.target_section_id is the section the orchestrator wants to gather evidence for.
+    # It may differ from section.id when the orchestrator jumps ahead.
+    _orch_target_section_id: str = (
+        orch_plan.get("target_section_id") or (section.id if section else "")
+    )
+    _active_section_id: str = section.id if section else ""
+
     # ── Two-Lane Architecture ──────────────────────────────────────────────────
 
     # Lane A: deterministic target selection → LLM phrasing only
@@ -3816,6 +3948,20 @@ def generate_questions_node(state: "PRDState") -> dict:
               confidence=confidence, target=target, candidates=candidates,
               reason=classification_reason, reason_code=reason_code)
     
+    # ── base_prompt: initialize ONCE — before ALL early exits and orchestrator branches ──
+    # INVARIANT: every return path (SECTION_COMPLETE, UNRESOLVED_GAP, safe_clarify,
+    # deterministic PROPOSE, SEED, TRADEOFF, Lane A/B) reads or passes base_prompt.
+    # Initialize here so no branch can reference an unbound variable.
+    base_prompt = _build_elicitor_prompt_context(state, section, bridge_output)
+    log_event(
+        **ctx, level="DEBUG",
+        event_type="generate_question_prompt_initialized",
+        message="base_prompt initialized — covers all return paths",
+        prompt_length=len(base_prompt),
+        has_base_prompt=True,
+        prompt_path="pending",  # refined per branch below
+    )
+
     # ── Section-complete early exit (F1/F2/F3) ───────────────────────────────
     # When all canonical components are resolved, skip LLM entirely and
     # return no_question_available so the router advances to draft.
@@ -3844,12 +3990,48 @@ def generate_questions_node(state: "PRDState") -> dict:
             "recent_questions": state.get("recent_questions", []),
             "repair_instruction": "",
         }, "", section.title if section else "Unknown", state["section_index"], state.get("iteration", 0), event_type="elicit")
-    
-    base_prompt = _build_elicitor_prompt_context(state, section, bridge_output)
+
+    # ── Unresolved gap early exit — dedicated gap_question path ──────────────
+    # When _classify_target_confidence returns UNRESOLVED_GAP, orchestration has
+    # detected a blocking gap in section_gap_state. Read the question directly from
+    # the structured gap — do NOT route through _extract_draft_markers or any draft
+    # text inspection. This is a clean orchestrator-owned path.
+    if reason_code == "UNRESOLVED_GAP":
+        _section_gaps = state.get("section_gap_state", {}).get(section.id, [])
+        _blocking = [g for g in _section_gaps if not g.get("resolved") and g.get("severity") == "blocking"]
+        if _blocking:
+            _first_gap = _blocking[0]
+            _gap_q = _first_gap.get("question", "")
+            _gap_id = _first_gap.get("gap_id", f"gap_{section.id}")
+            _gap_comp = _first_gap.get("component", "gap")
+            log_event(
+                **ctx, level="INFO",
+                event_type="gap_question_generated",
+                message="Returning structured gap question — no draft text parsing required",
+                section_id=section.id,
+                gap_id=_gap_id,
+                component=_gap_comp,
+                reason=classification_reason,
+            )
+            _norm = {
+                "single_next_question": _gap_q,
+                "question_id": _gap_id,
+                "subparts": [],
+                "gap_reason": f"unresolved_gap:{_gap_comp}",
+            }
+            # base_prompt already initialized above — no re-init needed here.
+            return _package_generated_question_result(
+                _norm, _gap_q,
+                {"question_id": _gap_id, "question_text": _gap_q, "subparts": []},
+                state, section, ctx, base_prompt,
+                override_status="gap_question",
+                duplicate_details={"total_candidates_evaluated": 0, "rejection_reasons": []},
+            )
+
 
     # ── Orchestrator dispatch — consumes _orch_base_prompt_override ───────────
-    # Previously _orch_base_prompt_override was set but never read (dead variable).
-    # This block is the fix: we consume the orchestrator decision BEFORE any LLM call.
+    # Initialize first, mutate second (inject seed/candidates/tradeoff),
+    # call LLM or deterministic formatter third.
     #
     # Three paths:
     #   1. PROPOSE + candidates → deterministic formatter short-circuit (no LLM)
@@ -3880,16 +4062,32 @@ def generate_questions_node(state: "PRDState") -> dict:
                 override_status="orchestrator_deterministic_propose",
                 duplicate_details={"total_candidates_evaluated": 1, "rejection_reasons": []},
             )
-        # Candidate items exist but formatter returned empty (edge case) —
-        # fall through to LLM path with candidates injected as CONSTRAINT.
-        base_prompt = _inject_orch_candidates(base_prompt, orch_plan)
+        # Deterministic formatter rejected all candidates — return SAFE_CLARIFY directly.
+        # Do NOT fall through to _inject_orch_candidates with corrupted text.
+        # Do NOT pass zero usable candidates to the LLM as PROPOSE_ONE.
+        _rejected_count = len(orch_plan.get("candidate_items", []))
         log_event(
-            **ctx, level="INFO",
-            event_type="orchestrator_prompt_override_applied",
-            message="Candidate constraint injected into prompt (LLM phrasing path, formatter returned empty)",
+            **ctx, level="WARNING",
+            event_type="orchestrator_all_candidates_rejected_safe_clarify",
+            message="All deterministic candidates rejected — returning safe clarification question",
             section_id=section.id, action=orch_action,
-            candidate_count=len(orch_plan.get("candidate_items", [])),
-            path="llm_constrained",
+            rejected_candidate_count=_rejected_count,
+            path="safe_clarify",
+        )
+        _section_title = section.title if section else "this section"
+        _safe_q = _build_safe_clarification_question(section.id if section else "", _section_title)
+        _norm = {
+            "single_next_question": _safe_q,
+            "question_id": f"orch_safe_clarify_{section.id if section else 'unknown'}",
+            "subparts": [],
+            "gap_reason": "orchestrator_safe_clarify",
+        }
+        return _package_generated_question_result(
+            _norm, _safe_q,
+            {"question_id": _norm["question_id"], "question_text": _safe_q, "subparts": []},
+            state, section, ctx, base_prompt,
+            override_status="orchestrator_safe_clarify",
+            duplicate_details={"total_candidates_evaluated": _rejected_count, "rejection_reasons": ["all_corrupted"]},
         )
     elif _orch_base_prompt_override == "PROPOSE_CONSTRAINED":
         # PROPOSE + not_live: cannot deterministically format (no live injection gate),
@@ -4415,7 +4613,9 @@ def handle_tagged_event_node(state: PRDState) -> dict:
     fact_id = str(uuid.uuid4())
 
     if event_type == "TAG_MESSAGE_AS_TRUTH":
-        canonical_answer = target_content or new_content
+        from utils.filler_sanitizer import sanitize_answer as _sanitize_answer
+        _raw_canonical = target_content or new_content
+        canonical_answer = _sanitize_answer(_raw_canonical) or _raw_canonical  # fallback to raw if empty after sanitize
         promotion_note = new_content if (new_content and new_content != canonical_answer) else ""
         chat_msg = (
             "**Ground truth set** 📌\n\n"
@@ -4425,7 +4625,8 @@ def handle_tagged_event_node(state: PRDState) -> dict:
         store_update = {
             concept_key: {
                 "fact_id": fact_id,
-                "answer": canonical_answer,
+                "answer": canonical_answer,       # cleaned
+                "raw_answer": _raw_canonical,      # audit only
                 "questions": current_questions,
                 "section": section.title,
                 "section_id": section.id,
@@ -4449,7 +4650,9 @@ def handle_tagged_event_node(state: PRDState) -> dict:
         }]
 
     elif event_type == "CORRECT_MESSAGE":
-        corrected_answer = new_content or target_content
+        from utils.filler_sanitizer import sanitize_answer as _sanitize_answer
+        _raw_corrected = new_content or target_content
+        corrected_answer = _sanitize_answer(_raw_corrected) or _raw_corrected  # fallback if sanitizer returns empty
         # Hard Correction Linkage (P1/P3): Match by target_message_id or fail
         existing_store = state.get("confirmed_qa_store", {})
         corrects_key = next(
@@ -4473,7 +4676,8 @@ def handle_tagged_event_node(state: PRDState) -> dict:
         store_update = {
             concept_key: {
                 "fact_id": fact_id,
-                "answer": corrected_answer,
+                "answer": corrected_answer,       # cleaned
+                "raw_answer": _raw_corrected,      # audit only
                 "questions": current_questions,
                 "section": section.title,
                 "section_id": section.id,
@@ -4812,13 +5016,50 @@ def await_confirmation_node(state: PRDState) -> dict:
 
     if _is_acceptance(user_response):
         # ── Commit to canonical truth ─────────────────────────────────────
+        from utils.filler_sanitizer import sanitize_answer as _sanitize_answer, is_filler_only as _is_filler_only
         pending = state.get("pending_concept_updates", {})
         interpreted_answer = pending.get("interpreted_answer", pending.get("raw_answer", ""))
         question = pending.get("questions", state.get("current_questions", ""))
+
+        # ── Filler sanitization — strip before canonical commit ───────────
+        # Keep the raw text for audit only; all downstream reads use cleaned.
+        raw_interpreted_answer = interpreted_answer
+        cleaned_answer = _sanitize_answer(interpreted_answer)
+
+        # Guard: if the entire reply was filler, do not commit — re-ask instead.
+        if _is_filler_only(interpreted_answer):
+            log_event(**ctx, level="WARNING", event_type="filler_only_answer_blocked",
+                      message="Answer is conversational filler only — skipping commit, re-asking",
+                      raw_preview=interpreted_answer[:120])
+            reask_q = state.get("current_questions", "")
+            return {
+                "answer_confirmation_status": "CORRECTED",
+                "raw_answer_buffer": "",
+                "pending_echo": "",
+                "pending_concept_updates": {},
+                "chat_history": [
+                    {"role": "user", "content": user_response},
+                    {
+                        "role": "assistant",
+                        "msg_id": f"msg_{str(uuid.uuid4())[:8]}",
+                        "type": "reask",
+                        "section": section.title,
+                        "content": "I didn\'t catch a specific answer there \u2014 could you give me a bit more detail?\n\n" + reask_q,
+                    },
+                ],
+            }
+
+        interpretation_cleaned = cleaned_answer or interpreted_answer  # fallback to original if sanitizer returns empty unexpectedly
         iteration = state.get("iteration", 0)
         existing_qa = list(state.get("section_qa_pairs", []))
         round_n = len(existing_qa) + 1
         concept_key = f"{section.id}:iter_{iteration}:round_{round_n}"
+
+        log_event(**ctx, level="DEBUG", event_type="filler_sanitization_applied",
+                  message="Filler sanitizer ran before commit",
+                  raw_preview=raw_interpreted_answer[:80],
+                  cleaned_preview=interpretation_cleaned[:80],
+                  was_mutated=(raw_interpreted_answer != interpretation_cleaned))
 
         # ── O-1b contradiction check (on CONFIRMED answers only) ──────────
         contradiction_flagged = False
@@ -4827,14 +5068,14 @@ def await_confirmation_node(state: PRDState) -> dict:
         existing_store = state.get("confirmed_qa_store", {})
         if existing_store:
             contradiction_desc = _check_contradiction(
-                question, interpreted_answer, existing_store, section.id,
+                question, interpretation_cleaned, existing_store, section.id,
             )
             if contradiction_desc:
                 contradiction_flagged = True
                 contradiction_log_entry = [{
                     "concept_key": concept_key,
                     "prior": "see confirmed_qa_store",
-                    "new": interpreted_answer[:200],
+                    "new": interpretation_cleaned[:200],
                     "section": section.title,
                     "description": contradiction_desc,
                 }]
@@ -4855,13 +5096,14 @@ def await_confirmation_node(state: PRDState) -> dict:
 
         qa_entry = {
             "questions": question,
-            "answer": interpreted_answer,
+            "answer": interpretation_cleaned,   # cleaned — used by all inference
             "section": section.title,
         }
         store_update = {
             concept_key: {
                 "fact_id": fact_id,
-                "answer": interpreted_answer,
+                "answer": interpretation_cleaned,   # cleaned
+                "raw_answer": raw_interpreted_answer,  # audit only — never read by inference
                 "questions": question,
                 "section": section.title,
                 "section_id": section.id,
@@ -5227,7 +5469,9 @@ def detect_impact_node(state: PRDState) -> dict:
     def _run_side_facts():
         if not raw_answer:
             return []
-        return _extract_side_facts(question, raw_answer, state)
+        from utils.filler_sanitizer import sanitize_answer as _sanitize_answer
+        _cleaned_for_sidefacts = _sanitize_answer(raw_answer) or raw_answer
+        return _extract_side_facts(question, _cleaned_for_sidefacts, state)
 
     def _run_contradiction():
         existing_store = state.get("confirmed_qa_store", {})
@@ -5930,20 +6174,114 @@ def reflect_node(state: PRDState) -> dict:
                     message="JSON verdict disagrees with text verdict",
                     json_verdict=json_verdict, text_verdict=verdict,
                 )
+            # ── Parse blocking_gaps — orchestration source of truth ─────────────────
+            raw_blocking = parsed.get("blocking_gaps", [])
+            if not isinstance(raw_blocking, list):
+                raw_blocking = []
         except (ValueError, TypeError) as exc:
             log_event(
                 **ctx, level="WARNING", event_type="reflect_json_parse_error",
                 message=f"Failed to parse reflector JSON block: {exc}",
             )
+            raw_blocking = []
     else:
         log_event(
             **ctx, level="WARNING", event_type="reflect_json_missing",
             message="Reflector output contained no JSON block — using regex fallback",
         )
+        raw_blocking = []
+
+    # ── Build structured section_gap_state update ─────────────────────────────────
+    # Orchestrator reads this. Composer renders from this. Routing never reads draft text.
+    _existing_gaps: list = list(state.get("section_gap_state", {}).get(section.id, []))
+
+    if verdict == "PASS":
+        # Mark all existing gaps for this section resolved on PASS.
+        _new_gap_state_for_section = [
+            {**g, "resolved": True} for g in _existing_gaps
+        ]
+        log_event(**ctx, level="INFO", event_type="section_gaps_resolved_on_pass",
+                  message="All blocking gaps marked resolved on PASS",
+                  section_id=section.id, count=len(_existing_gaps))
+    else:
+        # Build blocking gaps from JSON block (primary) or keyword fallback.
+        _COMPONENT_KEYWORDS: dict[str, list[str]] = {
+            "target": ["target", "targets", "goal value", "threshold", "success criterion"],
+            "baseline": ["baseline", "current rate", "current level", "starting point"],
+            "measurement_method": ["measurement", "measured", "tracked", "monitoring", "how to measure"],
+            "timeline": ["timeline", "deadline", "by when", "schedule", "date"],
+            "owner": ["owner", "responsible", "accountable", "who owns"],
+            "validation_plan": ["validation", "evaluation plan", "test plan"],
+        }
+
+        def _infer_component(text: str) -> str:
+            tl = text.lower()
+            for comp, kws in _COMPONENT_KEYWORDS.items():
+                if any(kw in tl for kw in kws):
+                    return comp
+            return "other"
+
+        # Primary: use LLM-parsed blocking_gaps
+        _json_gap_entries = []
+        for raw_g in raw_blocking:
+            if not isinstance(raw_g, dict):
+                continue
+            _comp = str(raw_g.get("component", "other")).strip()
+            _q = str(raw_g.get("question", "")).strip()
+            if not _q:
+                continue
+            _json_gap_entries.append({"component": _comp, "question": _q})
+
+        # Fallback: keyword-match technical_gaps lines when JSON blocking_gaps absent
+        _fallback_gap_entries = []
+        if not _json_gap_entries:
+            for line in technical_gaps.splitlines():
+                line = line.strip().lstrip("-•*0123456789. \t")
+                if not line:
+                    continue
+                _comp = _infer_component(line)
+                _fallback_gap_entries.append({"component": _comp, "question": line})
+
+        _source_entries = _json_gap_entries or _fallback_gap_entries
+
+        # Merge: prefer existing gap_id for same component (stable IDs across turns)
+        _existing_by_comp = {g["component"]: g for g in _existing_gaps}
+        _new_gap_state_for_section = []
+        for entry in _source_entries:
+            existing = _existing_by_comp.get(entry["component"])
+            if existing:
+                # Update question text; preserve gap_id and resolved status
+                _new_gap_state_for_section.append({
+                    **existing,
+                    "question": entry["question"],
+                    "resolved": False,
+                })
+            else:
+                _new_gap_state_for_section.append({
+                    "gap_id": str(uuid.uuid4()),
+                    "section_id": section.id,
+                    "component": entry["component"],
+                    "question": entry["question"],
+                    "severity": "blocking",
+                    "source": "reflect_node",
+                    "resolved": False,
+                })
+
+        # Carry forward any existing gaps whose component is NOT in new entries
+        _new_comps = {e["component"] for e in _source_entries}
+        for eg in _existing_gaps:
+            if eg["component"] not in _new_comps:
+                _new_gap_state_for_section.append({**eg, "resolved": True})
+
+        log_event(**ctx, level="INFO", event_type="section_gaps_updated",
+                  message="Structured blocking gaps written to section_gap_state",
+                  section_id=section.id,
+                  gap_count=len(_new_gap_state_for_section),
+                  source="json" if _json_gap_entries else "keyword_fallback")
 
     blocking_fields = [
-        l.strip().lstrip("-•*0123456789. \t") 
-        for l in technical_gaps.splitlines() 
+        l.strip().lstrip("-•*0123456789. \t")
+        for l in technical_gaps.splitlines()
         if l.strip().lstrip("-•*0123456789. \t")
     ]
     missing_required_fields_count = len(blocking_fields)
@@ -6007,6 +6345,8 @@ def reflect_node(state: PRDState) -> dict:
                 "iteration": new_iteration,
             }
         },
+        # ── Structured gap state (orchestrator source of truth) ──────────
+        "section_gap_state": {section.id: _new_gap_state_for_section},
         "chat_history": [
             {
                 "role": "assistant",
@@ -6063,6 +6403,43 @@ def advance_section_node(state: PRDState) -> dict:
     else:
         advance_event = "advance_section_forced_iter_cap"
         advance_reason = "ITER_CAP"
+
+    # ── Blocking gap guard: ITER_CAP/RECOVERY_CAP cannot override required fields ───
+    if advance_reason != "PASS":
+        _section_gaps = state.get("section_gap_state", {}).get(section.id, [])
+        _blocking = [
+            g for g in _section_gaps
+            if not g.get("resolved") and g.get("severity") == "blocking"
+        ]
+        if _blocking:
+            log_event(
+                **ctx, level="WARNING",
+                event_type="forced_progression_blocked_by_required_gap",
+                message="ITER_CAP/RECOVERY_CAP blocked — unresolved blocking gaps remain",
+                section_id=section.id,
+                advance_reason=advance_reason,
+                blocked_by=[g.get("component") for g in _blocking],
+            )
+            # Stay in current section without advancing.
+            return {"verdict": "REWORK", "triage_decision": "TRIAGE: NORMAL ITERATION"}
+
+    # ── question_target_section_consistency_guard: ITER_CAP cannot override mismatch ──
+    if advance_reason != "PASS":
+        _q_target = state.get("last_question_target_section_id", "")
+        _cross_sec = state.get("cross_section_target")
+        if _q_target and _q_target != section.id and not _cross_sec:
+            log_event(
+                **ctx, level="WARNING",
+                event_type="advance_blocked_by_section_target_mismatch",
+                message=(
+                    f"ITER_CAP/RECOVERY_CAP blocked — last question target "
+                    f"'{_q_target}' != section being advanced '{section.id}'"
+                ),
+                section_id=section.id,
+                last_question_target_section_id=_q_target,
+                advance_reason=advance_reason,
+            )
+            return {"verdict": "REWORK", "triage_decision": "TRIAGE: NORMAL ITERATION"}
 
     log_event(
         **ctx, level="INFO", event_type="node_start",
@@ -6306,6 +6683,79 @@ def answer_clarification_node(state: PRDState) -> dict:
         did_append_followup_question=False
     )
     
+    section_index = state.get("section_index", 0)
+    try:
+        section_title = get_section_by_index(section_index).title
+        section_id = get_section_by_index(section_index).id
+    except Exception:
+        section_title = "the current section"
+        section_id = ""
+
+    # ── Preflight: guardrail-triggered off_topic block ──────────────────────────
+    # When the NeMo gateway classified the message as off_topic (after any
+    # relevance override failed), the question context may be absent or stale.
+    # Calling the LLM with empty contents throws 'contents are required'.
+    # Return a deterministic message instead — do NOT mutate QA store.
+    message_class = state.get("message_class", "")
+    if message_class == "off_topic" and not question:
+        log_event(
+            **ctx, level="WARNING",
+            event_type="answer_clarification_guardrail_bypass",
+            message="off_topic block with empty question — skipping LLM call",
+            message_class=message_class,
+            section_id=section_id,
+        )
+        reply_content = (
+            f"That doesn't seem related to {section_title}. "
+            f"Could you share more about {section_title}?"
+        )
+        new_message = {
+            "role": "assistant",
+            "msg_id": f"msg_{str(uuid.uuid4())[:8]}",
+            "type": "guardrail_clarification",
+            "content": reply_content,
+            "run_id": state.get("run_id", ""),
+            "section": section_title,
+        }
+        log_event(**ctx, level="INFO", event_type="node_end", message="answer_clarification finished (guardrail bypass)")
+        return {
+            "chat_history": [new_message],
+            "question_status": state.get("question_status", "OPEN"),
+        }
+
+    # ── Preflight: empty question or answer — skip LLM to avoid 'contents are required' ─
+    if not question or not answer:
+        log_event(
+            **ctx, level="WARNING",
+            event_type="answer_clarification_empty_prompt",
+            message="Empty question or answer — deterministic fallback applied",
+            question_empty=not bool(question),
+            answer_empty=not bool(answer),
+            section_id=section_id,
+        )
+        fallback_blockers = state.get("remaining_subparts", [])
+        if fallback_blockers:
+            reply_content = (
+                f"Could you tell me more about "
+                + ", ".join(fallback_blockers[:3])
+                + f" for {section_title}?"
+            )
+        else:
+            reply_content = f"Could you share more about {section_title}?"
+        new_message = {
+            "role": "assistant",
+            "msg_id": f"msg_{str(uuid.uuid4())[:8]}",
+            "type": "clarification_answer",
+            "content": reply_content,
+            "run_id": state.get("run_id", ""),
+            "section": section_title,
+        }
+        log_event(**ctx, level="INFO", event_type="node_end", message="answer_clarification finished (empty prompt bypass)")
+        return {
+            "chat_history": [new_message],
+            "question_status": state.get("question_status", "OPEN"),
+        }
+
     # We must format the PRD safely, handle edge cases
     prd_sections = state.get("prd_sections", {})
     from config.sections import PRD_SECTIONS

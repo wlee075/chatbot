@@ -19,7 +19,8 @@ from graph.nodes import (
     terminal_session_node,
 )
 from graph.split_nodes import (
-    answer_validity_node,
+    nemo_guardrails_gateway_node,
+    task_request_blocked_node,
     multimodal_answer_materialization_node,
     numeric_validation_node,
     intent_classifier_node,
@@ -45,7 +46,7 @@ from graph.routing import (
     route_after_draft,
     route_after_advance,
     route_after_answer,
-    route_after_answer_validity,
+    route_after_nemo_guardrails,
     route_after_first_message,
     route_after_numeric_validation,
     route_after_discovery,
@@ -119,7 +120,8 @@ def build_graph(checkpointer: MemorySaver | None = None):
     builder.add_node("uploaded_image_description", uploaded_image_description_node)
     builder.add_node("image_description_session_context", image_description_session_context_node)
     
-    builder.add_node("answer_validity", answer_validity_node)
+    builder.add_node("nemo_guardrails_gateway", nemo_guardrails_gateway_node)
+    builder.add_node("task_request_blocked", task_request_blocked_node)
     builder.add_node("answer_clarification", answer_clarification_node)
     builder.add_node("detect_impact", detect_impact_node)
     builder.add_node("draft", draft_node)
@@ -184,7 +186,7 @@ def build_graph(checkpointer: MemorySaver | None = None):
         "await_answer",
         route_after_answer,
         {
-            "answer_validity": "answer_validity",
+            "nemo_guardrails_gateway": "nemo_guardrails_gateway",
             "handle_tagged_event": "handle_tagged_event",
             "file_upload_intake": "file_upload_intake",
             "image_description_session_context": "image_description_session_context",
@@ -193,13 +195,17 @@ def build_graph(checkpointer: MemorySaver | None = None):
         },
     )
     builder.add_conditional_edges(
-        "answer_validity",
-        route_after_answer_validity,
+        "nemo_guardrails_gateway",
+        route_after_nemo_guardrails,
         {
             "await_answer": "await_answer",
+            "task_request_blocked": "task_request_blocked",
+            "answer_clarification": "answer_clarification",
+            "contradiction_validator": "contradiction_validator",
             "numeric_validation": "numeric_validation",
         },
     )
+    builder.add_edge("task_request_blocked", "await_answer")
     
     builder.add_conditional_edges(
         "file_upload_intake",

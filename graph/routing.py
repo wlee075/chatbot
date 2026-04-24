@@ -195,33 +195,35 @@ def route_after_answer(state: PRDState) -> str:
 
     if event_type in ("TAG_MESSAGE_AS_TRUTH", "CORRECT_MESSAGE"):
         return "handle_tagged_event"
-    # All standard ANSWER / REPLY_TO_MESSAGE paths go through the validity gate first
-    return "answer_validity"
+    # All standard ANSWER / REPLY_TO_MESSAGE paths go through the unified NeMo gateway
+    return "nemo_guardrails_gateway"
 
 
-def route_after_answer_validity(state: PRDState) -> str:
+def route_after_nemo_guardrails(state: PRDState) -> str:
     """
-    REJECTED → back to await_answer so the user can retype.
-              (clarification message is already in chat_history;
-               raw_answer_buffer was cleared by answer_validity_node)
-    PASSED   → continue to numeric_validation as normal.
+    Reads gateway_route_to set by nemo_guardrails_gateway_node.
+
+    Possible values:
+      await_answer         — noise_input: user re-types (clarification already emitted)
+      task_request_blocked — task_request: boundary acknowledgement, no mode switch
+      answer_clarification — meta_request / off_topic
+      contradiction_validator — contradiction
+      numeric_validation   — valid_answer / partial_answer / user_correction / cross_section
     """
-    status = state.get("answer_guardrail_status", "PASSED")
-    if status == "REJECTED":
-        route = "await_answer"
-    else:
-        route = "numeric_validation"
+    route = state.get("gateway_route_to", "numeric_validation")
+    message_class = state.get("message_class", "")
 
     log_event(
         thread_id=state.get("thread_id", ""),
         run_id=state.get("run_id", ""),
-        node_name="route_after_answer_validity",
+        node_name="route_after_nemo_guardrails",
         level="INFO",
         event_type="routing_decision",
-        message=f"Routing after answer_validity: {status} → {route}",
+        message=f"Routing after nemo_guardrails: {message_class} → {route}",
         route=route,
-        reason=status,
-        guardrail_reason=state.get("answer_guardrail_reason", ""),
+        message_class=message_class,
+        guardrail_reason=state.get("guardrail_reason", ""),
+        guardrail_source=state.get("guardrail_source", ""),
     )
     return route
 
@@ -324,13 +326,42 @@ def route_after_generate_questions(state: PRDState) -> str:
     """
     If the question generator exhausted all candidates and has no active question,
     safely bypass the `await_answer` lock and proceed directly to `draft`.
+
+    Defence-in-depth: if generation_status is no_question_available but the last
+    question target stamp does not match the active section, log a warning.
+    The mismatch clarification is already emitted by generate_questions_node itself
+    before this router is reached, so this log is observability-only.
     """
     status = state.get("generation_status", "question_generated")
     if status == "no_question_available":
         route = "draft"
+        # ── question_target_section_consistency_guard: defensive log ──────────
+        _last_target = state.get("last_question_target_section_id", "")
+        _active_idx = state.get("section_index", 0)
+        _active_id = (
+            PRD_SECTIONS[_active_idx].id
+            if 0 <= _active_idx < len(PRD_SECTIONS) else ""
+        )
+        _cross = state.get("cross_section_target")
+        if _last_target and _last_target != _active_id and not _cross:
+            log_event(
+                thread_id=state.get("thread_id", ""),
+                run_id=state.get("run_id", ""),
+                node_name="route_after_generate_questions",
+                level="WARNING",
+                event_type="section_target_mismatch_observed",
+                message=(
+                    f"no_question_available reached router but last target "
+                    f"'{_last_target}' != active section '{_active_id}'. "
+                    f"Clarification should have been emitted by generate_questions_node."
+                ),
+                last_question_target_section_id=_last_target,
+                active_section_id=_active_id,
+            )
+        # ── end guard ────────────────────────────────────────────────────────
     else:
         route = "await_answer"
-        
+
     log_event(
         thread_id=state.get("thread_id", ""),
         run_id=state.get("run_id", ""),

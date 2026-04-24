@@ -43,70 +43,159 @@ def _has_reversal(text: str) -> bool:
     return any(r in tl for r in _REVERSAL_MARKERS)
 
 
-def answer_validity_node(state: PRDState) -> dict:
-    """Pre-commit response quality gate.
+def nemo_guardrails_gateway_node(state: PRDState) -> dict:
+    """Unified NeMo Guardrails PRD gateway.
 
-    Runs immediately after await_answer and before numeric_validation.
-    Prevents accidental keystrokes (e.g. 'ñ', '.', 'aaaa') from advancing
-    section state or being echoed as confirmed facts.
+    Runs immediately after await_answer and before any section state mutation.
+    Classifies the user message into one of 9 classes and writes routing flags.
 
-    Decision:
-      PASSED  → no-op; downstream nodes proceed normally
-      REJECTED → gentle clarification emitted; raw_answer_buffer cleared;
-                 downstream numeric_validation / intent_classifier skipped
-                 via route_after_answer_validity router.
+    This node enforces the core chatbot contract: INFORMATION-GATHERING ONLY.
+    Task requests (code / PDF / export / draft) are blocked here — never routed
+    to a downstream executor.
+
+    Returns state fields consumed by route_after_nemo_guardrails:
+      message_class, gateway_allow_commit, gateway_allow_section_complete,
+      gateway_allow_advance, gateway_route_to, is_user_correction,
+      is_tentative_answer, cross_section_target,
+      guardrail_reason, guardrail_confidence, guardrail_source
     """
     import uuid as _uuid
-    from utils.answer_guardrail import check_answer_quality
+    from utils.nemo_guardrails_gateway import (
+        run_nemo_guardrails_gateway, safe_fallback_result,
+    )
 
-    ctx = _log_ctx(state, "answer_validity")
+    ctx = _log_ctx(state, "nemo_guardrails_gateway")
     raw_answer = state.get("raw_answer_buffer", "").strip()
-    question   = state.get("current_questions", "").strip()
 
-    # Image-only submissions are always valid (no text required)
+    # Image-only submissions bypass text classification
     if not raw_answer and state.get("uploaded_files"):
-        log_event(**ctx, level="INFO", event_type="answer_guardrail_passed",
-                  message="Image-only submission — guardrail bypassed", reason="image_only")
-        return {"answer_guardrail_status": "PASSED"}
+        log_event(**ctx, level="INFO", event_type="nemo_guardrails_classified",
+                  message="Image-only submission — guardrail bypassed",
+                  message_class="valid_answer", source="bypass")
+        return {
+            "message_class": "valid_answer",
+            "gateway_allow_commit": True,
+            "gateway_allow_section_complete": True,
+            "gateway_allow_advance": True,
+            "gateway_route_to": "numeric_validation",
+            "is_user_correction": False,
+            "is_tentative_answer": False,
+            "cross_section_target": None,
+            "guardrail_reason": "image-only bypass",
+            "guardrail_confidence": 1.0,
+            "guardrail_source": "FAST_REGEX",
+        }
 
-    result = check_answer_quality(raw_answer, question)
-
-    if result.passed:
-        log_event(**ctx, level="INFO", event_type="answer_guardrail_passed",
-                  message="Answer quality check passed",
-                  reason=result.reason, score=result.score,
-                  input_length=len(raw_answer))
-        return {"answer_guardrail_status": "PASSED"}
-
-    # ── Reject path ──────────────────────────────────────────────────────────
-    log_event(**ctx, level="WARNING", event_type="answer_guardrail_triggered",
-              message="Answer quality check REJECTED input — clarification prompted",
-              reason=result.reason, score=result.score,
-              input_length=len(raw_answer),
-              **{f"signal_{k}": v for k, v in result.signals.items()})
-
-    section_index = state.get("section_index", 0)
     try:
-        section_title = get_section_by_index(section_index).title
-    except Exception:
-        section_title = ""
+        result = run_nemo_guardrails_gateway(state, raw_answer)
+    except Exception as exc:
+        log_event(**ctx, level="ERROR", event_type="nemo_guardrails_error",
+                  message=f"Gateway error — safe fallback applied: {exc}")
+        result = safe_fallback_result()
 
-    clarification_msg = {
-        "role":     "assistant",
-        "msg_id":   f"msg_{str(_uuid.uuid4())[:8]}",
-        "type":     "answer_validity_clarification",
-        "content":  result.clarification_prompt,
-        "run_id":   state.get("run_id", ""),
-        "section":  section_title,
+    # ── Defensive schema guard ─────────────────────────────────────────────────
+    # If the GatewayResult object is missing any expected field (e.g. from a
+    # future interface regression), extract values with getattr defaults and log
+    # a schema-error so the UI never crashes.
+    _EXPECTED_FIELDS = (
+        "message_class", "confidence", "allow_commit", "allow_section_complete",
+        "allow_advance", "route_to", "corrected_prior_content", "target_section_override",
+        "guardrail_reason", "classifier_source", "signals",
+    )
+    _missing = [f for f in _EXPECTED_FIELDS if not hasattr(result, f)]
+    if _missing:
+        log_event(**ctx, level="ERROR", event_type="nemo_guardrails_schema_error",
+                  message=f"GatewayResult missing fields — safe fallback applied: {_missing}")
+        result = safe_fallback_result(reason=f"schema error: missing {_missing}")
+
+    # ── Logging ───────────────────────────────────────────────────────────────
+    if result.message_class in ("noise_input", "task_request", "meta_request",
+                                "off_topic", "contradiction"):
+        log_event(**ctx, level="WARNING", event_type="nemo_guardrails_blocked",
+                  message=f"Guardrail blocked: {result.message_class}",
+                  message_class=result.message_class,
+                  source=result.classifier_source,
+                  reason=result.guardrail_reason,
+                  route_to=result.route_to,
+                  **{f"signal_{k}": v for k, v in result.signals.items()})
+    elif result.message_class in ("user_correction", "cross_section", "partial_answer"):
+        log_event(**ctx, level="INFO", event_type="nemo_guardrails_rerouted",
+                  message=f"Guardrail rerouted: {result.message_class}",
+                  message_class=result.message_class,
+                  source=result.classifier_source,
+                  reason=result.guardrail_reason,
+                  cross_section_target=result.target_section_override or "")
+    else:
+        log_event(**ctx, level="INFO", event_type="nemo_guardrails_classified",
+                  message=f"Guardrail passed: {result.message_class}",
+                  message_class=result.message_class,
+                  source=result.classifier_source,
+                  confidence=result.confidence)   # canonical field: GatewayResult.confidence
+
+    # ── State update ──────────────────────────────────────────────────────────
+    updates: dict = {
+        "message_class": result.message_class,
+        "gateway_allow_commit": result.allow_commit,
+        "gateway_allow_section_complete": result.allow_section_complete,
+        "gateway_allow_advance": result.allow_advance,
+        "gateway_route_to": result.route_to,
+        "is_user_correction": result.corrected_prior_content,
+        "is_tentative_answer": result.message_class == "partial_answer",
+        "cross_section_target": result.target_section_override,
+        "guardrail_reason": result.guardrail_reason,
+        "guardrail_confidence": result.confidence,   # state key = guardrail_confidence
+        "guardrail_source": result.classifier_source,
     }
 
+    if result.message_class == "noise_input":
+        # Emit gentle clarification
+        section_index = state.get("section_index", 0)
+        try:
+            section_title = get_section_by_index(section_index).title
+        except Exception:
+            section_title = ""
+        updates["raw_answer_buffer"] = ""
+        updates["chat_history"] = [{
+            "role":    "assistant",
+            "msg_id":  f"msg_{str(_uuid.uuid4())[:8]}",
+            "type":    "guardrail_clarification",
+            "content": "I may have caught a typo — could you answer in a full word or phrase?",
+            "run_id":  state.get("run_id", ""),
+            "section": section_title,
+        }]
+
+    return updates
+
+
+def task_request_blocked_node(state: PRDState) -> dict:
+    """Boundary-preserving task decline node.
+
+    Emits a short acknowledgement and routes back to await_answer.
+    This node is LLM-free and must NOT mutate:
+      confirmed_qa_store, section_qa_pairs, or section_index.
+    """
+    import uuid as _uuid
+
+    ctx = _log_ctx(state, "task_request_blocked")
+    log_event(**ctx, level="INFO", event_type="task_request_blocked",
+              message="Task request blocked — chatbot staying in info-gathering mode",
+              guardrail_reason=state.get("guardrail_reason", ""))
+
+    msg = (
+        "I'm focused on gathering the information first. "
+        "Let's finish clarifying the requirements before turning it into an artifact."
+    )
     return {
-        "answer_guardrail_status": "REJECTED",
-        "answer_guardrail_reason": result.reason,
-        # Clear the buffer so echo_generation / truth_commit cannot touch it
-        "raw_answer_buffer": "",
-        "chat_history": [clarification_msg],
+        "chat_history": [{
+            "role":    "assistant",
+            "msg_id":  f"msg_{str(_uuid.uuid4())[:8]}",
+            "type":    "task_request_blocked",
+            "content": msg,
+            "run_id":  state.get("run_id", ""),
+        }],
     }
+
+
 
 
 def numeric_validation_node(state: PRDState) -> dict:

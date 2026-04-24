@@ -781,7 +781,8 @@ Emit this block at the very end of your response, after the VERDICT line above.
   "brief_rationale": "Max 5 words explaining verdict",
   "technical_gaps": [],
   "user_gaps": [],
-  "confidence": 0.0
+  "confidence": 0.0,
+  "blocking_gaps": []
 }}
 ```
 
@@ -793,6 +794,10 @@ Rules for the JSON block:
   NO EVALUATOR JARGON. Never use words like 'undefined', 'unmeasurable', 'ambiguous', 'contradictory'. Write like a natural colleague.
   Example: "What should happen when a user hits the daily report limit?"
 - "confidence": 0.9+ for PASS-quality drafts; 0.5-0.89 for minor gaps; below 0.5 for major missing decisions.
+- "blocking_gaps": array of objects for fields that are genuinely required and still missing.
+  Each object: {{"component": "<baseline|target|measurement_method|timeline|owner|validation_plan|other>", "question": "<exact plain-English question to ask the user>"}}
+  Only include if the field is truly required for this section type. Use an empty array [] if nothing is blocking.
+  Example for a success_metrics section: [{{"component": "target", "question": "What accuracy target should we use for the final automated + human-reviewed output?"}}]
 - Must be valid JSON. No trailing commas. Strings must be double-quoted.\
 """
 
