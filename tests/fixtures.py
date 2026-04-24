@@ -14,11 +14,11 @@ Each fixture is a dict with:
 
 FIXTURES = [
     # ─────────────────────────────────────────────────────────────────────────
-    # tl;dr — F01: High quality
+    # Headliner — F01: High quality
     # ─────────────────────────────────────────────────────────────────────────
     {
         "fixture_id": "F01",
-        "section_id": "tldr",
+        "section_id": "headliner",
         "label": "high",
         "expected_band": "high",
         "expected_verdict": "PASS",
@@ -37,11 +37,11 @@ FIXTURES = [
         ),
     },
     # ─────────────────────────────────────────────────────────────────────────
-    # tl;dr — F02: Poor quality
+    # Headliner — F02: Poor quality
     # ─────────────────────────────────────────────────────────────────────────
     {
         "fixture_id": "F02",
-        "section_id": "tldr",
+        "section_id": "headliner",
         "label": "poor",
         "expected_band": "poor",
         "expected_verdict": "REWORK",

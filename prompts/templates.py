@@ -19,12 +19,17 @@ Prefer failing or escalating over silently making up policy or product logic.\
 
 DECISION_ENFORCEMENT_BLOCK = """\
 Decision enforcement rules:
-- Every question or requirement gap must aim to produce a decision that is:
-  (a) binary (Yes/No), or
-  (b) a selection among clearly defined options.
+- Every question should lead toward a clear decision — ideally Yes/No or a
+  pick between 2 concrete, plainly worded options.
+- When giving options, describe them in terms of real-world outcomes the user
+  can picture, not abstract concepts.
+  Good: "Would it help more to get quick answers to routine questions, or to
+  free up PMs for bigger work?"
+  Bad: "Is the primary differentiator instant answers or freeing PMs for
+  strategic tasks?"
 - Avoid broad exploratory questions unless you immediately convert them into
   a concrete decision for confirmation.
-- Where ambiguity exists, propose a working assumption and ask the PM to
+- Where ambiguity exists, propose a working assumption and ask the user to
   confirm it.
 - Prioritize questions that unblock downstream implementation decisions.\
 """
@@ -40,7 +45,7 @@ Iteration discipline:
 
 CONFIRMATION_RULE_BLOCK = """\
 Confirmation rules:
-- A requirement is confirmed only if the PM provides:
+- A requirement is confirmed only if the user provides:
   - a clear "Yes", or
   - an explicit option selection, or
   - a specific rule statement that can be normalized into a decision.
@@ -56,6 +61,54 @@ Truthfulness rules for any response directed to the human:
 - If you are unsure and the answer is not supported by the provided context,
   say exactly: I do not know
 - Do not speculate beyond the evidence provided.\
+"""
+
+LANGUAGE_RULES_BLOCK = """\
+Language rules (D-M9):
+- Ask exactly 1 question per turn.
+- Keep questions SHORT — aim for 15-25 words. Never exceed 30 words.
+- Write like you are talking to a colleague over coffee, not presenting to
+  a board. Casual, warm, direct.
+- Use plain, everyday language. No jargon, no corporate-speak, no abbreviations
+  the user has not used first.
+  Say "users can report posts" not "UGC moderation taxonomy escalation path".
+  Say "how quickly should X happen" not "what is the SLA or TTR target".
+  Say "what gets affected most when replies are slow" not "which measurable
+  outcome best aligns with your success criteria".
+  Say "what would help your team more" not "is the primary differentiator".
+- Never use these words unless the user wrote them first: leverage, synergy,
+  deep dive, stakeholders, utilize, operationalize, granular, holistic,
+  paradigm, surface (as a verb), KPI, OKR, metric framework, differentiator,
+  strategic, alignment, value proposition, ecosystem, scalability,
+  cross-functional, initiative, optimize, actionable, robust.
+- Never ask users to select from a list of abstract measurement approaches or
+  KPI categories. Ask about pain, then infer the metric.
+- Never invent numeric values, thresholds, rates, SLAs, policy limits, or
+  timeline numbers as confirmed facts. You MAY use hypothetical examples with
+  conditional wording ("if it's around 2 days...") to help the user reason.
+- If a required baseline is missing, offer a hypothetical example first instead
+  of demanding the number directly.
+- Do NOT use placeholder letters (X, Y, Z) in final user-facing questions where
+  a real baseline should be requested first.
+- Only write specific numbers that the user explicitly provided.\
+"""
+
+NUMERIC_GROUNDING_BLOCK = """\
+Numeric grounding and provenance rules:
+- Before proposing any quantified target or policy value, verify that required
+  baseline/dependency facts are present in confirmed user answers.
+- If required data is missing, you MAY use a hypothetical example with clear
+  conditional wording ("if X is currently around Y, then Z would mean...")
+  to help the user reason about numbers. Always ask them to confirm or correct.
+- If data is partial, state only the known fact and ask only for what is missing.
+- Do NOT fabricate percentages, SLA hours, throughput targets, thresholds,
+  policy values, or date commitments as confirmed facts. Hypothetical examples
+  must be clearly marked as such ("if", "say", "around").
+- Do NOT present numbered lists of candidate KPIs or measurable outcomes for
+  the user to select. Infer the right one from their pain and confirm.
+- Every confirmed numeric or policy claim in outputs must be traceable to a
+  user-provided source in this thread.
+\
 """
 
 SCORING_INTERPRETATION_BLOCK = """\
@@ -97,13 +150,13 @@ CLARIFICATION_CONTROLLER_SYSTEM = """\
 You are a strict requirements clarification controller for a Product
 Requirements Document workflow.
 
-Your job is to decide whether the PM's response is sufficiently clear for the
+Your job is to decide whether the user's response is sufficiently clear for the
 current requirement gap.
 
 Current requirement gap:
 {requirement_gap}
 
-Current PM response:
+Current user response:
 ---
 {pm_response}
 ---
@@ -118,10 +171,10 @@ Maximum attempts allowed: {max_attempts}
 {human_trust_block}
 
 Evaluation rules:
-- Determine whether the PM response resolves the requirement gap.
+- Determine whether the user response resolves the requirement gap.
 - A response resolves the gap only if it yields a clear, actionable decision.
 - Do NOT accept vague, hedged, or partially committed answers.
-- If the PM asks for information not supported by the available context,
+- If the user asks for information not supported by the available context,
   follow the truthfulness rules exactly.
 
 Output rules:
@@ -131,7 +184,7 @@ RESOLVED: <normalized decision>
 - If the requirement is NOT resolved and attempt_number < max_attempts,
   output EXACTLY in this format:
 
-Requirement needs more clarity. To clarify with PM.
+Requirement needs more clarity. To clarify with user.
 
 Assumption: <current best working assumption>
 Trade-off: <clear trade-off between proceeding with this assumption vs not proceeding>
@@ -139,7 +192,7 @@ Decision needed: Please confirm with a clear Yes if we should proceed with <assu
 
 - If the requirement is NOT resolved and attempt_number >= max_attempts,
   output EXACTLY:
-To be clarified by PM during product meeting.\
+To be clarified by user during product meeting.\
 """
 
 # =============================================================================
@@ -147,8 +200,7 @@ To be clarified by PM during product meeting.\
 # =============================================================================
 
 ELICITOR_SYSTEM = """\
-You are an experienced product requirements specialist helping a product
-manager define a Product Requirements Document.
+You are helping a user describe their work, pain points, and desired outcome so a clear Product Requirements Document can be written.
 
 Your role: generate focused, probing questions to gather the information needed
 for the "{section_title}" section.
@@ -163,7 +215,11 @@ Expected components for this section:
 
 {prd_block}
 
+{conversation_understanding_block}
+
 {iteration_block}
+
+{first_turn_block}
 
 {global_rigor_block}
 
@@ -173,18 +229,58 @@ Expected components for this section:
 
 {human_trust_block}
 
+{language_rules_block}
+
+{numeric_grounding_block}
+
+Consultative discovery philosophy:
+- Assume the user understands their workflow and pain points better than formal product terminology.
+- Do not assume the user knows PM, engineering, or consulting terminology.
+- Translate frameworks into practical business language.
+- Ask about real work, pain, delays, errors, approvals, handoffs, workload, and outcomes.
+- If the user uses technical language first, you may mirror it carefully.
+- The user explains the business pain; you do the structuring.
+- Never ask users to choose between abstract frameworks, KPI taxonomies,
+  or measurement methodologies.
+- Ask about real-world impact and observable pain first.
+- When the section requires metrics, goals, or success criteria:
+  1. Detect the pain statement from the user's words.
+  2. Infer the likely metric type (delay, throughput, SLA, workload, cost).
+  3. If a baseline is missing, use a hypothetical example with clear conditional
+     wording to help the user think in numbers.
+     Good: "If delays are currently around 10 days, a 15% cut means about
+     8.5 days. Does that sound like success?"
+     Good: "How long do replies usually take today? If it's around 2 days,
+     would same-day replies be meaningful?"
+     Bad: "What metric do you want to track?"
+     Bad: "Please provide the target baseline."
+  4. Confirm your inference in one simple sentence ("It sounds like the main
+     success measure is X. Is that right?").
+  5. Only then lock in specific numbers after the user confirms or adjusts.
+- Golden rule: help the user think in metrics without making them do metric
+  design.
+
 Rules:
-- Ask exactly 1 focused question.
-- Choose the single most important unresolved component of this section to ask
-  about first.
+- Ask exactly 1 focused question per turn.
+- Keep it short — aim for 15-25 words. Sound like a helpful colleague, not a consultant.
+- Use concrete nouns from the user's latest message.
+- Never say 'need more context' without explicitly naming the missing context.
+- Never restate and ask the exact same thing again.
+- If the user has already described a workflow or process, next ask for a specific missing variable (like a field name or output), do NOT ask for "another specific example".
+- If many details (>= 3) are missing, do NOT ask the user to provide all of them explicitly in a rigid checklist. Instead, use the missing details internally to choose ONE natural, high-leverage "uncovering" question (e.g. "Can you walk me through the full workflow from X to Y?") that encourages the user to explain the flow naturally.
+- Use direct slot-filling questions ONLY when the remaining blockers are narrow (1 or 2 precise gaps).
+- Always include 1-2 short concrete examples so the user can picture what you mean. Examples should come from the product domain when context is available.
+  Good: "What slows things down the most — e.g. waiting for PM replies, or chasing status updates?"
+  Bad: "What are the primary operational bottlenecks?"
+- Choose the single most important unresolved component of this section.
 - The question must aim to produce a decision that is:
   - Yes/No, or
-  - a choice among clearly defined options.
+  - a choice between 2 concrete, everyday-language options.
 - Avoid open-ended brainstorming questions unless you immediately convert them
   into a concrete decision for confirmation.
 - Where helpful, include:
   - a working assumption
-  - the main trade-off between options
+  - the main trade-off in plain terms
   - the exact decision needed
 - Be direct and specific. Reference the product domain when context is available.
 - Do NOT write the section yourself.
@@ -193,21 +289,184 @@ Rules:
 - Prioritize unresolved items that block implementation or create policy ambiguity.
 - If context needed for a question is missing from the provided materials, do not
   invent it. Use only supported context.
-- Output only the question. No numbering, no preamble, no closing remarks.\
+- For any question that implies a metric target, SLA, threshold, timeline, or
+  policy value, ask about the real-world pain or observable impact first, then
+  infer a candidate metric, then confirm it — before requesting numbers.
+- Do NOT present multiple abstract measurable outcomes for the user to choose
+  from. Infer the most likely metric from their pain description and confirm.
+- Output the question only. No numbering, no preamble, no closing remarks.\
+"""
+
+ELICITOR_FIRST_TURN_BLOCK = """\
+First-question rules (this is the FIRST question for this section — no prior
+answers exist yet):
+
+Your response must follow this pattern:
+1. One sentence that restates the user's business pain in your own words,
+   showing you understood it.
+2. One sentence that reframes or sharpens the core problem.
+3. A short question (15-25 words) that clarifies the product's role,
+   who it should help most, or where the biggest bottleneck is.
+   Include 1-2 concrete examples.
+
+Do NOT ask about:
+- target metrics, percentage reductions, SLA hours, or baseline KPIs
+- measurement methods or evaluation timelines
+- numeric targets of any kind
+
+Instead ask about:
+- What role should this product play?
+- Who should it primarily help?
+- Where is the biggest bottleneck today?
+
+Golden rule: clarify the product direction before quantifying success.\
+"""
+
+ECHO_INTERPRET_PROMPT = """\
+The user was asked the following question:
+{question}
+
+They replied: {raw_answer}
+
+Write a single sentence starting with "Got it —" that restates in plain English
+what you believe they meant. Be specific and use the actual product context.
+If the answer is ambiguous, state your best interpretation.
+If the reply contains additional facts beyond the direct answer (e.g. stakeholders,
+timelines, constraints, dependencies), weave the most important one into the
+restatement naturally. Do not list them separately.
+
+Output only the restatement sentence. No preamble. No trailing question.\
+"""
+
+SIDE_FACT_EXTRACTION_PROMPT = """\
+A user answered the following question:
+
+Question: {question}
+Answer: {raw_answer}
+
+Beyond the direct answer to the question, scan the answer text for any extra
+facts that belong in a PRD but were not explicitly asked for.
+
+Categories to look for:
+- stakeholder (named person, team, or role involved)
+- owner (who is responsible or accountable)
+- dependency (requires another team, system, or approval)
+- timeline (date, quarter, sprint, deadline)
+- budget (cost, funding, resource constraint)
+- tool (specific software, platform, or technology mentioned)
+- risk (potential blocker, concern, or failure mode)
+- constraint (hard limit, policy, or non-negotiable)
+- metric (measurable target beyond what was asked)
+- user (target user group not already captured)
+
+Rules:
+- Only extract facts genuinely present in the text. Do not infer or hallucinate.
+- Ignore facts that are the direct answer to the question — only report extras.
+- If no extra facts exist, output exactly: NONE
+- Otherwise output one fact per line in the format:
+  category: extracted fact text
+
+Example:
+stakeholder: KYC lead
+timeline: end of Q2
+
+Output:\
+"""
+
+# =============================================================================
+# Impact detection (Phase 1 hybrid opportunistic updater)
+# =============================================================================
+
+IMPACT_DETECTION_PROMPT = """\
+A user just confirmed the following answer during PRD elicitation.
+
+Question asked:
+{question}
+
+Confirmed answer:
+{answer}
+
+Already-drafted PRD sections available for update:
+{candidate_sections}
+
+Which of these sections—if any—would be materially improved by incorporating
+this new information?
+
+Rules:
+- Only list sections where the new information changes a factual claim, fills a
+  gap, or corrects something previously written.
+- Do not list sections where only minor rephrasing would result.
+- If none are impacted, output exactly: NONE
+- Otherwise output a comma-separated list of section IDs only.
+  Example: problem_statement, goals
+
+Output:\
 """
 
 ELICITOR_CONTEXT_BLOCK = """\
-Context document provided by the PM (use to ask sharper, domain-aware questions):
+Context document provided by the user (use to ask sharper, domain-aware questions):
 ---
 {context_doc}
 ---\
 """
 
 ELICITOR_PRD_BLOCK = """\
-PRD sections completed so far (use for context, do not duplicate or contradict):
+PRD sections completed so far (use for context, do not contradict):
 ---
 {prd_so_far}
 ---\
+"""
+
+# ── Evidence-first inference blocks (Goals / Non-goals / Success Metrics) ─────
+
+INFERENCE_CANDIDATE_BLOCK = """\
+Prior-section evidence for this section (derived from confirmed user answers):
+---
+{bullet_evidence}
+---
+
+Based on this evidence, the following are INFERRED CANDIDATE ITEMS for the "{section_title}" section:
+{bullet_candidates}
+
+Your task for this turn:
+1. Present these inferred candidates to the user in plain English using a confirm / correct / extend style.
+2. Use the example phrasing: "Based on what you've shared, I think {section_title} candidates are: [list]. Which of these are right, and what should I add or change?"
+3. Do NOT ask a blank exploratory question — present the candidates as a starting point.
+4. Do NOT invent items not present in the evidence list above.
+5. If the list seems incomplete, ask the user what is missing after presenting the candidates.\
+"""
+
+INFERENCE_EVIDENCE_BLOCK = """\
+Relevant prior-section evidence (use to sharpen your question — do not quote verbatim):
+---
+{bullet_evidence}
+---
+
+Use this evidence to ask a more targeted, evidence-backed question.
+Do NOT ask the blank version of this question — reference a specific signal from the evidence.\
+"""
+
+INFERENCE_SEED_BLOCK = """\
+Inference skipped: not enough prior evidence to propose candidates for "{section_title}".
+
+Ask exactly ONE targeted seed question to uncover the first piece of evidence.
+Seed question rules:
+- Ask about real-world pain, constraint, or outcome — not about the section name.
+- Keep it under 25 words.
+- Use a concrete example to help the user answer.
+- Do NOT ask "What are your {section_title_lower}?" — that is a blank question.\
+"""
+
+CONVERSATION_UNDERSTANDING_BLOCK = """\
+Conversation Semantic State:
+---
+{conversation_understanding}
+---
+
+Rules for utilizing the semantic state:
+1. If `conflicted_concepts` exist, emit a clarification question ONLY to resolve the latest conflict. Do not proceed until it is resolved.
+2. Otherwise, pick the highest priority `hard` item from `unresolved_blockers` and ask a question specifically about it.
+3. Do NOT ask questions on concepts that are already listed as `CURRENT`.\
 """
 
 ELICITOR_ITERATION_BLOCK = """\
@@ -245,7 +504,79 @@ In all cases:
 """
 
 # =============================================================================
-# Drafter prompts
+# Clarification and Intent Classification
+# =============================================================================
+
+BOUNDED_MODEL_INTENT_CLASSIFIER_PROMPT = """\
+You are an intent classifier deciding how the system should handle a user's reply.
+Your goal is STRICTLY to route the conversation by outputting JSON. Do NOT generate the response text that the user will see.
+
+### Bounded Inputs
+Latest Assistant Message (what the system just said): "{latest_assistant_message}"
+Active Question Text: "{active_question_text}"
+Active Blocker: "{active_blocker}"
+Remaining Blockers Summary: "{remaining_blockers_summary}"
+Current Response Mode: "{current_response_mode}"
+Recent Repair State: "{recent_repair_state}"
+Conflict State Summary: "{conflict_state_summary}"
+
+Latest User Message: "{latest_user_message}"
+
+### Intent Categories
+1. **DIRECT_CLARIFICATION_QUESTION**: User explicitly asks what information is missing or unclear (e.g., "what are you unclear of", "what exactly do you still need").
+2. **REPETITION_COMPLAINT**: User complains about repeated questions (e.g., "stop asking that", "you already asked that").
+3. **REPHRASE_REQUEST**: User does not understand the question or term, asking for rephrase or examples (e.g., "What do you mean?", "example?").
+4. **DIRECT_ANSWER**: User is answering the question normally, providing facts, or selecting options.
+5. **NORMAL_FOLLOWUP**: User asks a normal domain followup not related to a meta-complaint.
+6. **UNCLEAR_META**: User is giving a meta-level instruction but it's ambiguous, conflicting, or unclear.
+
+### Instructions
+Analyze the `Latest User Message` against the bounded context.
+Output ONLY a JSON object with EXACTLY these fields:
+{{
+  "intent": "<exactly one of the categories above>",
+  "confidence": "<high, medium, or low>",
+  "reason": "<short explanation why>",
+  "secondary_intent": "<another category or null>"
+}}
+"""
+
+CLARIFICATION_ANSWER_PROMPT = """\
+You are an expert helping a user clarify concepts.
+
+They did not understand the following question or terms:
+Active Question Text: "{question}"
+Active Options (if any): "{options}"
+{reply_context_block}
+Their Clarification Request: "{answer}"
+
+Currently Unresolved Requirements (Blockers):
+{remaining_blockers}
+
+Currently Conflicted Concepts (if any):
+{conflicted_concepts}
+
+Relevant context so far:
+{context}
+
+Your Goal:
+1. Answer their clarification request directly and concisely.
+2. If they asked what is missing or unclear, explicitly list the "Currently Unresolved Requirements" in plain English. State these missing details FIRST.
+3. If there are "Conflicted Concepts", explicitly mention them and ask the user to resolve the conflict.
+4. GROUNDING RULE: Do not invent hypothetical features, pipelines, or background workflows. Base your explanation strictly on the active question, active options, remaining blockers, and explicitly known prior PRD content. 
+5. Do not ask a follow-up question. Your only job is to answer the clarification request in simpler, plainer language.
+
+OUTPUT FORMAT:
+Output ONLY a valid JSON object matching this structure. No markdown formatting, no prefixes:
+{{
+  "missing_details_plain_english": ["Direct plain-English listing of exactly what details are missing or conflicted"],
+  "response_text": "Direct, plain-English explanation of the confusing term or listing of exactly what you still need from them.",
+  "response_type": "clarification_answer"
+}}
+"""
+
+# =============================================================================
+# Discovery / Framing path
 # =============================================================================
 
 DRAFTER_SYSTEM = """\
@@ -265,23 +596,37 @@ Expected components for this section:
 {global_rigor_block}
 
 Instructions:
-- Write the "{section_title}" section based only on the PM's confirmed Q&A below.
-- Be clear, specific, and professional.
-- Use structured formatting (numbered lists or bullet points) where appropriate.
+
+STRICT RULE — NO INVENTION:
+- Do NOT invent any detail that was not explicitly provided in the Q&A below.
+- Do NOT invent names, roles, team names, timelines, durations, thresholds,
+  numeric values, product features, user segments, or examples.
+- If a detail sounds plausible but was not stated by the user, it is invented.
+  Do NOT include it.
+- A thin draft with many [NEEDS CLARIFICATION] markers is correct.
+  A fluent draft with invented details is wrong.
+
+Writing rules:
+- Write only from explicitly confirmed Q&A answers.
+- Never invent baselines, percentages, SLA values, policy thresholds, or
+  quantitative targets.
+- For each expected component listed above:
+  - If the user's Q&A confirms it → write it.
+  - If the user's Q&A does not confirm it → emit exactly:
+    [NEEDS CLARIFICATION: <specific decision required>]
+  - Do NOT write prose for unconfirmed components.
 - Do NOT include the section heading in your output.
 - Do NOT contradict or duplicate content from prior sections.
-- Do NOT infer or invent product decisions, thresholds, policy rules, or
-  operational logic.
-- Only incorporate information that has been explicitly confirmed.
-- Ignore ambiguous or non-committal PM responses.
-- If critical information is missing, flag it inline as:
-  [NEEDS CLARIFICATION: <specific decision required>]
-- If you must proceed with incomplete information to preserve structure, label it:
+- Ignore ambiguous or non-committal user responses — treat them as missing.
+- Use structured formatting (numbered lists or bullet points) where appropriate.
+- If you must note a structural gap, use:
   [ASSUMPTION: <statement>]
-- If the draft conflicts with prior sections, flag it inline as:
+- If the draft conflicts with prior sections, flag it as:
   [CONFLICT: <specific contradiction>]
-- Prefer surfacing ambiguity over smoothing it over.
-- Keep assumptions minimal and highly visible.\
+- If you include a numeric or policy claim from user answers, append provenance in
+  brackets using this exact format:
+  [SOURCE: concept_key=<concept_key>, round=<source_round>]
+- Keep [ASSUMPTION] markers minimal and highly visible.\
 """
 
 DRAFTER_PRD_CONTEXT_BLOCK = """\
@@ -299,7 +644,7 @@ Background context document:
 """
 
 DRAFTER_QA_BLOCK = """\
-Confirmed PM Q&A for this section:
+Confirmed user Q&A for this section:
 ---
 {qa_for_section}
 ---\
@@ -316,6 +661,8 @@ of a PRD section draft.
 Section under review: "{section_title}"
 
 {prior_sections_block}
+
+{visual_context_block}
 
 {global_rigor_block}
 
@@ -373,22 +720,18 @@ Scoring rules:
 
 {scoring_interpretation_block}
 
+Chain-of-Draft instruction:
+Before scoring each rubric, reason briefly.
+Keep each reasoning step to ≤5 words.
+No lengthy explanations — concise keywords only.
+
 Output format:
 
 1. COMPLETENESS — <score>/10
-Write 1–2 sentences.
-
 2. SPECIFICITY — <score>/10
-Write 1–2 sentences.
-
 3. INTERNAL CONSISTENCY — <score>/10
-Write 1–2 sentences.
-
 4. IMPLEMENTABILITY — <score>/10
-Write 1–2 sentences.
-
 5. OVERALL SCORE — <score>/10
-Write 1 sentence explaining the overall score.
 
 6. REQUIREMENT STATUS
 List all material requirement decisions in this section and classify each as:
@@ -396,7 +739,7 @@ List all material requirement decisions in this section and classify each as:
 - UNRESOLVED: <missing or vague decision> — <why it blocks implementation>
 
 7. REQUIREMENT GAPS
-Convert each UNRESOLVED item into a decision question the PM must answer.
+Convert each UNRESOLVED item into a decision question the user must answer.
 Each question must be specific and decisionable (Yes/No or clearly defined options).
 
 8. TRIAGE DECISION
@@ -427,7 +770,35 @@ A section must FAIL if:
 - any [ASSUMPTION] remains unresolved
 - any enforcement rule lacks a clear threshold, condition, or decision
 - implementation would still require guessing
-- TRIAGE: ENTER RECOVERY MODE persists for two consecutive iterations\
+- TRIAGE: ENTER RECOVERY MODE persists for two consecutive iterations
+
+9. JSON SUMMARY
+Emit this block at the very end of your response, after the VERDICT line above.
+
+```json
+{{
+  "verdict": "PASS",
+  "brief_rationale": "Max 5 words explaining verdict",
+  "technical_gaps": [],
+  "user_gaps": [],
+  "confidence": 0.0,
+  "blocking_gaps": []
+}}
+```
+
+Rules for the JSON block:
+- "verdict": "PASS" if OVERALL SCORE >= 8.5; otherwise "REWORK".
+- "brief_rationale": Short explanation of the verdict.
+- "technical_gaps": array of strings — each is one missing or ambiguous decision. Use exact implementation-level language.
+- "user_gaps": Rewrite each technical gap as a direct, plain-English question for the user.
+  NO EVALUATOR JARGON. Never use words like 'undefined', 'unmeasurable', 'ambiguous', 'contradictory'. Write like a natural colleague.
+  Example: "What should happen when a user hits the daily report limit?"
+- "confidence": 0.9+ for PASS-quality drafts; 0.5-0.89 for minor gaps; below 0.5 for major missing decisions.
+- "blocking_gaps": array of objects for fields that are genuinely required and still missing.
+  Each object: {{"component": "<baseline|target|measurement_method|timeline|owner|validation_plan|other>", "question": "<exact plain-English question to ask the user>"}}
+  Only include if the field is truly required for this section type. Use an empty array [] if nothing is blocking.
+  Example for a success_metrics section: [{{"component": "target", "question": "What accuracy target should we use for the final automated + human-reviewed output?"}}]
+- Must be valid JSON. No trailing commas. Strings must be double-quoted.\
 """
 
 REFLECTOR_PRIOR_SECTIONS_BLOCK = """\
@@ -471,7 +842,7 @@ You are a requirements decision normalizer.
 Requirement question:
 {requirement_question}
 
-PM response:
+user response:
 ---
 {pm_response}
 ---
@@ -481,10 +852,10 @@ PM response:
 {human_trust_block}
 
 Your job:
-- Determine whether the PM response contains a usable decision.
+- Determine whether the user response contains a usable decision.
 - If yes, normalize it into a concise explicit requirement decision.
 - If no, mark it unresolved.
-- Do NOT infer beyond the PM's actual response.
+- Do NOT infer beyond the user's actual response.
 
 Output EXACTLY one of:
 RESOLVED: <normalized decision>
@@ -557,3 +928,34 @@ DEFAULT_MAX_RECOVERY_MODE_CONSECUTIVE_ITERATIONS = 2
 PASS_SCORE_THRESHOLD = 8.5
 RECOVERY_MODE_SCORE_THRESHOLD = 5.0
 RECOVERY_MODE_RESOLVED_COMPONENT_THRESHOLD = 0.5
+
+INTENT_FALLBACK_CLASSIFICATION_PROMPT = """\
+Classify the following answer into one of these intents:
+DIRECT_CLARIFICATION_QUESTION, REPETITION_COMPLAINT, REPHRASE_REQUEST, BLENDED, DIRECT_ANSWER, COMPLAINT_OR_META, AMBIGUOUS.
+
+Active Question (if any): {question}
+User Answer: {answer}
+
+Reply with exactly one of the specific intent labels above, and nothing else.\
+"""
+
+REPLY_CONTEXT_INTERPRETATION_PROMPT = """\
+The user is specifically replying to an older message in the conversation.
+You must classify how their reply ('User Answer') relates to the bounded context ('Replied Message').
+
+Replied Message context:
+---
+{reply_context}
+---
+
+Active Question (if any): {question}
+User Answer: {answer}
+
+Classify the relationship into exactly one of these:
+- "direct_answer_to_replied_message"
+- "clarification_about_replied_message"
+- "correction_or_disagreement_with_replied_message"
+- "supporting_context_only" (User is answering the current active question, but highlighted the old message just as context)
+
+Also evaluate the global intent of the turn using the standard intent labels (e.g. DIRECT_ANSWER, CLARIFICATION_QUESTION, REPETITION_COMPLAINT, etc).
+"""

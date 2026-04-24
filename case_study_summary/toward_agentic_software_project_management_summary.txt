@@ -1,0 +1,38 @@
+Source File: toward_agentic_software_project_management.pdf
+
+==================================================
+1. Structured Summary
+==================================================
+
+Q1. What is the main vision for Software Project Management (SPM) proposed in the study regarding the use of agentic AI?
+The study envisions the transition of SPM into the "SPM 3.0" era, driven by the advent of agentic AI. It proposes an "Agentic Project Manager (PM)" built as a multi-agent system that functions as a "junior" or "intern" PM. This agentic PM is designed to work collaboratively with human PMs and other software teammates to boost project success while keeping humans at the center of oversight. For example, rather than fully replacing human project managers, an agentic PM coordinates tasks proactively while requiring human approval and feedback to learn over time.
+
+Q2. How does the proposed Agentic PM handle assigning autonomy based on different SPM tasks?
+The Agentic PM operates using four distinct "working modes" that adjust its level of autonomy according to the specific complexity and risk of a given task. These modes include guided AI-autonomy, supervised-AI, human-AI collaborative, and AI-assisted. The level of human involvement scales inversely with the agentic PM's autonomy; highly critical or high-risk tasks demand more human control. For instance, the "Agentic PM" would use the "Guided AI-autonomy mode" for low-risk, simple tasks like meeting note-taking, functioning autonomously but still allowing the human PM to review the final notes for accuracy.
+
+Q3. What are some critical risks or ethical concerns highlighted by the authors when integrating agentic AI into project management?
+The authors emphasize that giving unsupervised or full autonomy to multiple AI agents brings severe risks, including data privacy concerns, loss of accountability, and algorithmic hallucinations. High costs, poor alignment with business value, and fears about job security could also cause agentic AI projects to fail if not properly supervised. To mitigate these threats, the human project manager must maintain ultimate authority over decision-making processes. For example, if a human PM delegates fully autonomous project planning to AI without oversight, the AI might leak confidential client data or draft unrealistic deadlines based on biased historical evidence, as happened with Deloitte's real-world $440,000 refund due to AI-generated errors.
+
+Q4. How do the authors expect the role of the human Project Manager to evolve in response to these technological shifts?
+The authors argue that the human project manager will not be replaced but must upskill to become a "strategic leader" and a "coach" who guides both human and agentic teammates. Project managers will need to deepen their interpersonal skills, emotional intelligence, critical thinking, and capacity for ethical oversight. Rather than focusing on routine coordination, the PM provides final decision-making power and ensures responsible human-agent interaction. For example, the human PM would step in to mediate conflicts or oversee high-stakes negotiations, while delegating routine documentation scheduling back to the agentic PM under the "Supervised-AI" mode.
+
+Q5. What is the expected future research roadmap proposed for Agentic Software Project Management?
+The paper concludes with a research agenda stating that empirical evidence is strongly needed to uncover the factors affecting human acceptance of agentic PMs and to create proper governance guidelines. Furthermore, they call for understanding the perceptions of software team members and the broader impact of AI adoption on early-career PM roles, such as interns. The authors stress that software engineering curriculums must be updated to prepare future graduates for managing these hybrid environments. For example, future case studies are suggested to run experimental prototypes of agentic PMs within agile scrum teams, discovering how actual team developers collaborate with or push back against agentic teammates.
+
+==================================================
+2. Next Steps for Our Application to Adapt
+==================================================
+
+Step-by-step implications:
+1. We need to evaluate our chatbot/application's current task autonomy level to see where it fits within the four proposed working modes (e.g., supervised-AI, AI-assisted).
+2. We must implement distinct human-in-the-loop oversight mechanisms that correspond to the task's calculated complexity and risk thresholds.
+3. We should introduce specialized "sub-agents" in our architecture to distribute workloads safely instead of relying entirely on monolithic processing.
+
+Recommended changes:
+- Implement a configurable task approval UI for users to explicitly approve, edit, or reject the AI's generated output before it acts, mirroring the "Supervised-AI" mode.
+- Establish a central logging database to capture all intermediate sub-agent outputs, enabling continuous reinforcement learning and clear accountability audits.
+- Refactor our chatbot's evidence-linking or citation logic to be strict guardrails, reducing potential hallucination risks typical inside high-autonomy scenarios.
+
+Risks / assumptions:
+- A major risk is user coordination overhead; if the chatbot prompts the user too much in low-risk scenarios, it may lead to alert fatigue and low acceptance.
+- We assume that our current NLP framework is deterministic enough to handle evidence extraction without inventing facts, effectively preventing hallucination incidents reported in the case study.

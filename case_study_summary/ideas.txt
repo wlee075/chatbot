@@ -1,0 +1,138 @@
+Source: toward_agentic_software_project_management.pdf
+Generated: 2026-04-20
+
+================================================================================
+IDEA 1 — Human-in-the-Loop Oversight Scaled by Complexity × Risk
+================================================================================
+
+What the paper says (evidence):
+- The authors define two task-specific factors that determine how much human
+  oversight is needed: COMPLEXITY ("the capability of human or agent to meet
+  the specific requirements needed to perform a task, e.g. creativity, expertise
+  knowledge, social skills, effort") and RISK ("the uncertainty of the outcomes
+  associated with delegating the task and their impact which create the need for
+  accountability towards the outcome"). (Section 3.2, lines 339-344)
+- They map these two factors onto four working modes with decreasing AI autonomy:
+    1. Guided AI-autonomy — low complexity, low risk (e.g. meeting notes).
+       AI acts, human reviews final output.
+    2. Supervised-AI — medium complexity/risk (e.g. drafting reports).
+       AI drafts, consults human mid-task, human approves before execution.
+    3. Human-AI Collaborative — higher complexity (e.g. sprint planning).
+       Both human and AI contribute as peers; AI provides data/insights only.
+    4. AI-Assisted — highest complexity/risk (e.g. project planning, negotiation).
+       Human leads entirely; AI responds only when prompted.
+  (Section 3.2, lines 350-415)
+- "Human PM involvement should increase with the task complexity and risk level
+  while reducing the autonomy of the agentic PM." (lines 425-427)
+- "Accountability for outcomes in ALL working modes should remain with the human
+  PM as the ultimate decision maker." (lines 427-429)
+- Real-world failure cited: Deloitte refunded $440,000 to the Australian
+  government because an Azure OpenAI GPT-4o report contained errors and
+  fabricated references — a case where human oversight was insufficient for a
+  high-risk document task. (Table 1, lines 547-551)
+- Another failure: Otter.ai leaked confidential company discussion notes to
+  unintended parties after a Zoom meeting, resulting in cancelled business
+  deals — a case where a low-risk task (note-taking) still needed human review
+  of sharing targets. (Table 1, lines 515-518)
+
+How this maps to our chatbot:
+- Our chatbot already has a conversational state machine that tracks PRD
+  subparts and enforces evidence-backed citations. This is effectively operating
+  somewhere between "Supervised-AI" and "Human-AI Collaborative" mode.
+- The paper's framework suggests we should NOT use the same level of oversight
+  for every interaction. Low-risk responses (e.g. summarising already-confirmed
+  facts) can auto-proceed, but high-risk responses (e.g. generating new
+  recommendations or contradicting prior user statements) should require
+  explicit user confirmation.
+
+Actionable next steps:
+1. Define a complexity/risk scoring function for each chatbot response type.
+   - Inputs: (a) whether the response introduces NEW information vs. repeats
+     confirmed facts, (b) whether the response contradicts any prior user
+     statement, (c) whether the response triggers a state transition in the
+     conversational state machine.
+   - Output: a mode tag — "auto-proceed", "confirm-before-send", or
+     "user-must-lead".
+
+2. Wire the mode tag into the UI.
+   - "auto-proceed" → response renders immediately (current behavior).
+   - "confirm-before-send" → response renders in a draft state with an
+     explicit [Approve / Edit / Reject] control before the chatbot commits
+     the state transition.
+   - "user-must-lead" → chatbot only responds to direct user prompts, does
+     not proactively suggest or advance topics.
+
+3. Log every mode assignment and user decision (approve/reject/edit) into the
+   chat history metadata so the system can learn which tasks users actually
+   treat as high-risk vs. low-risk over time.
+
+
+================================================================================
+IDEA 2 — Specialized Sub-Agents Instead of Monolithic Processing
+================================================================================
+
+What the paper says (evidence):
+- "The agentic PM will be composed of multiple sub-agents working on specialized
+  tasks and a coordinating agent that centrally coordinate all sub-agents, and
+  communications between sub-agents and with humans." (Section 3.2, lines 306-309)
+- The coordinating agent "can analyse the task assigned, working mode, input
+  sources, and similar past assignments to decide on the suitable task-specialized
+  sub-agent(s) to assign the task." (Section 3.2.2, lines 439-441)
+- Explicit sub-agent examples given: "planning agent, email agent, meeting note
+  agent, risk analysis agent, tasks management agent, etc." (lines 460-462)
+- Sub-agents communicate with each other ONLY via the coordinating agent, which
+  can "escalate any issues or conflicts among agents to human PM for their
+  review and decision." (lines 462-465)
+- A central database stores "all the outcomes, feedback, decisions, and related
+  logs for governance and learning purposes." (lines 321-323)
+- The paper cites coordination overhead as a key problem with single-agent
+  approaches: "concerns about coordination overhead when single AI agents
+  augment individual tasks" motivated the move to an integrated multi-agent
+  system. (lines 213-215)
+- Studies recommend "interconnected multi-agent systems which are more proactive
+  in task management, suitable for complex goals and dynamic environments,
+  capable of reasoning, learning, and adapting." (lines 216-219)
+
+How this maps to our chatbot:
+- Our chatbot currently runs as a single monolithic Streamlit app (app.py) that
+  handles conversation state, PRD extraction, evidence linking, contradiction
+  detection, and UI rendering all in one process.
+- The paper's architecture suggests decomposing this into specialized agents
+  coordinated by a central orchestrator, each with its own bounded
+  responsibility.
+
+Actionable next steps:
+1. Identify candidate sub-agents from our existing codebase.
+   Likely candidates based on current functionality:
+   - Extraction Agent — handles PRD clause extraction and NLP stemming logic.
+   - Evidence Agent — manages provenance metadata, citation chip generation,
+     and source linking.
+   - Contradiction Agent — detects conflicts between new user input and
+     previously confirmed facts.
+   - State Agent — manages the conversational state machine transitions and
+     tracks which PRD subparts are confirmed/pending.
+   - Unsure: whether the UI rendering layer counts as a "sub-agent" or remains
+     a pure presentation layer. The paper does not address front-end concerns
+     directly.
+
+2. Implement a coordinating agent (orchestrator).
+   - Receives raw user input.
+   - Determines which sub-agents need to act and in which order.
+   - Merges sub-agent outputs into a single coherent response.
+   - Holds the authority to escalate conflicts (e.g. Contradiction Agent flags
+     an issue → orchestrator surfaces it to the user before State Agent commits
+     the transition).
+
+3. Establish a central log store.
+   - Per the paper: all sub-agent outcomes, feedback, and decisions should be
+     logged centrally for governance.
+   - Map this to our chat history metadata structure — each message already
+     carries provenance metadata; extend it to include which sub-agent produced
+     each segment of the response.
+
+4. Not found: The paper does not provide implementation-level guidance on
+   inter-agent communication protocols (e.g. message queues, function calls,
+   shared memory). This is left as a future research item.
+
+5. Not found: The paper does not specify how to handle sub-agent failures or
+   timeouts. We would need to design our own fallback/retry strategy.

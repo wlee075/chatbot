@@ -50,11 +50,14 @@ def _env_level() -> int:
 
 def _file_handles(thread_id: str) -> dict[str, object]:
     """Return (and cache) open file handles for this session thread_id."""
+    if not thread_id:
+        thread_id = "unknown"
+    
     if thread_id in _HANDLES:
         return _HANDLES[thread_id]
 
     _LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    short = thread_id[:8]
+    short = str(thread_id)[:8]
 
     h: dict[str, object] = {
         "info": open(_LOGS_DIR / f"session_{short}.log", "a", encoding="utf-8"),

@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List
 
 
@@ -10,12 +10,16 @@ class PRDSection:
     expected_components: List[str]
     specificity_guidance: str
     allow_high_level: bool = False
+    # Sections whose existing drafts should be included in the PRD context block
+    # when this section is being drafted. Used to scope the draft-cache key so
+    # that unrelated section changes do not bust the cache.
+    context_depends_on: List[str] = field(default_factory=list)
 
 
 PRD_SECTIONS: List[PRDSection] = [
     PRDSection(
-        id="tldr",
-        title="tl;dr",
+        id="headliner",
+        title="Headliner",
         description="A concise one-paragraph summary of the entire initiative — problem, solution, and expected impact.",
         expected_components=[
             "what problem is being solved",
@@ -38,6 +42,7 @@ PRD_SECTIONS: List[PRDSection] = [
         ],
         specificity_guidance="Should be specific enough to distinguish this initiative from alternatives. Avoid generic phrases like 'better experience'.",
         allow_high_level=True,
+        context_depends_on=["problem_statement", "goals"],
     ),
     PRDSection(
         id="key_stakeholders",
@@ -49,6 +54,7 @@ PRD_SECTIONS: List[PRDSection] = [
             "any formal sign-off or approval requirements",
         ],
         specificity_guidance="Roles should be specific (e.g. 'Trust & Safety Engineering Lead') not vague (e.g. 'the team').",
+        context_depends_on=["goals"],
     ),
     PRDSection(
         id="background",
@@ -60,6 +66,7 @@ PRD_SECTIONS: List[PRDSection] = [
             "any prior attempts or related work and why they were insufficient",
         ],
         specificity_guidance="Should reference specific incidents, metrics, or observations — not generic statements like 'the current system is slow'.",
+        context_depends_on=["problem_statement"],
     ),
     PRDSection(
         id="problem_statement",
@@ -82,7 +89,8 @@ PRD_SECTIONS: List[PRDSection] = [
             "goals are measurable or time-bound",
             "goals directly address the problem statement",
         ],
-        specificity_guidance="Avoid vague goals like 'improve performance'. Each goal should include a target (e.g. 'reduce false positive rate by 20% by Q3 2026').",
+        specificity_guidance="Avoid vague goals like 'improve performance'. Ask about the real-world pain first, infer a concrete goal, then confirm it before requesting targets. Example result: 'reduce false positive rate by 20% by Q3 2026'.",
+        context_depends_on=["problem_statement"],
     ),
     PRDSection(
         id="success_metrics",
@@ -95,7 +103,8 @@ PRD_SECTIONS: List[PRDSection] = [
             "measurement method or data source",
             "evaluation timeline",
         ],
-        specificity_guidance="Each metric must be quantifiable. 'User satisfaction' is not a metric. 'NPS score ≥ 40 measured via quarterly survey by Q4 2026' is.",
+        specificity_guidance="Each metric must be quantifiable. Start by understanding the user's pain, then infer likely success indicators and confirm them. 'User satisfaction' is not a metric. 'NPS score ≥ 40 measured via quarterly survey by Q4 2026' is. Ask for baselines and targets only after the metric is confirmed.",
+        context_depends_on=["goals", "problem_statement"],
     ),
     PRDSection(
         id="non_goals",
@@ -107,6 +116,7 @@ PRD_SECTIONS: List[PRDSection] = [
             "reason why each item is out of scope",
         ],
         specificity_guidance="Non-goals should be specific enough to prevent ambiguity (e.g. 'We will not support manual review workflows in this phase').",
+        context_depends_on=["goals", "proposed_solution"],
     ),
     PRDSection(
         id="assumptions",
@@ -118,6 +128,7 @@ PRD_SECTIONS: List[PRDSection] = [
             "how and when the assumption will be validated",
         ],
         specificity_guidance="Assumptions without validation plans are just risks. Each assumption needs a concrete validation method and owner.",
+        context_depends_on=["goals", "proposed_solution"],
     ),
     PRDSection(
         id="out_of_scope",
@@ -129,6 +140,7 @@ PRD_SECTIONS: List[PRDSection] = [
             "no contradiction with the proposed solution or features",
         ],
         specificity_guidance="Items should be specific. 'Mobile support' is more useful than 'some platforms'. Cross-reference with Non-goals for consistency.",
+        context_depends_on=["proposed_solution", "non_goals"],
     ),
     PRDSection(
         id="proposed_solution",
@@ -141,6 +153,7 @@ PRD_SECTIONS: List[PRDSection] = [
             "technical dependencies or integrations identified",
         ],
         specificity_guidance="Features should be specific enough for engineering to scope. Avoid 'smart' or 'intelligent' without explaining the mechanism.",
+        context_depends_on=["goals", "problem_statement", "background"],
     ),
     PRDSection(
         id="risks",
@@ -153,6 +166,7 @@ PRD_SECTIONS: List[PRDSection] = [
             "mitigation plan for each risk",
         ],
         specificity_guidance="Every risk must have a mitigation plan, not just identification. 'Monitor the situation' is not a mitigation.",
+        context_depends_on=["proposed_solution", "timeline", "assumptions"],
     ),
     PRDSection(
         id="timeline",
@@ -164,6 +178,7 @@ PRD_SECTIONS: List[PRDSection] = [
             "specific dates or sprint references",
         ],
         specificity_guidance="Dates must be specific (e.g. 'Q3 2026 Week 2') not vague ('soon' or 'next quarter'). Include dependencies between milestones if applicable.",
+        context_depends_on=["goals", "proposed_solution"],
     ),
 ]
 

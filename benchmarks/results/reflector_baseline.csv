@@ -1,0 +1,16 @@
+prompt_variant,draft_label,expected_verdict,run,latency_ms,input_tokens,output_tokens,parse_verdict,parse_triage,parse_overall,parse_completeness,parse_specificity,parse_consistency,parse_implementability,parse_score,overall_score,verdict,triage
+baseline,very_poor,REWORK,1,9491,1284,1677,1,1,1,1,1,1,1,1.0,2.5,REWORK,RECOVERY
+baseline,very_poor,REWORK,2,10718,1284,1910,1,1,1,1,1,1,1,1.0,0.9,REWORK,RECOVERY
+baseline,very_poor,REWORK,3,10607,1284,1677,1,1,1,1,1,1,1,1.0,2.5,REWORK,RECOVERY
+baseline,poor,REWORK,1,10830,1329,1906,1,1,1,1,1,1,1,1.0,0.5,REWORK,RECOVERY
+baseline,poor,REWORK,2,11712,1329,2005,1,1,1,1,1,1,1,1.0,0.6,REWORK,RECOVERY
+baseline,poor,REWORK,3,10991,1329,1906,1,1,1,1,1,1,1,1.0,0.5,REWORK,RECOVERY
+baseline,medium,REWORK,1,14036,1330,2460,1,1,1,1,1,1,1,1.0,6.3,REWORK,NORMAL
+baseline,medium,REWORK,2,14469,1330,2460,1,1,1,1,1,1,1,1.0,6.3,REWORK,NORMAL
+baseline,medium,REWORK,3,14109,1330,2405,1,1,1,1,1,1,1,1.0,6.0,REWORK,NORMAL
+baseline,good,REWORK,1,15046,1374,2514,1,1,1,1,1,1,1,1.0,8.4,REWORK,NORMAL
+baseline,good,REWORK,2,14236,1374,2514,1,1,1,1,1,1,1,1.0,8.4,REWORK,NORMAL
+baseline,good,REWORK,3,24507,1374,4320,1,1,1,1,1,1,1,1.0,5.5,REWORK,NORMAL
+baseline,excellent,PASS,1,263369,1405,63371,1,1,1,1,1,1,1,1.0,9.4,PASS,NORMAL
+baseline,excellent,PASS,2,255768,1405,63371,1,1,1,1,1,1,1,1.0,9.4,PASS,NORMAL
+baseline,excellent,PASS,3,12863,1405,2456,1,1,1,1,1,1,1,1.0,9.8,PASS,NORMAL
