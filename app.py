@@ -1455,236 +1455,118 @@ if st.session_state.graph_started and st.session_state.get("active_reference"):
 # ─────────────────────────────────────────────────────────────────────────────
 # Unified multimodal composer CSS + helper
 # ─────────────────────────────────────────────────────────────────────────────
-_COMPOSER_CSS = """<style>
-/* ── Voice confirmation card ──────────────────────────────────── */
-.transcript-card {
-    background: #f0f4ff; border: 1px solid #b3c6f7;
-    border-radius: 12px; padding: 16px 18px 12px; margin-bottom: 10px;
-}
-.transcript-card-header {
-    display: flex; align-items: center; gap: 8px;
-    font-size: 0.92rem; font-weight: 600; color: #2d3748; margin-bottom: 10px;
-}
-
-/* ═══════════════════════════════════════
-   COMPOSER BAR
-   [ + upload ] [ text input flex:1 ] [ 🎙️ mic ] [ → send ]
-   Built with st.form + st.columns inside bottom().
-   st.audio_input is NEVER rendered in this bar.
-   ═══════════════════════════════════════ */
-
-/* 1. Bottom strip */
-div[data-testid="stBottom"] > div {
-    padding: 8px 16px 10px !important;
-    background: #ffffff !important;
-    border-top: 1px solid #e2e8f0 !important;
-}
-/* 2. Form: no chrome */
-div[data-testid="stBottom"] [data-testid="stForm"] {
-    border: none !important; background: transparent !important;
-    padding: 0 !important; max-width: 820px !important; margin: 0 auto !important;
-}
-/* 3. Columns row → the pill bar visual container */
-div[data-testid="stBottom"] [data-testid="stHorizontalBlock"] {
-    background: #f8fafc !important;
-    border: 1.5px solid #dde1e9 !important;
-    border-radius: 28px !important;
-    padding: 4px 6px 4px 8px !important;
-    align-items: center !important;
-    gap: 8px !important;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.05) !important;
-}
-
-/* ── Col 0: upload — HIDDEN ────────────────────────────────────── */
-div[data-testid="stBottom"] [data-testid="stFileUploader"] { display: none !important; }
-
-/* Hide all file uploader chrome — leave only the browse button */
-div[data-testid="stBottom"] [data-testid="stFileUploaderDropzone"] {
-    border: none !important; background: transparent !important;
-    padding: 0 !important; min-height: 0 !important; min-width: 0 !important;
-}
-div[data-testid="stBottom"] [data-testid="stFileUploaderDropzoneInstructions"] {
-    display: none !important;
-}
-div[data-testid="stBottom"] [data-testid="stFileUploader"] [class*="uploadedFile"] {
-    display: none !important;
-}
-/* Upload button: hide native "Upload"/"Browse files" text, show icon via ::before */
-div[data-testid="stBottom"] [data-testid="stFileUploader"] button {
-    background: transparent !important; border: none !important;
-    border-radius: 50% !important; width: 40px !important; height: 40px !important;
-    padding: 0 !important;
-    font-size: 0 !important; color: transparent !important;  /* hide label text */
-    overflow: visible !important; position: relative !important;
-    cursor: pointer !important;
-}
-div[data-testid="stBottom"] [data-testid="stFileUploader"] button::before {
-    content: "📎";
-    font-size: 1.2rem; color: #6b7280;
-    position: absolute; top: 50%; left: 50%;
-    transform: translate(-50%, -50%);
-    display: block;
-}
-div[data-testid="stBottom"] [data-testid="stFileUploader"] button:hover::before {
-    color: #4f46e5;
-}
-
-/* ── Col 1: text input ──────────────────────────────────────────── */
-div[data-testid="stBottom"] [data-testid="stTextInput"] input {
-    border: none !important; box-shadow: none !important;
-    background: transparent !important; outline: none !important;
-    font-size: 0.94rem !important; padding: 8px 4px !important;
-}
-div[data-testid="stBottom"] [data-testid="stTextInputRootElement"] {
-    border: none !important; box-shadow: none !important; background: transparent !important;
-}
-
-/* ── Col 2: mic button (custom form_submit_button) ──────────────────────── */
-/* Target specifically the 3rd column child = mic slot */
-div[data-testid="stBottom"] [data-testid="stHorizontalBlock"] > div:nth-child(3) button {
-    background: transparent !important;
-    border: 1.5px solid #dde1e9 !important;
-    border-radius: 50% !important;
-    width: 40px !important; height: 40px !important;
-    padding: 0 !important; font-size: 1.15rem !important;
-    color: #6b7280 !important; cursor: pointer !important;
-    display: flex !important; align-items: center !important; justify-content: center !important;
-}
-div[data-testid="stBottom"] [data-testid="stHorizontalBlock"] > div:nth-child(3) button:hover {
-    background: #fef3c7 !important; border-color: #f59e0b !important; color: #d97706 !important;
-}
-
-/* ── Col 3: send button ────────────────────────────────────────────── */
-/* Target specifically the 4th column child = send slot */
-div[data-testid="stBottom"] [data-testid="stHorizontalBlock"] > div:nth-child(4) button {
-    background: #6366f1 !important; color: #fff !important;
-    border: none !important; border-radius: 50% !important;
-    width: 40px !important; height: 40px !important;
-    padding: 0 !important; font-size: 1rem !important;
-    display: flex !important; align-items: center !important; justify-content: center !important;
-    cursor: pointer !important;
-}
-div[data-testid="stBottom"] [data-testid="stHorizontalBlock"] > div:nth-child(4) button:hover {
-    background: #4f46e5 !important; box-shadow: 0 2px 8px rgba(99,102,241,0.4) !important;
-}
-
-/* ── Mic capture card (rendered ABOVE composer, outside bottom()) ────────── */
-.mic-capture-card {
-    background: #f8faff; border: 1.5px solid #c7d7f9;
-    border-radius: 14px; padding: 14px 18px 12px;
-    margin: 0 auto 8px; max-width: 820px;
-}
-.mic-capture-title {
-    font-size: 0.88rem; font-weight: 600; color: #3730a3; margin-bottom: 10px;
-    display: flex; align-items: center; gap: 6px;
-}
-
-/* ── Responsive ───────────────────────────────────────────────── */
-@media (max-width: 768px) {
-    div[data-testid="stBottom"] > div { padding: 6px 12px 8px !important; }
-    div[data-testid="stBottom"] [data-testid="stHorizontalBlock"] { gap: 5px !important; padding: 3px 5px 3px 8px !important; }
-}
-@media (max-width: 480px) {
-    div[data-testid="stBottom"] > div { padding: 5px 8px 7px !important; }
-    div[data-testid="stBottom"] [data-testid="stHorizontalBlock"] > div:nth-child(3) button,
-    div[data-testid="stBottom"] [data-testid="stHorizontalBlock"] > div:nth-child(4) button {
-        width: 36px !important; height: 36px !important; font-size: 0.95rem !important;
-    }
-}
-</style>"""
+import logging as _logging
+_composer_log = _logging.getLogger("composer")
 
 def _render_unified_composer(placeholder: str, key_prefix: str) -> dict:
-    """Fixed-bottom composer: [ + upload ] [ text input flex:1 ] [ 🎙️ mic ] [ → send ]
+    """Composer using Streamlit 1.56's native chat_input with file + audio support.
 
-    The mic button is a plain form_submit_button — clicking it sets a session-state
-    flag and reruns, which shows a separate audio-capture card above the composer.
-    st.audio_input is NEVER rendered inside the composer bar itself.
+    st.chat_input returns:
+      - None             → nothing submitted
+      - str              → text only (legacy, shouldn't trigger with accept_file/audio)
+      - ChatInputValue   → .text (str), .files (list[UploadedFile]), .audio (UploadedFile|None)
 
-    Returns {"text": str|None, "audio_bytes": bytes|None, "uploaded_file": obj|None}.
+    NOTE: .audio is an UploadedFile (same class as files), NOT an AudioData namedtuple.
+    Use .getvalue() or .read() to get bytes. MIME type comes from .type.
+
+    Returns {"text", "audio_bytes", "audio_mime", "uploaded_file", "uploaded_files"}.
     """
-    from streamlit_extras.bottom_container import bottom
+    result: dict = {"text": None, "audio_bytes": None, "audio_mime": "audio/wav",
+                    "uploaded_file": None, "uploaded_files": []}
 
-    result: dict = {"text": None, "audio_bytes": None, "uploaded_file": None}
+    _input = st.chat_input(
+        placeholder,
+        accept_file="multiple",
+        file_type=["png", "jpg", "jpeg", "webp", "pdf"],
+        accept_audio=True,
+    )
 
-    st.markdown(_COMPOSER_CSS, unsafe_allow_html=True)
+    _composer_log.info(
+        "composer_input_received",
+        extra={"key": key_prefix, "type": type(_input).__name__,
+               "is_none": _input is None},
+    )
 
-    # ── Mic capture overlay (above composer, outside bottom()) ────────────────────
-    _mic_active = st.session_state.get(f"{key_prefix}_mic_active", False)
-    if _mic_active:
-        st.markdown("""<style>
-        .mic-capture-card div[data-testid="stAudioInput"] label,
-        .mic-capture-card div[data-testid="stAudioInput"] input {display:none !important;}</style>""", unsafe_allow_html=True)
-        # st.markdown('<div class="mic-capture-card">', unsafe_allow_html=True)
-        # st.markdown('<div class="mic-capture-title">🎙️ Speak now — click the mic to start, then confirm.</div>', unsafe_allow_html=True)
-        _audio_obj = st.audio_input(
-            "Record your answer",
-            key=f"{key_prefix}_audio_capture",
-            label_visibility="collapsed",
+    if _input is None:
+        return result
+
+    # Plain string fallback
+    if isinstance(_input, str):
+        result["text"] = _input.strip() or None
+        _composer_log.info("composer_plain_string", extra={"text": result["text"]})
+        return result
+
+    # ChatInputValue — log ALL attributes to discover actual shape at runtime
+    _text  = getattr(_input, "text",  None) or ""
+    _files = getattr(_input, "files", [])   or []
+    _audio = getattr(_input, "audio", None)
+
+    _composer_log.info(
+        "composer_chat_input_value",
+        extra={
+            "text_len":    len(_text),
+            "files_count": len(_files),
+            "audio_type":  type(_audio).__name__,
+            "audio_is_none": _audio is None,
+            # Log all attribute names on the audio object so we can see what's available
+            "audio_attrs": [a for a in dir(_audio) if not a.startswith("_")] if _audio else [],
+            "audio_name":  getattr(_audio, "name",  "N/A") if _audio else "N/A",
+            "audio_mime":  getattr(_audio, "type",  "N/A") if _audio else "N/A",
+            "audio_size":  getattr(_audio, "size",  "N/A") if _audio else "N/A",
+        },
+    )
+
+    if _text.strip():
+        result["text"] = _text.strip()
+
+    if _audio is not None:
+        # .audio is an UploadedFile — use getvalue() (non-destructive) or read() as fallback
+        _raw: bytes | None = None
+        try:
+            _raw = _audio.getvalue()
+        except Exception:
+            try:
+                _raw = _audio.read()
+            except Exception as _exc:
+                _composer_log.error("composer_audio_read_failed", extra={"exc": str(_exc)})
+
+        _mime = getattr(_audio, "type", None) or "audio/wav"
+        _composer_log.info(
+            "composer_audio_extracted",
+            extra={"bytes_len": len(_raw) if _raw else 0, "mime": _mime},
         )
-        _col_ok, _col_cancel = st.columns([3, 1])
-        with _col_ok:
-            _ok = st.button(
-                "✅ Use this recording",
-                key=f"{key_prefix}_audio_ok",
-                disabled=(_audio_obj is None),
-                use_container_width=True,
-            )
-        with _col_cancel:
-            _cancel = st.button("✕ Cancel", key=f"{key_prefix}_audio_cancel", use_container_width=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+        if _raw:
+            result["audio_bytes"] = _raw
+            result["audio_mime"]  = _mime
 
-        if _cancel:
-            st.session_state[f"{key_prefix}_mic_active"] = False
-            st.session_state.pop(f"{key_prefix}_audio_capture", None)
-            st.rerun()
+    if _files:
+        import uuid as _uuid
+        stashed = []
+        for _f in _files:
+            stashed.append({
+                "file_id":    f"file_{_uuid.uuid4().hex[:8]}",
+                "filename":   _f.name,
+                "size_bytes": _f.size,
+                "mime_type":  _f.type or "application/octet-stream",
+                "bytes":      _f.read(),
+            })
+        result["uploaded_files"] = stashed
+        result["uploaded_file"]  = stashed[0]
+        _composer_log.info("composer_files_stashed",
+                           extra={"count": len(stashed),
+                                  "names": [s["filename"] for s in stashed]})
 
-        if _ok and _audio_obj is not None:
-            result["audio_bytes"] = _audio_obj.getvalue()
-            # Clear capture widget so it resets on next rerun
-            st.session_state[f"{key_prefix}_mic_active"] = False
-            st.session_state.pop(f"{key_prefix}_audio_capture", None)
-            return result
-
-    # ── Composer bar (always visible at bottom) ────────────────────────────────
-    with bottom():
-        with st.form(key=f"{key_prefix}_composer_form", border=False, enter_to_submit=True):
-            c_add, c_text, c_mic, c_send = st.columns(
-                [1, 10, 1, 1], gap="small", vertical_alignment="center"
-            )
-
-            with c_add:
-                _up = st.file_uploader(
-                    "Attach image",
-                    key=f"{key_prefix}_upload",
-                    type=["png", "jpg", "jpeg", "webp"],
-                    label_visibility="collapsed",
-                    accept_multiple_files=False,
-                )
-            with c_text:
-                _text_val = st.text_input(
-                    "Message",
-                    key=f"{key_prefix}_text",
-                    label_visibility="collapsed",
-                    placeholder=placeholder,
-                )
-            # Declare send BEFORE mic so Enter-to-submit triggers send, not mic
-            with c_send:
-                _sent = st.form_submit_button("→", use_container_width=True)
-            with c_mic:
-                _mic_clicked = st.form_submit_button("🎙️", use_container_width=True)
-
-    # ── Handle results ────────────────────────────────────────────────────────
-    if _mic_clicked:
-        st.session_state[f"{key_prefix}_mic_active"] = True
-        st.rerun()
-
-    if _sent:
-        if _text_val and _text_val.strip():
-            result["text"] = _text_val.strip()
-        if _up is not None:
-            result["uploaded_file"] = _up
-
+    _composer_log.info(
+        "composer_result_summary",
+        extra={
+            "has_text":  bool(result["text"]),
+            "has_audio": bool(result["audio_bytes"]),
+            "audio_len": len(result["audio_bytes"]) if result["audio_bytes"] else 0,
+            "files":     len(result["uploaded_files"]),
+        },
+    )
     return result
+
 
 # ── Compact timeline bar: rendered once per rerun above the chat composer ─────────────
 if st.session_state.graph_started and sv:
@@ -1699,7 +1581,6 @@ if True:
             # ── needs_confirmation card (low-confidence voice) ───────────────
             _voice_result = st.session_state.get("voice_confirmation_state")
             if _voice_result is not None:
-                st.markdown(_COMPOSER_CSS, unsafe_allow_html=True)
                 _vc_text = _voice_result.get("normalized_text", "") or _voice_result.get("raw_transcript", "")
                 _vc_conf = _voice_result.get("confidence", -1.0)
                 _vc_needs_warn = _voice_result.get("requires_confirmation", False)
@@ -1771,14 +1652,33 @@ if True:
             _mm = _render_unified_composer(_placeholder, "active")
 
             # Audio path
+            import logging as _al
+            _audio_log = _al.getLogger("audio_pipeline")
+            _audio_log.info(
+                "audio_path_check",
+                extra={"has_audio_bytes": bool(_mm["audio_bytes"]),
+                       "audio_len": len(_mm["audio_bytes"]) if _mm["audio_bytes"] else 0,
+                       "audio_mime": _mm.get("audio_mime", "audio/wav")},
+            )
             if _mm["audio_bytes"]:
+                _audio_mime = _mm.get("audio_mime", "audio/wav") or "audio/wav"
+                _audio_log.info("audio_dispatching_to_transcription",
+                                extra={"bytes_len": len(_mm["audio_bytes"]),
+                                       "mime": _audio_mime})
                 with st.spinner("Transcribing…"):
                     from utils.voice_dictation_pipeline import process_voice_input as _pvr
                     _vr = _pvr(
-                        _mm["audio_bytes"], mime_type="audio/wav",
+                        _mm["audio_bytes"], mime_type=_audio_mime,
                         session_id=st.session_state.thread_id,
                         turn_id=(sv.get("run_id", "") if sv else ""),
                     )
+                _audio_log.info(
+                    "audio_transcription_result",
+                    extra={"status": _vr["status"],
+                           "failure_reason": _vr.get("failure_reason", ""),
+                           "handoff_len": len(_vr.get("handoff_text", "") or ""),
+                           "confidence": _vr.get("confidence", -1)},
+                )
                 if _vr["status"] == "failed":
                     st.error(
                         "❌ Transcription failed — "
@@ -1801,10 +1701,13 @@ if True:
                             st.session_state.active_reference = None
                         else:
                             _vt_payload = {"event_type": "ANSWER", "content": _vt_text}
+                        _audio_log.info("audio_setting_pending_payload",
+                                        extra={"text_preview": _vt_text[:60]})
                         st.session_state._pending_payload = _vt_payload
                         st.session_state._pending_user_msg = "🎙️ " + _vt_text
                         st.rerun()
                 elif _vr["status"] == "needs_confirmation":
+                    _audio_log.info("audio_needs_user_confirmation")
                     st.session_state.voice_confirmation_state = _vr
                     st.rerun()
                 user_input_obj = None
@@ -1812,10 +1715,13 @@ if True:
             # Text / image path
             else:
                 from types import SimpleNamespace as _SNS
+                _mm_files = _mm.get("uploaded_files") or (
+                    [_mm["uploaded_file"]] if _mm.get("uploaded_file") else []
+                )
                 user_input_obj = _SNS(
                     text=_mm["text"] or "",
-                    files=[_mm["uploaded_file"]] if _mm["uploaded_file"] else [],
-                ) if (_mm["text"] or _mm["uploaded_file"]) else None
+                    files=_mm_files,
+                ) if (_mm["text"] or _mm_files) else None
             
         elif sv.get("is_complete", False):
             st.chat_input("Session complete — see download in chat above.", disabled=True)
@@ -1838,16 +1744,19 @@ if True:
                 files = getattr(user_input_obj, "files", []) if hasattr(user_input_obj, "files") else []
                 
             if files:
-                import uuid
-                uploaded_img = files[0]
-                mime = uploaded_img.type or "image/png"
-                uploaded_files_list.append({
-                    "file_id": f"file_{uuid.uuid4().hex[:8]}",
-                    "filename": uploaded_img.name,
-                    "size_bytes": uploaded_img.size,
-                    "mime_type": mime,
-                    "bytes": uploaded_img.read()
-                })
+                import uuid as _uuid_fh
+                for _uf in files:
+                    if isinstance(_uf, dict):
+                        uploaded_files_list.append(_uf)   # already stashed
+                    else:
+                        uploaded_files_list.append({
+                            "file_id":    f"file_{_uuid_fh.uuid4().hex[:8]}",
+                            "filename":   _uf.name,
+                            "size_bytes": _uf.size,
+                            "mime_type":  _uf.type or "image/png",
+                            "bytes":      _uf.read(),
+                        })
+
                 
             # Safe submit rule checking
             has_text_input = bool(user_input and user_input.strip())
@@ -1943,23 +1852,19 @@ if True:
                 st.rerun()
 
         # Text / image path
-        elif _l_mm["text"] or _l_mm["uploaded_file"]:
-            user_input = _l_mm["text"] or ""
-            _l_stash   = None
-            if _l_mm["uploaded_file"]:
-                import uuid as _uuid
-                _l_uf = _l_mm["uploaded_file"]
-                _l_stash = {
-                    "file_id":    f"file_{_uuid.uuid4().hex[:8]}",
-                    "filename":   _l_uf.name,
-                    "size_bytes": _l_uf.size,
-                    "mime_type":  _l_uf.type or "image/png",
-                    "bytes":      _l_uf.read(),
-                }
+        elif _l_mm["text"] or _l_mm.get("uploaded_files") or _l_mm.get("uploaded_file"):
+            user_input  = _l_mm["text"] or ""
+            # Files are already stashed dicts — no UploadedFile attribute access needed
+            _l_stashes  = _l_mm.get("uploaded_files") or (
+                [_l_mm["uploaded_file"]] if _l_mm.get("uploaded_file") else []
+            )
+            if _l_stashes:
                 st.session_state.image_context_buffer = (
-                    st.session_state.get("image_context_buffer", []) + [_l_stash]
+                    st.session_state.get("image_context_buffer", []) + _l_stashes
                 )
-            payload = _build_submit_payload(user_input or "[Image Uploaded]", _l_stash)
+            payload = _build_submit_payload(user_input or "[Image Uploaded]", _l_stashes[0] if _l_stashes else None)
+            if payload and _l_stashes:
+                payload["uploaded_files"] = _l_stashes
             if payload:
                 try:
                     graph.invoke(
